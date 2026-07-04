@@ -109,6 +109,40 @@ impl SubsonicClient {
         Ok(album.song.into_iter().map(map_song).collect())
     }
 
+    /// List an artist's albums. REAL: calls `get_artist` (returns
+    /// `ArtistWithAlbumsId3`, whose `album: Vec<AlbumId3>` are the albums) and
+    /// maps each into our `Album`. Backs the MPD `lsinfo` drill-down into an
+    /// artist directory.
+    pub async fn artist_albums(&self, id: &ArtistId) -> Result<Vec<Album>, SubsonicError> {
+        let artist = self
+            .inner
+            .get_artist(&id.0)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(artist.album.into_iter().map(map_album).collect())
+    }
+
+    /// Search songs (real `search3`, songs only). Backs MPD `search`/`find`.
+    pub async fn search_songs(&self, query: &str) -> Result<Vec<Song>, SubsonicError> {
+        let res = self
+            .inner
+            .search3(query, Some(0), None, Some(0), None, Some(100), None, None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(res.song.into_iter().map(map_song).collect())
+    }
+
+    /// Fetch a single song's metadata (real `get_song`). Used to resolve a queued
+    /// uri (`song/<id>`) into full tags for `addid`/`currentsong`.
+    pub async fn song(&self, id: &SongId) -> Result<Song, SubsonicError> {
+        let child = self
+            .inner
+            .get_song(&id.0)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(map_song(child))
+    }
+
     /// Resolve a playable stream URL for a song. Vertical-slice step 4.
     ///
     /// This is the handoff point to the audio player: hand this URL straight to

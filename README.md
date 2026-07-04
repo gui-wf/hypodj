@@ -38,9 +38,16 @@ Subsonic library and plays the streams through mpv.
   `PlayerEvent`s (which drive queue-advance + scrobble). Browse mapping is real
   (`artists`/`album_list`/`album_songs` map live wire types to the model).
   Proven live + headless by the `play-probe` binary (see below).
-- **Phase 2 - MPD server loop.** The TCP accept loop + line codec + dispatch
-  implementing the ncmpcpp-critical command subset, bound to `127.0.0.1:6601`
-  in dev.
+- **Phase 2 - MPD server loop. DONE (this commit).** The tokio TCP accept loop
+  + line parser (quoted args) + dispatch, bound to `127.0.0.1:6601` in dev. A
+  `SubsonityHandler` (`handler.rs`) backs the ncmpcpp-critical command subset
+  with live Subsonic browse/search + the player, over a shared in-memory queue.
+  Synthetic `artist/<id>` / `album/<id>` / `song/<id>` URIs bridge MPD's
+  path model to Subsonic ids; `lsinfo` drills root -> artists -> albums ->
+  songs. `command_list[_ok]` batching + `idle`/`noidle` supported. Verified
+  live against Navidrome with a real MPD client: greet, `status`, `lsinfo`
+  browse of real artists/albums/songs, and `addid`+`play` -> `state: play`
+  (audio to `ao=null`, speakers never touched, mopidy/6600 undisturbed).
 - **Phase 3 - feature parity.** Port the 9 shipped Python features (scrobble,
   cover art, star/love, similar/radio, smart album lists, genres, search3,
   listing cache, OpenSubsonic extension negotiation).

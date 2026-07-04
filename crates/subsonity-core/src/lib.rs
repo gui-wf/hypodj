@@ -12,6 +12,7 @@
 //!               accept/codec loop is next-phase.
 
 pub mod config;
+pub mod handler;
 pub mod model;
 pub mod mpd;
 pub mod player;
