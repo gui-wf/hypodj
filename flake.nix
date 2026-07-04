@@ -7,10 +7,19 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
+    let
+      # ONE shared module definition, parameterized by flavor. Lives outside the
+      # per-system block so the modules evaluate system-independently.
+      mkHypodjModule = import ./nix/hypodj-module.nix;
+    in
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-      in {
+      in
+      {
+        packages.hypodj = pkgs.callPackage ./nix/package.nix { };
+        packages.default = self.packages.${system}.hypodj;
+
         devShells.default = pkgs.mkShell {
           # Rust toolchain + pkg-config + the audio system lib (libmpv).
           # Reproducible: the build finds mpv via pkg-config here.
@@ -35,5 +44,12 @@
           CARGO_BUILD_JOBS = "2";
           PKG_CONFIG_PATH = "${pkgs.mpv-unwrapped.dev}/lib/pkgconfig";
         };
-      });
+      })
+    // {
+      # System-independent outputs: the two modules + the overlay.
+      overlays.default = import ./nix/overlay.nix;
+
+      nixosModules.default = mkHypodjModule { flavor = "nixos"; };
+      homeManagerModules.default = mkHypodjModule { flavor = "home-manager"; };
+    };
 }

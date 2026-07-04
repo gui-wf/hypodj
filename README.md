@@ -239,12 +239,94 @@ sanctioned fallback. Nothing was ever sent to the speakers.
   scope of the command set, not per-command difficulty - which is why the
   ncmpcpp-critical surface is enumerated in the interface now.
 
+## Usage
+
+The flake ships a package plus a NixOS module and a Home-Manager module - ONE
+shared `services.hypodj` definition. Import the module for your system, point it
+at your OpenSubsonic/Navidrome server, and connect ncmpcpp to `127.0.0.1:6601`
+(mopidy keeps `6600`; hypodj never binds it).
+
+The Navidrome password is read from `passwordFile` (or `passwordCommand`) at
+service start into a `0600` runtime config under `/run` - it is never written to
+the Nix store. Only a template with a `@HYPODJ_PASSWORD@` placeholder lives in
+the store; the real password is substituted at start.
+
+### NixOS
+
+```nix
+{
+  inputs.hypodj.url = "github:you/hypodj";   # or path:/tmp/hypodj while local
+
+  # in your host module (config is in scope here):
+  imports = [ hypodj.nixosModules.default ];
+
+  # sops-nix secret (assumed you already run sops-nix); any 0600 file works too.
+  sops.secrets."hypodj/password" = { };
+
+  services.hypodj = {
+    enable = true;
+    server.url = "https://navidrome.example.com";
+    server.username = "guilherme";
+    server.passwordFile = config.sops.secrets."hypodj/password".path;
+    # mpd.bind stays 127.0.0.1:6601 ; audio stays "null" (headless).
+  };
+}
+```
+
+The NixOS module wires `hypodj.overlays.default` automatically, so
+`services.hypodj.package` defaults to `pkgs.hypodj`. The system service runs
+under `DynamicUser` with `LoadCredential`, so a root-owned sops secret is read
+without any ownership juggling.
+
+### Home-Manager
+
+```nix
+{
+  inputs.hypodj.url = "github:you/hypodj";
+
+  # add the overlay so pkgs.hypodj (the module's default package) resolves:
+  nixpkgs.overlays = [ hypodj.overlays.default ];
+
+  imports = [ hypodj.homeManagerModules.default ];
+
+  services.hypodj = {
+    enable = true;
+    server.url = "https://navidrome.example.com";
+    server.username = "guilherme";
+    server.passwordFile = "/run/secrets/hypodj-password";  # any 0600 file you own
+  };
+}
+```
+
+### passwordCommand (alternative to passwordFile)
+
+Exactly one of `passwordFile` / `passwordCommand` must be set. The command's
+stdout is the password, read at start:
+
+```nix
+services.hypodj.server.passwordCommand = [ "pass" "show" "navidrome/guilherme" ];
+```
+
+### Connecting a client
+
+```
+ncmpcpp -h 127.0.0.1 -p 6601
+# or: mpc -h 127.0.0.1 -p 6601 status
+```
+
+Set `services.hypodj.audio = "device"` only when you actually want hypodj to own
+audio output; the default `"null"` keeps it headless so it never grabs your
+speakers while mopidy runs.
+
 ## Layout
 
 ```
 crates/hypodj-core/     library: config, model, subsonic, player, mpd
 crates/hypodj-daemon/   binaries: `hypodj` (daemon) + `probe` (slice prover)
-flake.nix                  reproducible devshell (rust + pkg-config + libmpv)
+flake.nix               packages.default, devShell, nixos/home-manager modules
+nix/package.nix         buildRustPackage (daemon bin, libmpv wrapped)
+nix/hypodj-module.nix   ONE shared services.hypodj module (nixos + home-manager)
+nix/overlay.nix         overlays.default -> pkgs.hypodj
 ```
 
 ## Build constraints
