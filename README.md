@@ -33,32 +33,36 @@ Subsonic library and plays the streams through mpv.
 
 ## Phased plan
 
-- **Phase 0 - FOUNDATION (this commit, compiles + real vertical slice).**
-  Cargo workspace, nix devshell, config, the OpenSubsonic client wrapper, the
-  internal domain model, the player **actor boundary** (`PlayerHandle`) with a
-  working headless `NullPlayer`, and the MPD command/response/handler
-  **interface**. The `probe` binary proves the slice against a live server:
-  config -> auth/ping -> browse -> resolve stream URL.
-- **Phase 1 - MpvPlayer + real browse. DONE (this commit).** Real playback
-  behind the same `PlayerHandle`: a dedicated thread owning `libmpv2::Mpv`,
-  driven by the command channel, pushing `time-pos`/`eof` back out as
-  `PlayerEvent`s (which drive queue-advance + scrobble). Browse mapping is real
-  (`artists`/`album_list`/`album_songs` map live wire types to the model).
-  Proven live + headless by the `play-probe` binary (see below).
-- **Phase 2 - MPD server loop. DONE (this commit).** The tokio TCP accept loop
-  + line parser (quoted args) + dispatch, bound to `127.0.0.1:6601` in dev. A
-  `HypodjHandler` (`handler.rs`) backs the ncmpcpp-critical command subset
-  with live Subsonic browse/search + the player, over a shared in-memory queue.
-  Synthetic `artist/<id>` / `album/<id>` / `song/<id>` URIs bridge MPD's
-  path model to Subsonic ids; `lsinfo` drills root -> artists -> albums ->
-  songs. `command_list[_ok]` batching + `idle`/`noidle` supported. Verified
-  live against Navidrome with a real MPD client: greet, `status`, `lsinfo`
-  browse of real artists/albums/songs, and `addid`+`play` -> `state: play`
-  (audio to `ao=null`, speakers never touched, mopidy/6600 undisturbed).
-- **Phase 3 - feature parity.** Port the 9 shipped Python features (scrobble,
-  cover art, star/love, similar/radio, smart album lists, genres, search3,
-  listing cache, OpenSubsonic extension negotiation).
-- **Phase 4 - cut over.** Flip the bind to `6600` and retire mopidy.
+- **Phase 0 - FOUNDATION. DONE.** Cargo workspace, nix devshell, config, the
+  OpenSubsonic client wrapper, the internal domain model, the player **actor
+  boundary** (`PlayerHandle`) with a headless `NullPlayer`, and the MPD
+  command/response/handler **interface**. The `probe` binary proves the slice
+  against a live server: config -> auth/ping -> browse -> resolve stream URL.
+- **Phase 1 - MpvPlayer + real browse. DONE.** Real playback behind the same
+  `PlayerHandle`: a dedicated thread owning `libmpv2::Mpv`, driven by the
+  command channel, pushing `time-pos`/`eof` back out as `PlayerEvent`s (which
+  drive queue-advance + scrobble). Browse mapping is real. Proven live +
+  headless by the `play-probe` binary.
+- **Phase 2 - MPD server loop. DONE.** The tokio TCP accept loop + line parser
+  (quoted args) + dispatch, bound to `127.0.0.1:6601` in dev. A `HypodjHandler`
+  backs the ncmpcpp-critical command subset with live Subsonic browse/search +
+  the player over a shared in-memory queue. Synthetic `artist/<id>` /
+  `album/<id>` / `song/<id>` URIs bridge MPD's path model to Subsonic ids;
+  `lsinfo` drills root -> artists -> albums -> songs. `command_list[_ok]`
+  batching + `idle`/`noidle`. Verified live against Navidrome with a real MPD
+  client.
+- **Phase 3 - feature parity. DONE.** All 9 shipped Python features ported and
+  live-verified against Navidrome (scrobble, cover art, star/love + rating via
+  MPD `sticker`, similar/radio/top, smart album lists, genres, search3 with
+  typed-tag filtering + richer metadata, TTL+LRU listing cache, OpenSubsonic
+  extension negotiation). See the honest feature-status section below.
+- **Nix packaging. DONE.** The flake exposes `packages.default` (the daemon,
+  libmpv wrapped), `nixosModules.default`, `homeManagerModules.default`, and an
+  `overlays.default` - see [Usage](#usage). Password stays out of the store
+  (systemd `LoadCredential` + a runtime-rendered config).
+- **Phase 4 - cut over. (remaining, deployment step)** Flip the bind to `6600`
+  and retire the mopidy + mopidy-subidy stack once you're ready to make hypodj
+  your daily driver.
 
 ## Phase 3 feature status (honest)
 
@@ -96,50 +100,42 @@ Known honest limitation in `idle`: it always emits `changed: player` on any
 change (single change-notifier; no per-subsystem tracking yet). ncmpcpp re-reads
 status/currentsong/plchanges on any `changed:` line, so its view still refreshes.
 
-## What is BUILT vs next-phase (honest)
+## Source map
 
-**Built now, real, compiles, tested (Phase 0 foundation + Phase 1):**
+Everything below is built, compiles, and is tested (the full workspace passes
+`cargo test`; the feature paths are additionally live-verified against Navidrome
+via the probes and a real MPD client). The only remaining item is the Phase 4
+cut-over (bind `6600` + retire mopidy), a deployment step you take when ready.
 
-- `config.rs` - TOML config, creds read from a file (never hardcoded). Default
-  MPD bind is `127.0.0.1:6601` on purpose (mopidy owns 6600). Unit-tested.
+- `config.rs` - TOML config; creds read from a file, never hardcoded. Default
+  MPD bind `127.0.0.1:6601` (mopidy owns 6600 until cut-over).
 - `model.rs` - internal domain types (`SongId`/`AlbumId`/`ArtistId` newtypes,
-  `Artist`/`Album`/`Song`), decoupled from the `opensubsonic` wire types.
-- `subsonic.rs` - `SubsonicClient` wrapping `opensubsonic::Client`. **Real:**
-  `connect` (token auth), `ping`, `artists` (real `get_artists` -> flattened
-  `Vec<Artist>`), `album_list` (real `get_album_list2` -> `Vec<Album>`),
-  `album_songs` (real `get_album` -> `Vec<Song>` from `AlbumWithSongsId3.song`),
-  `stream_url` (returns `url::Url`, the handoff type to the player). Wire->model
-  mapping is exercised both by unit tests (against the exact camelCase wire JSON,
-  deserialized through the real `opensubsonic::data` structs) and by the probes
-  against a live server.
-- `player.rs` (Phase 1) - `MpvPlayer`: the REAL libmpv-backed actor behind the
-  same `PlayerHandle`. A dedicated OS thread owns `libmpv2::Mpv`, maps commands
-  to `loadfile`/`pause`/`seek`/`volume`, and pushes `time-pos`/`eof` back out as
-  `PlayerEvent`s. `AudioOut` selects headless output (`Null` = `ao=null`, `File`
-  = encode decoded PCM to a WAV, `Device` = real speakers). Backend/init failures
-  log and fall back to `NullPlayer` - a playback failure never panics the daemon.
-- `player.rs` - the **actor boundary**: `PlayerHandle` (cloneable, `&self`
-  command methods over mpsc+oneshot, state via `watch`, events via mpsc), the
-  `PlayerEvent` stream, and a genuine `NullPlayer` actor over that boundary.
-  Unit-tested through the handle.
-- `mpd.rs` - the MPD **interface**: `MpdCommand` (including the ncmpcpp-blocking
-  command set), `MpdResponse` (pairs / binary / ack shapes), `MpdHandler` trait
-  (shared `&self`), `MpdServer`.
-- `probe.rs` - the real vertical-slice prover (see below).
-- `flake.nix` - reproducible devshell (rust + pkg-config + libmpv).
-
-**Clearly next-phase (marked `TODO(next-phase)`, not faked as done):**
-
-- `MpdServer::serve` - the TCP accept loop + line codec + dispatch. Bails with a
-  "next-phase" error today; it does not pretend to serve. This is the main
-  remaining gap: nothing yet drives `MpvPlayer` from an MPD client - the daemon
-  spawns the player headless (`AudioOut::Null`) but has no serve loop.
-- The remaining ~75 SubsonicClient endpoints (scrobble/star/search3/cover art
-  etc.) - each lands as a method on the existing wrapper. The 8 endpoints the
-  9-feature parity needs are all verified present in opensubsonic 0.3.0 with
-  concrete typed returns; only field-level wire->model mapping remains.
-- `cache.rs` / `scrobble.rs` and an `mpd/` submodule split (codec/parse/dispatch)
-  once the command surface grows.
+  `Artist`/`Album`/`Song`/`Genre`), decoupled from the `opensubsonic` wire types.
+- `subsonic.rs` - `SubsonicClient` over `opensubsonic::Client`: connect (token
+  auth, configurable client name), ping, browse (artists/albums/songs), search3,
+  scrobble, star/unstar/set_rating, get_starred2, similar/top/random songs,
+  album lists by type, genres + songs-by-genre, cover art bytes, and
+  OpenSubsonic extension negotiation. Wire->model mapping is unit-tested against
+  the real wire structs and exercised live.
+- `player.rs` - the player **actor boundary** (`PlayerHandle`) and `MpvPlayer`,
+  a real libmpv-backed actor (dedicated thread owning `libmpv2::Mpv`) that pushes
+  `time-pos`/`eof` events driving queue-advance + scrobble. `AudioOut` selects
+  headless (`Null`/`File`) or `Device` output; init failure falls back to
+  `NullPlayer` and never panics the daemon.
+- `mpd.rs` + `handler.rs` - the MPD server: accept loop, line parser (quoted
+  args), response/binary/ack framing, and dispatch of the ncmpcpp command set
+  (status/currentsong/idle, playback, queue, `lsinfo` browse of the synthetic
+  Genres/Lists/Radio/Starred dirs, `albumart`/`readpicture`, `sticker` ratings,
+  `list`/`search`/`find` with typed-tag filtering, the editable `Starred`
+  playlist star trigger).
+- `cache.rs` - the bounded TTL+LRU listing cache (freshness-critical listings
+  stay uncached; star/rating busts affected listings).
+- `scrobble.rs` - now-playing + threshold-gated completed-play submission off the
+  player event loop.
+- `nix/` + `flake.nix` - `packages.default` (daemon, libmpv wrapped),
+  `nixosModules.default`, `homeManagerModules.default`, `overlays.default`, and
+  the devshell. See [Usage](#usage).
+- `probe.rs` / `play-probe` - the "test with a real server, not mocks" provers.
 
 ## Running the vertical slice (`probe`)
 
