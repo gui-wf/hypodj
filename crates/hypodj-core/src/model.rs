@@ -52,6 +52,33 @@ pub struct Song {
     pub artist: Option<String>,
     pub track: Option<u32>,
     pub duration_secs: Option<u32>,
+    /// Cover-art id (NOT the song id). Used to resolve `albumart`/`readpicture`.
+    /// When absent, the handler falls back to the song id itself (Navidrome and
+    /// most servers accept the media id directly for getCoverArt).
     pub cover_art: Option<String>,
     pub starred: bool,
+    // ── richer metadata (feature 7) - all Option so absent server data is clean.
+    /// MusicBrainz recording/track id (wire `Child.music_brainz_id`).
+    pub musicbrainz_id: Option<String>,
+    /// Disc number (wire `Child.disc_number`).
+    pub disc: Option<u32>,
+    /// Release year (wire `Child.year`). Emitted as MPD `Date`.
+    pub year: Option<u32>,
+    /// Genre name (wire `Child.genre`).
+    pub genre: Option<String>,
+    /// Bitrate in kbps (wire `Child.bit_rate`).
+    pub bitrate: Option<u32>,
+    /// Free-form comment (wire `Child.comment`).
+    pub comment: Option<String>,
+    /// The current user's 0..=5 rating (wire `Child.user_rating`).
+    pub user_rating: Option<u8>,
+}
+
+/// A genre with its song/album counts (wire `data::Genre`; `name` is the
+/// renamed `value` field). Backs the `Genres` browse dir and `list genre`.
+#[derive(Debug, Clone)]
+pub struct Genre {
+    pub name: String,
+    pub song_count: u32,
+    pub album_count: u32,
 }

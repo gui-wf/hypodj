@@ -18,8 +18,10 @@
 //! So the honest remaining gap is field-level wire->model mapping, NOT endpoint
 //! existence and NOT a get()/raw fallback or a fork.
 
+use std::collections::HashSet;
+
 use crate::config::ServerConfig;
-use crate::model::{Album, AlbumId, Artist, ArtistId, Song, SongId};
+use crate::model::{Album, AlbumId, Artist, ArtistId, Genre, Song, SongId};
 use opensubsonic::{AlbumListType, data};
 use url::Url;
 
@@ -35,17 +37,57 @@ pub enum SubsonicError {
 
 pub struct SubsonicClient {
     inner: opensubsonic::Client,
+    /// Names of the OpenSubsonic extensions the server advertised. Filled once
+    /// by [`SubsonicClient::probe_extensions`] right after connect (see below on
+    /// why this is a separate async step, not part of the sync `connect`).
+    supported_exts: HashSet<String>,
 }
 
 impl SubsonicClient {
     /// Build the client from config. Uses token auth (MD5(password+salt)+salt),
     /// the recommended OpenSubsonic scheme - the password never crosses the
     /// wire in the clear.
+    ///
+    /// This is SYNC (it only builds a URL + auth), so it cannot call the async
+    /// `getOpenSubsonicExtensions`. The extension set therefore starts empty and
+    /// is filled by [`probe_extensions`](Self::probe_extensions), which the
+    /// daemon calls once immediately after connect, before the client is moved
+    /// into the handler. (Critique mustChange #1: the "cached at connect" claim
+    /// is not implementable in a sync connect; this `&mut self` probe is.)
     pub fn connect(cfg: &ServerConfig) -> Result<Self, SubsonicError> {
         let auth = opensubsonic::Auth::token(&cfg.username, &cfg.password);
         let inner = opensubsonic::Client::new(&cfg.url, auth)
             .map_err(|e| SubsonicError::Init(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            supported_exts: HashSet::new(),
+        })
+    }
+
+    /// Fetch and cache the server's OpenSubsonic extension names (feature 9).
+    /// Called ONCE, right after connect, before the client is Arc-wrapped. A
+    /// server that doesn't implement the endpoint (plain Subsonic) yields an
+    /// error we swallow into an empty set - scrobble/star/etc. are all CORE
+    /// Subsonic and never gated, so an empty set only disables the optional
+    /// `playbackReport` finer-grained now-playing.
+    pub async fn probe_extensions(&mut self) {
+        match self.inner.get_open_subsonic_extensions().await {
+            Ok(exts) => {
+                self.supported_exts = exts.into_iter().map(|e| e.name).collect();
+                tracing::info!(
+                    count = self.supported_exts.len(),
+                    "negotiated OpenSubsonic extensions"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "getOpenSubsonicExtensions unavailable; core-only");
+            }
+        }
+    }
+
+    /// Whether the server advertised the named OpenSubsonic extension.
+    pub fn supports_extension(&self, name: &str) -> bool {
+        self.supported_exts.contains(name)
     }
 
     /// Liveness + credential check. Vertical-slice step 2.
@@ -155,6 +197,168 @@ impl SubsonicClient {
             .stream_url(&id.0, None, None)
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
+
+    // ── scrobbling (feature 1) ─────────────────────────────────────────────
+    //
+    // `submission=false` is a now-playing notification; `submission=true` is a
+    // real play submission. `time` is epoch MILLIS of playback START per the
+    // Subsonic spec (getting the unit wrong silently mis-dates plays).
+
+    /// Now-playing notification (does not count as a play).
+    pub async fn now_playing(&self, id: &SongId) -> Result<(), SubsonicError> {
+        self.inner
+            .scrobble(&id.0, None, Some(false))
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// Submit a completed play. `start_epoch_ms` is the epoch-millis timestamp of
+    /// when playback STARTED.
+    pub async fn submit_play(&self, id: &SongId, start_epoch_ms: i64) -> Result<(), SubsonicError> {
+        self.inner
+            .scrobble(&id.0, Some(start_epoch_ms), Some(true))
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    // ── star / rating (feature 3) ──────────────────────────────────────────
+
+    pub async fn star_song(&self, id: &SongId) -> Result<(), SubsonicError> {
+        self.inner
+            .star(&[&id.0], &[], &[])
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    pub async fn unstar_song(&self, id: &SongId) -> Result<(), SubsonicError> {
+        self.inner
+            .unstar(&[&id.0], &[], &[])
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// Set a 0..=5 star rating on a song (0 clears it).
+    pub async fn set_rating(&self, id: &SongId, rating: u8) -> Result<(), SubsonicError> {
+        let r = (rating.min(5)) as i32;
+        self.inner
+            .set_rating(&id.0, r)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// The user's starred songs (ID3). Decomposed to `Vec<Song>` at the boundary
+    /// (the wire `Starred2Content.song` is `Vec<Child>`). NEVER cached - it must
+    /// reflect the latest star state.
+    pub async fn starred_songs(&self) -> Result<Vec<Song>, SubsonicError> {
+        let starred = self
+            .inner
+            .get_starred2(None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(starred.song.into_iter().map(map_song).collect())
+    }
+
+    // ── radio / similar / top (feature 4) ──────────────────────────────────
+
+    /// Songs similar to a seed song/artist id.
+    pub async fn similar_songs(
+        &self,
+        id: &SongId,
+        count: Option<i32>,
+    ) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self
+            .inner
+            .get_similar_songs2(&id.0, count)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(songs.into_iter().map(map_song).collect())
+    }
+
+    /// Top songs for an artist. NOTE: `get_top_songs` takes an artist NAME, not
+    /// an id (verified against the crate) - the caller surfaces the name from the
+    /// browse path.
+    pub async fn top_songs(
+        &self,
+        artist: &str,
+        count: Option<i32>,
+    ) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self
+            .inner
+            .get_top_songs(artist, count)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(songs.into_iter().map(map_song).collect())
+    }
+
+    /// A fresh batch of random songs. NEVER cached - randomness is the point.
+    pub async fn random_songs(&self, size: Option<i32>) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self
+            .inner
+            .get_random_songs(size, None, None, None, None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(songs.into_iter().map(map_song).collect())
+    }
+
+    // ── genres (feature 6) ─────────────────────────────────────────────────
+
+    pub async fn genres(&self) -> Result<Vec<Genre>, SubsonicError> {
+        let genres = self
+            .inner
+            .get_genres()
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(genres.into_iter().map(map_genre).collect())
+    }
+
+    pub async fn songs_by_genre(&self, genre: &str) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self
+            .inner
+            .get_songs_by_genre(genre, Some(500), None, None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(songs.into_iter().map(map_song).collect())
+    }
+
+    // ── search3 with tag-classed results (feature 7) ───────────────────────
+
+    /// Full search3, returning songs/albums/artists so callers can filter by tag
+    /// class. Subsonic search3 is full-text only; precise MPD-tag semantics need
+    /// the caller's client-side post-filter on top of these results.
+    pub async fn search3(&self, query: &str) -> Result<SearchHits, SubsonicError> {
+        let res = self
+            .inner
+            .search3(query, Some(20), None, Some(50), None, Some(200), None, None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(SearchHits {
+            artists: res.artist.into_iter().map(map_artist).collect(),
+            albums: res.album.into_iter().map(map_album).collect(),
+            songs: res.song.into_iter().map(map_song).collect(),
+        })
+    }
+
+    // ── cover art (feature 2) ──────────────────────────────────────────────
+
+    /// Fetch the full cover-art bytes for a cover id. NOTE the id is a cover-art
+    /// id (`Child.cover_art`), NOT a song id - though most servers accept the
+    /// media id directly as a fallback.
+    pub async fn cover_art(&self, cover_id: &str) -> Result<Vec<u8>, SubsonicError> {
+        let bytes = self
+            .inner
+            .get_cover_art(cover_id, None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(bytes.to_vec())
+    }
+}
+
+/// Tag-classed search3 hits, decomposed from the wire `SearchResult3` aggregate
+/// so the aggregate never leaks past this boundary.
+pub struct SearchHits {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub songs: Vec<Song>,
 }
 
 // ── wire -> model mapping ──────────────────────────────────────────────────
@@ -201,12 +405,45 @@ fn map_song(c: data::Child) -> Song {
         duration_secs: c.duration.map(|d| i64_to_u32(d)),
         cover_art: c.cover_art,
         starred: c.starred.is_some(),
+        // richer metadata (feature 7)
+        musicbrainz_id: c.music_brainz_id,
+        disc: c.disc_number.map(|d| d.max(0) as u32),
+        year: c.year.map(|y| y.max(0) as u32),
+        genre: c.genre,
+        bitrate: c.bit_rate.map(|b| b.max(0) as u32),
+        comment: c.comment,
+        // user_rating is 0..=5 on the wire; clamp into u8.
+        user_rating: c.user_rating.map(|r| r.clamp(0, 5) as u8),
+    }
+}
+
+/// Map a wire `Genre` (whose `name` is the renamed `value` field) into our
+/// `Genre`, saturating the i64 counts into u32.
+fn map_genre(g: data::Genre) -> Genre {
+    Genre {
+        name: g.name,
+        song_count: i64_to_u32(g.song_count),
+        album_count: i64_to_u32(g.album_count),
     }
 }
 
 /// Saturating i64 -> u32. Negative (never expected for a count) clamps to 0.
 fn i64_to_u32(v: i64) -> u32 {
     v.clamp(0, u32::MAX as i64) as u32
+}
+
+/// Map a smart-list browse dirname to an `AlbumListType` (feature 5). The five
+/// smart lists are the PascalCase variants defined in `api::lists` (re-exported
+/// at the crate root as `AlbumListType`).
+pub fn list_type_from_dirname(name: &str) -> Option<AlbumListType> {
+    match name {
+        "frequent" => Some(AlbumListType::Frequent),
+        "newest" => Some(AlbumListType::Newest),
+        "recent" => Some(AlbumListType::Recent),
+        "highest" => Some(AlbumListType::Highest),
+        "random" => Some(AlbumListType::Random),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -290,7 +527,53 @@ mod tests {
         assert_eq!(s.artist.as_deref(), Some("Kalabrese"));
         assert_eq!(s.track, Some(4));
         assert_eq!(s.duration_secs, Some(372));
+        assert_eq!(s.cover_art.as_deref(), Some("ca-1"));
         assert!(s.starred);
+    }
+
+    #[test]
+    fn map_song_carries_richer_metadata_from_camelcase_wire() {
+        // Feature 7: the richer tags must round-trip through the real Child
+        // deserialization (camelCase wire names) into our Song.
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-9", "title": "Rumpel Pumpel", "isDir": false,
+                 "year": 2019, "genre": "Electronic", "bitRate": 320,
+                 "discNumber": 2, "comment": "vinyl rip",
+                 "userRating": 5,
+                 "musicBrainzId": "8f3e-abc" }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.year, Some(2019));
+        assert_eq!(s.genre.as_deref(), Some("Electronic"));
+        assert_eq!(s.bitrate, Some(320));
+        assert_eq!(s.disc, Some(2));
+        assert_eq!(s.comment.as_deref(), Some("vinyl rip"));
+        assert_eq!(s.user_rating, Some(5));
+        assert_eq!(s.musicbrainz_id.as_deref(), Some("8f3e-abc"));
+    }
+
+    #[test]
+    fn map_genre_saturates_counts() {
+        let wire: data::Genre = serde_json::from_str(
+            r#"{ "value": "Techno", "songCount": 42, "albumCount": 7 }"#,
+        )
+        .unwrap();
+        let g = map_genre(wire);
+        assert_eq!(g.name, "Techno");
+        assert_eq!(g.song_count, 42);
+        assert_eq!(g.album_count, 7);
+    }
+
+    #[test]
+    fn list_type_from_dirname_maps_the_five_smart_lists() {
+        use opensubsonic::AlbumListType as T;
+        assert!(matches!(list_type_from_dirname("frequent"), Some(T::Frequent)));
+        assert!(matches!(list_type_from_dirname("newest"), Some(T::Newest)));
+        assert!(matches!(list_type_from_dirname("recent"), Some(T::Recent)));
+        assert!(matches!(list_type_from_dirname("highest"), Some(T::Highest)));
+        assert!(matches!(list_type_from_dirname("random"), Some(T::Random)));
+        assert!(list_type_from_dirname("bogus").is_none());
     }
 
     #[test]

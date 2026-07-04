@@ -30,9 +30,13 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("hypodj.toml"));
     let cfg = Config::load(&cfg_path)?;
 
-    let client = SubsonicClient::connect(&cfg.server)?;
+    let mut client = SubsonicClient::connect(&cfg.server)?;
     client.ping().await?;
+    // Negotiate OpenSubsonic extensions ONCE, while we still hold &mut, before
+    // the client is shared into the handler + scrobbler (feature 9).
+    client.probe_extensions().await;
     tracing::info!("connected to {}", cfg.server.url);
+    let client = std::sync::Arc::new(client);
 
     // Spawn the real mpv-backed player actor behind the same PlayerHandle.
     //
@@ -49,17 +53,39 @@ async fn main() -> anyhow::Result<()> {
     };
     let (player, mut player_events) = MpvPlayer::spawn(audio);
 
-    let handler = Arc::new(HypodjHandler::new(client, player.clone()));
+    let handler = Arc::new(HypodjHandler::new(client.clone(), player.clone()));
 
-    // Queue-advance: on natural EOF, advance to the next queue entry so playback
-    // continues like MPD. (Also keeps `status` honest across track ends.)
+    // The background scrobbler (feature 1) shares the SAME client. It is fed
+    // every player event alongside queue-advance.
+    let scrobbler = Arc::new(hypodj_core::scrobble::Scrobbler::new(client.clone()));
+
+    // Single event loop, two consumers: route EVERY event to the scrobbler, and
+    // additionally advance the queue on EOF. (The loop previously matched only
+    // Eof and discarded TimePos/StateChanged - the scrobbler needs those.)
     {
         let handler = handler.clone();
+        let scrobbler = scrobbler.clone();
+        let client = client.clone();
         tokio::spawn(async move {
-            use hypodj_core::player::PlayerEvent;
+            use hypodj_core::player::{PlayState, PlayerEvent};
             while let Some(ev) = player_events.recv().await {
-                if let PlayerEvent::Eof(_) = ev {
-                    handler.advance_on_eof().await;
+                scrobbler.on_event(&ev);
+                match &ev {
+                    // On a NEW song starting, resolve its duration so the 50%
+                    // scrobble threshold can engage (off the hot path is fine;
+                    // this loop is not the player thread).
+                    PlayerEvent::StateChanged(PlayState::Playing, Some(id)) => {
+                        let scrobbler = scrobbler.clone();
+                        let client = client.clone();
+                        let id = id.clone();
+                        tokio::spawn(async move {
+                            if let Ok(song) = client.song(&id).await {
+                                scrobbler.set_duration(&id, song.duration_secs);
+                            }
+                        });
+                    }
+                    PlayerEvent::Eof(_) => handler.advance_on_eof().await,
+                    _ => {}
                 }
             }
         });

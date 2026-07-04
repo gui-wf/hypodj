@@ -11,9 +11,11 @@
 //!               ncmpcpp-blocking command set + binary response shape); the TCP
 //!               accept/codec loop is next-phase.
 
+pub mod cache;
 pub mod config;
 pub mod handler;
 pub mod model;
 pub mod mpd;
 pub mod player;
+pub mod scrobble;
 pub mod subsonic;

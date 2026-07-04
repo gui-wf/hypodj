@@ -57,8 +57,11 @@ pub enum PlayerEvent {
     /// The current track finished (natural end). Triggers queue-advance +
     /// scrobble submission.
     Eof(SongId),
-    /// Play state changed (e.g. paused, stopped).
-    StateChanged(PlayState),
+    /// Play state changed (e.g. paused, stopped). Carries the id of the song the
+    /// state applies to so the scrobbler is self-describing: it can start a
+    /// now-playing on a NEW Playing id and attribute later `TimePos` to that
+    /// latched id (TimePos itself is id-less). `None` on Stop (no current song).
+    StateChanged(PlayState, Option<SongId>),
 }
 
 /// Commands sent INTO the player actor. Each carries a `oneshot` for its reply,
@@ -173,25 +176,33 @@ impl NullPlayer {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
                     PlayerCommand::PlayUrl { song, url: _, reply } => {
-                        current = Some(song);
+                        current = Some(song.clone());
                         let _ = state_tx.send(PlayState::Playing);
-                        let _ = evt_tx.send(PlayerEvent::StateChanged(PlayState::Playing)).await;
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Playing, Some(song)))
+                            .await;
                         let _ = reply.send(Ok(()));
                     }
                     PlayerCommand::Pause(reply) => {
                         let _ = state_tx.send(PlayState::Paused);
-                        let _ = evt_tx.send(PlayerEvent::StateChanged(PlayState::Paused)).await;
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Paused, current.clone()))
+                            .await;
                         let _ = reply.send(Ok(()));
                     }
                     PlayerCommand::Resume(reply) => {
                         let _ = state_tx.send(PlayState::Playing);
-                        let _ = evt_tx.send(PlayerEvent::StateChanged(PlayState::Playing)).await;
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Playing, current.clone()))
+                            .await;
                         let _ = reply.send(Ok(()));
                     }
                     PlayerCommand::Stop(reply) => {
                         current = None;
                         let _ = state_tx.send(PlayState::Stopped);
-                        let _ = evt_tx.send(PlayerEvent::StateChanged(PlayState::Stopped)).await;
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Stopped, None))
+                            .await;
                         let _ = reply.send(Ok(()));
                     }
                     PlayerCommand::Seek { secs, reply } => {
@@ -338,7 +349,8 @@ fn mpv_actor(
                 if let Some(song) = current.take() {
                     let _ = state_tx.send(PlayState::Stopped);
                     let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
-                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped));
+                    let _ = evt_tx
+                        .blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
                 }
             }
             Some(Ok(_)) => {}
@@ -368,9 +380,12 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             match &res {
                 Ok(()) => {
-                    *current = Some(song);
+                    *current = Some(song.clone());
                     let _ = state_tx.send(PlayState::Playing);
-                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Playing));
+                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
+                        PlayState::Playing,
+                        Some(song),
+                    ));
                 }
                 Err(e) => tracing::error!(error = %e, "mpv loadfile failed"),
             }
@@ -382,7 +397,10 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             if res.is_ok() {
                 let _ = state_tx.send(PlayState::Paused);
-                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Paused));
+                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
+                    PlayState::Paused,
+                    current.clone(),
+                ));
             }
             let _ = reply.send(res);
         }
@@ -392,7 +410,10 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             if res.is_ok() {
                 let _ = state_tx.send(PlayState::Playing);
-                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Playing));
+                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
+                    PlayState::Playing,
+                    current.clone(),
+                ));
             }
             let _ = reply.send(res);
         }
@@ -402,7 +423,7 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             *current = None;
             let _ = state_tx.send(PlayState::Stopped);
-            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped));
+            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
             let _ = reply.send(res);
         }
         PlayerCommand::Seek { secs, reply } => {

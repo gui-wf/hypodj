@@ -38,11 +38,11 @@ use tokio::net::TcpListener;
 /// IMPORTANT contract: the greeting version tells the client which syntax and
 /// binary/filter capabilities the server claims. Advertising `0.23.0` promises
 /// `albumart`/`readpicture` binary responses and the modern filter syntax. We
-/// advertise a version we can actually back. Until the binary + filter surface
-/// is implemented (next-phase), keep this at a conservative version that does
-/// NOT invite ncmpcpp to request capabilities we would then ACK on. Bump it to
-/// `0.23.0` in lockstep with implementing `albumart` + filter parsing.
-pub const ADVERTISED_MPD_VERSION: &str = "0.21.0";
+/// advertise a version we can actually back. As of Phase 3 the binary surface
+/// (`albumart`/`readpicture` -> getCoverArt, chunked to `binarylimit`) and the
+/// typed find/search tag filter ARE implemented, so `0.23.0` is now honest -
+/// bumped in lockstep as the module contract mandates.
+pub const ADVERTISED_MPD_VERSION: &str = "0.23.0";
 
 /// The command surface, parsed from the wire.
 ///
@@ -106,13 +106,25 @@ pub enum MpdCommand {
     ListPlaylists,
     ListPlaylistInfo(String),
     Load(String),
+    /// `playlistadd <name> <uri>` - the `Starred` playlist is our star trigger:
+    /// `playlistadd Starred song/<id>` stars the song server-side.
+    PlaylistAdd(String, String),
+    /// `playlistdelete <name> <pos>` - position-based (MPD has no uri delete).
+    /// For `Starred`, the position maps back to a starred song id (re-fetched in
+    /// the same order `listplaylistinfo` returned) -> unstar.
+    PlaylistDelete(String, usize),
+    /// `playlistclear <name>` - clear a stored playlist.
+    PlaylistClear(String),
 
     // ── db browse (backed by Subsonic browse/search3) ──────────────────
     LsInfo(Option<String>),
     ListAllInfo(Option<String>),
-    /// `find <filter...>` / `search <filter...>` -> Subsonic search3.
-    Find(String),
-    Search(String),
+    /// `find <filter...>` (exact) / `search <filter...>` (case-insensitive
+    /// substring) -> Subsonic search3 + client-side tag post-filter. Carries the
+    /// tag->value pairs verbatim (lowercased tag) so the dispatch can filter
+    /// precisely; search3 itself is full-text only.
+    Find(Vec<(String, String)>),
+    Search(Vec<(String, String)>),
     /// `list <tag> [filter]` -> Subsonic list/browse (e.g. `list genre`).
     List(String),
 
@@ -122,6 +134,9 @@ pub enum MpdCommand {
     AlbumArt(String, usize),
     /// `readpicture <uri> <offset>` - embedded picture, same framing.
     ReadPicture(String, usize),
+    /// `binarylimit <bytes>` - client-negotiated max binary chunk size. ncmpcpp
+    /// sends this before `albumart`. Applied per-connection (default 8192).
+    BinaryLimit(usize),
 
     // ── capability probe (ncmpcpp fires these at connect) ──────────────
     Commands,
@@ -238,15 +253,22 @@ pub fn parse(line: &str) -> MpdCommand {
         "listplaylists" => MpdCommand::ListPlaylists,
         "listplaylistinfo" => MpdCommand::ListPlaylistInfo(arg(0).unwrap_or_default()),
         "load" => MpdCommand::Load(arg(0).unwrap_or_default()),
+        "playlistadd" => MpdCommand::PlaylistAdd(arg(0).unwrap_or_default(), arg(1).unwrap_or_default()),
+        "playlistdelete" => MpdCommand::PlaylistDelete(
+            arg(0).unwrap_or_default(),
+            arg(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+        ),
+        "playlistclear" => MpdCommand::PlaylistClear(arg(0).unwrap_or_default()),
         "lsinfo" => MpdCommand::LsInfo(arg(0)),
         "listall" | "listallinfo" => MpdCommand::ListAllInfo(arg(0)),
-        // find/search take `TYPE VALUE ...` filters; we join the remaining args
-        // into a single free-text query and hand it to search3.
-        "find" => MpdCommand::Find(join_filter(&args)),
-        "search" => MpdCommand::Search(join_filter(&args)),
+        // find/search take `TAG VALUE ...` filters; keep the tag->value pairs so
+        // dispatch can post-filter search3 (full-text) with MPD-tag precision.
+        "find" => MpdCommand::Find(parse_filter(&args)),
+        "search" => MpdCommand::Search(parse_filter(&args)),
         "list" => MpdCommand::List(args.join(" ")),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
+        "binarylimit" => MpdCommand::BinaryLimit(arg(0).and_then(|s| s.parse().ok()).unwrap_or(8192)),
         "commands" => MpdCommand::Commands,
         "notcommands" => MpdCommand::NotCommands,
         "tagtypes" => MpdCommand::TagTypes,
@@ -298,10 +320,41 @@ mod parse_tests {
     }
 
     #[test]
-    fn search_filter_drops_tag_names_keeps_values() {
-        // `search Title foo Artist bar` -> "foo bar"
+    fn search_filter_keeps_tag_value_pairs() {
+        // `search Title foo Artist bar` -> [(title,foo),(artist,bar)] so dispatch
+        // can post-filter search3 with MPD-tag precision.
         match parse("search Title foo Artist bar") {
-            MpdCommand::Search(q) => assert_eq!(q, "foo bar"),
+            MpdCommand::Search(pairs) => {
+                assert_eq!(
+                    pairs,
+                    vec![
+                        ("title".to_string(), "foo".to_string()),
+                        ("artist".to_string(), "bar".to_string()),
+                    ]
+                );
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_search_value_files_under_any() {
+        match parse("search kalabrese") {
+            MpdCommand::Search(pairs) => {
+                assert_eq!(pairs, vec![("any".to_string(), "kalabrese".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_binarylimit_and_playlistadd() {
+        assert!(matches!(parse("binarylimit 4096"), MpdCommand::BinaryLimit(4096)));
+        match parse("playlistadd Starred song/so-1") {
+            MpdCommand::PlaylistAdd(name, uri) => {
+                assert_eq!(name, "Starred");
+                assert_eq!(uri, "song/so-1");
+            }
             other => panic!("got {other:?}"),
         }
     }
@@ -340,23 +393,35 @@ mod parse_tests {
     }
 }
 
-/// Collapse a `find`/`search` filter arg list into a free-text query. MPD sends
-/// `search TITLE foo ARTIST bar`; Subsonic's search3 is full-text, so we drop
-/// the tag-name tokens (every other token) and keep the values.
-fn join_filter(args: &[String]) -> String {
-    // Heuristic: known tag names are dropped; everything else is a value.
-    const TAGS: &[&str] = &[
-        "any", "title", "artist", "album", "albumartist", "track", "genre",
-        "date", "composer", "performer", "comment", "disc", "file", "base",
-        "modified-since", "albumartistsort", "artistsort",
-    ];
-    let mut out: Vec<&str> = Vec::new();
-    for a in args {
-        if !TAGS.contains(&a.to_lowercase().as_str()) {
-            out.push(a);
+/// Known MPD filter tag names (lowercased). A token equal to one of these
+/// begins a `TAG VALUE` pair; anything else is treated as a bare value under the
+/// `any` tag.
+const FILTER_TAGS: &[&str] = &[
+    "any", "title", "artist", "album", "albumartist", "track", "genre", "date",
+    "composer", "performer", "comment", "disc", "file", "base", "modified-since",
+    "albumartistsort", "artistsort",
+];
+
+/// Parse a `find`/`search` filter arg list into `(tag, value)` pairs, preserving
+/// the tag so dispatch can post-filter with MPD-tag precision (search3 itself is
+/// full-text only). `search TITLE foo ARTIST bar` -> `[(title,foo),(artist,bar)]`.
+/// A bare leading value (no tag) is filed under `any`.
+fn parse_filter(args: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let lower = args[i].to_lowercase();
+        if FILTER_TAGS.contains(&lower.as_str()) {
+            let value = args.get(i + 1).cloned().unwrap_or_default();
+            out.push((lower, value));
+            i += 2;
+        } else {
+            // bare value -> `any`
+            out.push(("any".to_string(), args[i].clone()));
+            i += 1;
         }
     }
-    out.join(" ")
+    out
 }
 
 /// What a handler produces for one command.
