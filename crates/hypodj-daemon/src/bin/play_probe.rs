@@ -21,16 +21,16 @@
 use std::time::Duration;
 
 use opensubsonic::AlbumListType;
-use subsonity_core::config::Config;
-use subsonity_core::model::{AlbumId, SongId};
-use subsonity_core::player::{AudioOut, MpvPlayer, PlayState};
-use subsonity_core::subsonic::SubsonicClient;
+use hypodj_core::config::Config;
+use hypodj_core::model::{AlbumId, SongId};
+use hypodj_core::player::{AudioOut, MpvPlayer, PlayState};
+use hypodj_core::subsonic::SubsonicClient;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let cfg_path = args.next().unwrap_or_else(|| "subsonity.toml".into());
-    let out_path = args.next().unwrap_or_else(|| "/tmp/subsonity-play-probe.wav".into());
+    let cfg_path = args.next().unwrap_or_else(|| "hypodj.toml".into());
+    let out_path = args.next().unwrap_or_else(|| "/tmp/hypodj-play-probe.wav".into());
     let secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(6);
 
     let cfg = Config::load(std::path::Path::new(&cfg_path))?;
@@ -100,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
             _ = tokio::time::sleep_until(deadline) => break,
             ev = events.recv() => {
                 match ev {
-                    Some(subsonity_core::player::PlayerEvent::TimePos(t)) => last_pos = t,
-                    Some(subsonity_core::player::PlayerEvent::Eof(_)) => {
+                    Some(hypodj_core::player::PlayerEvent::TimePos(t)) => last_pos = t,
+                    Some(hypodj_core::player::PlayerEvent::Eof(_)) => {
                         println!("      track reached EOF before deadline");
                         break;
                     }

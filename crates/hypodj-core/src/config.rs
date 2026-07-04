@@ -41,7 +41,7 @@ impl Default for MpdConfig {
 }
 
 fn default_client_name() -> String {
-    "subsonity".to_string()
+    "hypodj".to_string()
 }
 
 fn default_mpd_bind() -> String {
@@ -90,7 +90,7 @@ mod tests {
         .expect("valid config");
         assert_eq!(cfg.server.url, "https://music.example.com");
         assert_eq!(cfg.server.username, "alice");
-        assert_eq!(cfg.server.client_name, "subsonity");
+        assert_eq!(cfg.server.client_name, "hypodj");
         assert_eq!(cfg.mpd.bind, "127.0.0.1:6601");
     }
 

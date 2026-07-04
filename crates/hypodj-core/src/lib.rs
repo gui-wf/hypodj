@@ -1,4 +1,4 @@
-//! subsonity-core: the reusable library half of the daemon.
+//! hypodj-core: the reusable library half of the daemon.
 //!
 //! Module map (FOUNDATION vs next-phase):
 //!   config    - FOUNDATION: TOML config load.

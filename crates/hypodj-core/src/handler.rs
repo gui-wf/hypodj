@@ -46,7 +46,7 @@ struct State {
     playlist_version: u64,
 }
 
-pub struct SubsonityHandler {
+pub struct HypodjHandler {
     client: SubsonicClient,
     player: PlayerHandle,
     state: Mutex<State>,
@@ -54,7 +54,7 @@ pub struct SubsonityHandler {
     changed: Notify,
 }
 
-impl SubsonityHandler {
+impl HypodjHandler {
     pub fn new(client: SubsonicClient, player: PlayerHandle) -> Self {
         Self {
             client,
@@ -175,7 +175,7 @@ fn ack(code: u32, command: &str, message: &str) -> MpdResponse {
 const ACK_ERROR_NO_EXIST: u32 = 50;
 const ACK_ERROR_UNKNOWN: u32 = 5;
 
-impl MpdHandler for SubsonityHandler {
+impl MpdHandler for HypodjHandler {
     async fn idle(&self, _subsystems: Vec<String>) -> Option<String> {
         // Minimal-correct: wait for any change notification, report "player".
         // (ncmpcpp re-issues idle after each, and re-reads status/currentsong.)
@@ -508,7 +508,7 @@ impl MpdHandler for SubsonityHandler {
             }
             MpdCommand::Outputs => MpdResponse::pairs()
                 .pair("outputid", "0")
-                .pair("outputname", "subsonity")
+                .pair("outputname", "hypodj")
                 .pair("outputenabled", "1")
                 .build(),
             MpdCommand::Decoders => MpdResponse::ok(),
@@ -521,7 +521,7 @@ impl MpdHandler for SubsonityHandler {
     }
 }
 
-impl SubsonityHandler {
+impl HypodjHandler {
     /// Back `lsinfo` / `listallinfo`. Root lists artist directories; `artist/<id>`
     /// lists album directories; `album/<id>` lists song files.
     async fn lsinfo(&self, path: Option<&str>) -> MpdResponse {

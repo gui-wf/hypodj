@@ -1,12 +1,12 @@
 [package]
-name = "subsonity-daemon"
+name = "hypodj-daemon"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "subsonity"
+name = "hypodj"
 path = "src/main.rs"
 
 # The vertical-slice prover: config -> ping -> browse -> stream URL against a
@@ -23,12 +23,12 @@ name = "play-probe"
 path = "src/bin/play_probe.rs"
 
 [dependencies]
-subsonity-core = { path = "../subsonity-core" }
+hypodj-core = { path = "../hypodj-core" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # For the AlbumListType enum passed to the probe's browse call. (The daemon
-# talks to Subsonic only through subsonity-core::subsonic; this is the one
+# talks to Subsonic only through hypodj-core::subsonic; this is the one
 # upstream type that leaks into a call-site arg.)
 opensubsonic.workspace = true

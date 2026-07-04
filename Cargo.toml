@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/subsonity-core",
-    "crates/subsonity-daemon",
+    "crates/hypodj-core",
+    "crates/hypodj-daemon",
 ]
 
 [workspace.package]

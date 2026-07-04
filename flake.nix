@@ -1,5 +1,5 @@
 {
-  description = "subsonity - MPD-speaking OpenSubsonic client daemon";
+  description = "hypodj - MPD-speaking OpenSubsonic client daemon";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

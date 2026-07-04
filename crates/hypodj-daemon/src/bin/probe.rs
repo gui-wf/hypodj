@@ -11,14 +11,14 @@
 //! handoff point to the mpv player - a thin, clearly-scoped next step.)
 
 use opensubsonic::AlbumListType;
-use subsonity_core::config::Config;
-use subsonity_core::model::SongId;
-use subsonity_core::subsonic::SubsonicClient;
+use hypodj_core::config::Config;
+use hypodj_core::model::SongId;
+use hypodj_core::subsonic::SubsonicClient;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let cfg_path = args.next().unwrap_or_else(|| "subsonity.toml".into());
+    let cfg_path = args.next().unwrap_or_else(|| "hypodj.toml".into());
     let song_id = args.next().unwrap_or_else(|| "1".into());
 
     let cfg = Config::load(std::path::Path::new(&cfg_path))?;

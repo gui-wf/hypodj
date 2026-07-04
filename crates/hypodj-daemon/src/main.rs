@@ -1,4 +1,4 @@
-//! subsonity daemon entrypoint.
+//! hypodj daemon entrypoint.
 //!
 //! FOUNDATION wiring: load config, connect + ping the Subsonic server, then
 //! (TODO next-phase) start the MPD server bound to config.mpd.bind.
@@ -10,10 +10,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use subsonity_core::config::Config;
-use subsonity_core::handler::SubsonityHandler;
-use subsonity_core::mpd::MpdServer;
-use subsonity_core::subsonic::SubsonicClient;
+use hypodj_core::config::Config;
+use hypodj_core::handler::HypodjHandler;
+use hypodj_core::mpd::MpdServer;
+use hypodj_core::subsonic::SubsonicClient;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("subsonity.toml"));
+        .unwrap_or_else(|| PathBuf::from("hypodj.toml"));
     let cfg = Config::load(&cfg_path)?;
 
     let client = SubsonicClient::connect(&cfg.server)?;
@@ -36,27 +36,27 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the real mpv-backed player actor behind the same PlayerHandle.
     //
-    // AudioOut is chosen from SUBSONITY_AUDIO: "null" (default) keeps playback
+    // AudioOut is chosen from HYPODJ_AUDIO: "null" (default) keeps playback
     // fully headless (ao=null) - what the Phase-2 dev/validation run uses so the
     // user's speakers are never touched while mopidy still owns real output;
     // "device" opens the real device (Phase-4 cutover). If libmpv is missing at
     // runtime, spawn() logs and falls back to a NullPlayer actor rather than
     // panicking.
-    use subsonity_core::player::{AudioOut, MpvPlayer};
-    let audio = match std::env::var("SUBSONITY_AUDIO").as_deref() {
+    use hypodj_core::player::{AudioOut, MpvPlayer};
+    let audio = match std::env::var("HYPODJ_AUDIO").as_deref() {
         Ok("device") => AudioOut::Device,
         _ => AudioOut::Null,
     };
     let (player, mut player_events) = MpvPlayer::spawn(audio);
 
-    let handler = Arc::new(SubsonityHandler::new(client, player.clone()));
+    let handler = Arc::new(HypodjHandler::new(client, player.clone()));
 
     // Queue-advance: on natural EOF, advance to the next queue entry so playback
     // continues like MPD. (Also keeps `status` honest across track ends.)
     {
         let handler = handler.clone();
         tokio::spawn(async move {
-            use subsonity_core::player::PlayerEvent;
+            use hypodj_core::player::PlayerEvent;
             while let Some(ev) = player_events.recv().await {
                 if let PlayerEvent::Eof(_) = ev {
                     handler.advance_on_eof().await;

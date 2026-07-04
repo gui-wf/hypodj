@@ -442,6 +442,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypodj-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libmpv2",
+ "opensubsonic",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "hypodj-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hypodj-core",
+ "opensubsonic",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1268,34 +1296,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "subsonity-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libmpv2",
- "opensubsonic",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "subsonity-daemon"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "opensubsonic",
- "subsonity-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
 
 [[package]]
 name = "subtle"

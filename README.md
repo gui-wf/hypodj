@@ -1,19 +1,27 @@
-# subsonity
+# hypodj - *The DJ Underneath*
 
 A single standalone Rust daemon that (a) speaks the **MPD text protocol** on TCP
 so ncmpcpp and every other MPD client keeps working unchanged, and (b) is itself
 an **OpenSubsonic client + audio player**.
 
+The name is from the Roman **hypocaust** (Greek *hypo-*, "beneath" + *kaustos*,
+"burnt") - the furnace and flue chamber below a bath that heated the room above,
+tended out of sight. `hypodj` is the DJ underneath: it does the real work
+(browsing, streaming, playing your Navidrome library) hidden below, while your
+MPD client lounges in the warm room. It replaces the mopidy + mopidy-subidy
+Python stack with one Rust binary. (Bonus: rust is iron oxide - the furnace
+connection runs deep.)
+
 It is meant to replace the `mopidy` + `mopidy-subidy` Python stack entirely: no
-Python, no mopidy core, no MPRIS/GStreamer glue. ncmpcpp connects to subsonity
-exactly as it connects to mopidy today; subsonity translates MPD commands into
+Python, no mopidy core, no MPRIS/GStreamer glue. ncmpcpp connects to hypodj
+exactly as it connects to mopidy today; hypodj translates MPD commands into
 OpenSubsonic REST calls (browse / search / star / scrobble) and drives a local
 audio engine that streams the resolved URLs.
 
 ## Vision (north star)
 
 ```
-  ncmpcpp ──MPD text protocol──▶ subsonity ──OpenSubsonic REST──▶ Navidrome
+  ncmpcpp ──MPD text protocol──▶ hypodj ──OpenSubsonic REST──▶ Navidrome
    (unchanged)      (TCP)         │  daemon      (browse/search/     (or any
                                   │              stream/scrobble)     OpenSubsonic
                                   ▼                                   server)
@@ -40,7 +48,7 @@ Subsonic library and plays the streams through mpv.
   Proven live + headless by the `play-probe` binary (see below).
 - **Phase 2 - MPD server loop. DONE (this commit).** The tokio TCP accept loop
   + line parser (quoted args) + dispatch, bound to `127.0.0.1:6601` in dev. A
-  `SubsonityHandler` (`handler.rs`) backs the ncmpcpp-critical command subset
+  `HypodjHandler` (`handler.rs`) backs the ncmpcpp-critical command subset
   with live Subsonic browse/search + the player, over a shared in-memory queue.
   Synthetic `artist/<id>` / `album/<id>` / `song/<id>` URIs bridge MPD's
   path model to Subsonic ids; `lsinfo` drills root -> artists -> albums ->
@@ -104,7 +112,7 @@ The `probe` binary is the "test with a real server, not mocks" proof:
 
 ```
 nix develop
-# create a config with your server creds (see subsonity.toml.example)
+# create a config with your server creds (see hypodj.toml.example)
 cargo run -j2 --bin probe -- ./my-config.toml <song-id>
 ```
 
@@ -199,8 +207,8 @@ sanctioned fallback. Nothing was ever sent to the speakers.
 ## Layout
 
 ```
-crates/subsonity-core/     library: config, model, subsonic, player, mpd
-crates/subsonity-daemon/   binaries: `subsonity` (daemon) + `probe` (slice prover)
+crates/hypodj-core/     library: config, model, subsonic, player, mpd
+crates/hypodj-daemon/   binaries: `hypodj` (daemon) + `probe` (slice prover)
 flake.nix                  reproducible devshell (rust + pkg-config + libmpv)
 ```
 
