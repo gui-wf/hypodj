@@ -58,8 +58,12 @@ impl SubsonicClient {
     /// is not implementable in a sync connect; this `&mut self` probe is.)
     pub fn connect(cfg: &ServerConfig) -> Result<Self, SubsonicError> {
         let auth = opensubsonic::Auth::token(&cfg.username, &cfg.password);
+        // Send the configured client_name as the OpenSubsonic `c` param, rather
+        // than the crate's default. This is the `server.client_name` config field
+        // (and the module's `clientName` option) actually taking effect.
         let inner = opensubsonic::Client::new(&cfg.url, auth)
-            .map_err(|e| SubsonicError::Init(e.to_string()))?;
+            .map_err(|e| SubsonicError::Init(e.to_string()))?
+            .with_client_name(&cfg.client_name);
         Ok(Self {
             inner,
             supported_exts: HashSet::new(),
@@ -566,6 +570,36 @@ mod tests {
         assert!(matches!(list_type_from_dirname("highest"), Some(T::Highest)));
         assert!(matches!(list_type_from_dirname("random"), Some(T::Random)));
         assert!(list_type_from_dirname("bogus").is_none());
+    }
+
+    #[test]
+    fn connect_threads_configured_client_name_into_c_param() {
+        // The configured client_name must reach the OpenSubsonic `c=` param, not
+        // the crate's default. stream_url bakes the full query (including c=) so
+        // we can read it back off a real SubsonicClient built via connect().
+        let cfg = ServerConfig {
+            url: "https://music.example.com".into(),
+            username: "alice".into(),
+            password: "s3cr3t".into(),
+            client_name: "hypodj-custom".into(),
+        };
+        // connect() builds a real reqwest client, which needs system CA certs.
+        // In a network-isolated build sandbox no CA certs are present and the
+        // upstream reqwest builder aborts; that is environmental, not a wiring
+        // failure, so skip the assertion there. Outside the sandbox (devshell /
+        // CI with certs) this runs and proves the c= param carries client_name.
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        let url = client.stream_url(&SongId("so-1".into())).expect("stream url");
+        let has_c = url
+            .query_pairs()
+            .any(|(k, v)| k == "c" && v == "hypodj-custom");
+        assert!(has_c, "c= param must carry configured client_name; got {url}");
     }
 
     #[test]

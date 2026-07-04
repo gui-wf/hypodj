@@ -54,20 +54,34 @@ let
   # real password. Both flavors reference this same file.
   templateFile = tomlFormat.generate "hypodj-config-template.toml" merged;
 
+  # The systemd credential name staged by LoadCredential (both flavors when a
+  # passwordFile is set). systemd copies passwordFile into a per-service tmpfs
+  # readable by the service uid at $CREDENTIALS_DIRECTORY/<name>.
+  credentialName = "hypodj-password";
+
   # How the render step obtains the plaintext password on stdin of `pw=$(...)`.
-  #  - NixOS: systemd LoadCredential copies passwordFile into a tmpfs the (possibly
-  #    DynamicUser) uid can read; we read $CREDENTIALS_DIRECTORY/password. This
-  #    sidesteps the DynamicUser-cannot-read-root-owned-sops-secret trap entirely.
-  #  - Home-Manager: the unit already runs as the user, so read passwordFile /
-  #    run passwordCommand directly.
+  #  - passwordCommand: run it directly in ExecStartPre. NOTE: this runs with the
+  #    SERVICE's privileges/sandbox (DynamicUser, ProtectHome=true on NixOS), so
+  #    it must not need to read anything the hardened service cannot reach. Use
+  #    passwordFile (LoadCredential) for sops secrets that live under the user's
+  #    home or are root-owned.
+  #  - passwordFile: read from the systemd credential directory. LoadCredential
+  #    stages the file into a tmpfs the service uid can read, which works with
+  #    DynamicUser + ProtectHome=true (NixOS) and with a user service (HM) whose
+  #    manager supports credentials. This sidesteps the
+  #    DynamicUser/ProtectHome-cannot-read-the-sops-secret trap entirely.
+  #    Fallback (HM without credential support): read passwordFile directly - the
+  #    user service runs as the file's owner so that is fine.
+  useLoadCredential = cfg.server.passwordFile != null;
+
   passwordSource =
     if cfg.server.passwordCommand != null then
       lib.escapeShellArgs cfg.server.passwordCommand
-    else if isNixos then
-      # LoadCredential target (see serviceConfig below).
-      ''cat "$CREDENTIALS_DIRECTORY/password"''
     else
-      ''cat ${lib.escapeShellArg (toString cfg.server.passwordFile)}'';
+      # Prefer the LoadCredential-staged copy; on a user manager without
+      # credential support, $CREDENTIALS_DIRECTORY is unset and we fall back to
+      # reading the passwordFile path directly.
+      ''cat "''${CREDENTIALS_DIRECTORY:-}/${credentialName}" 2>/dev/null || cat ${lib.escapeShellArg (toString cfg.server.passwordFile)}'';
 
   # Shared render script. Reads the password, TOML-escapes it (backslash then
   # double-quote - the only two metacharacters that break a TOML basic string;
@@ -156,8 +170,8 @@ let
       # secrets. Only used when reading from a file (passwordCommand renders on
       # its own).
       LoadCredential =
-        lib.optional (cfg.server.passwordFile != null)
-          "password:${toString cfg.server.passwordFile}";
+        lib.optional useLoadCredential
+          "${credentialName}:${toString cfg.server.passwordFile}";
 
       # Hardening (NixOS-system only). DynamicUser + LoadCredential is the
       # idiomatic secrets-safe combination: no fixed user needed, and the sops
@@ -190,6 +204,14 @@ let
       RuntimeDirectoryMode = "0700";
       Restart = "on-failure";
       RestartSec = 5;
+      # LoadCredential is honored by recent user systemd; it stages passwordFile
+      # into $CREDENTIALS_DIRECTORY the render step reads. On an older user
+      # manager without credential support the variable is simply unset and the
+      # render step falls back to reading passwordFile directly (the user service
+      # runs as the file's owner, so that is safe).
+    } // lib.optionalAttrs useLoadCredential {
+      LoadCredential = "${credentialName}:${toString cfg.server.passwordFile}";
+    } // {
       # NO DynamicUser/ProtectSystem/RestrictAddressFamilies here: those are
       # system-service-only and break user-service activation.
     };
@@ -227,13 +249,20 @@ in
     };
 
     server.passwordFile = mkOption {
-      type = types.nullOr types.path;
+      # types.str (NOT types.path): a path is used verbatim as a RUNTIME path.
+      # types.path would coerce a literal path into the Nix store (copying the
+      # secret in). A sops runtime path like
+      # config.sops.secrets."hypodj/password".path is already a string and must
+      # stay a string so it is never copied to the store.
+      type = types.nullOr types.str;
       default = null;
       example = literalExpression ''config.sops.secrets."hypodj/password".path'';
       description = ''
-        Path to a file containing the Navidrome password, read at service start
-        into a runtime-only config. sops-nix friendly. The password never enters
-        the Nix store. Exactly one of passwordFile / passwordCommand must be set.
+        Path (as a string) to a file containing the Navidrome password, read at
+        service start into a runtime-only config. sops-nix friendly. The password
+        never enters the Nix store - pass a runtime path string (e.g.
+        `config.sops.secrets."hypodj/password".path`), not a literal store path.
+        Exactly one of passwordFile / passwordCommand must be set.
       '';
     };
 

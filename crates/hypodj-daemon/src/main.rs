@@ -15,8 +15,41 @@ use hypodj_core::handler::HypodjHandler;
 use hypodj_core::mpd::MpdServer;
 use hypodj_core::subsonic::SubsonicClient;
 
+const USAGE: &str = "\
+hypodj - MPD-speaking OpenSubsonic client daemon
+
+USAGE:
+    hypodj [CONFIG]
+
+ARGS:
+    CONFIG    Path to the TOML config (default: hypodj.toml)
+
+ENV:
+    HYPODJ_AUDIO    \"null\" (default, headless ao=null) or \"device\" (real output)
+    RUST_LOG        tracing filter (default: info)
+
+OPTIONS:
+    -h, --help       Print this help and exit
+    -V, --version    Print version and exit";
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
+    // Tiny hand-rolled flag handling: keep argv[1] as the config path, but treat
+    // the standard --help/--version flags specially. No arg-parser dependency.
+    if let Some(arg) = std::env::args().nth(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("hypodj {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

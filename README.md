@@ -275,8 +275,15 @@ the store; the real password is substituted at start.
 
 The NixOS module wires `hypodj.overlays.default` automatically, so
 `services.hypodj.package` defaults to `pkgs.hypodj`. The system service runs
-under `DynamicUser` with `LoadCredential`, so a root-owned sops secret is read
-without any ownership juggling.
+under `DynamicUser` with `LoadCredential` (credential name `hypodj-password`),
+so a root-owned sops secret is read without any ownership juggling: systemd
+stages the file into `$CREDENTIALS_DIRECTORY` readable by the (dynamic) service
+user, and the pre-start render step reads it there - this works despite
+`DynamicUser` + `ProtectHome=true`.
+
+`passwordFile` is typed `str`, not `path`, on purpose: pass a runtime path
+string such as `config.sops.secrets."hypodj/password".path`. It is used verbatim
+as a runtime path and is never copied into the Nix store.
 
 ### Home-Manager
 
@@ -306,6 +313,12 @@ stdout is the password, read at start:
 ```nix
 services.hypodj.server.passwordCommand = [ "pass" "show" "navidrome/guilherme" ];
 ```
+
+Note: `passwordCommand` runs in `ExecStartPre` with the service's own
+privileges and sandbox (on NixOS that means `DynamicUser` + `ProtectHome=true`).
+It must not depend on reading anything the hardened service cannot reach. For a
+sops secret under a user home or root-owned, prefer `passwordFile`, which is
+staged via systemd `LoadCredential` and is readable regardless of the sandbox.
 
 ### Connecting a client
 
