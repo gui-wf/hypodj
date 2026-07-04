@@ -15,6 +15,13 @@ path = "src/main.rs"
 name = "probe"
 path = "src/bin/probe.rs"
 
+# The Phase-1 LIVE + HEADLESS playback prover: browse -> album songs -> stream
+# URL -> real MpvPlayer decoding to a WAV FILE (never speakers) -> assert real
+# bytes decoded. Run: cargo run -j2 --bin play-probe -- <config.toml> [out.wav]
+[[bin]]
+name = "play-probe"
+path = "src/bin/play_probe.rs"
+
 [dependencies]
 subsonity-core = { path = "../subsonity-core" }
 tokio.workspace = true

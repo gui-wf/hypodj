@@ -32,10 +32,12 @@ Subsonic library and plays the streams through mpv.
   working headless `NullPlayer`, and the MPD command/response/handler
   **interface**. The `probe` binary proves the slice against a live server:
   config -> auth/ping -> browse -> resolve stream URL.
-- **Phase 1 - MpvPlayer.** Real playback behind the same `PlayerHandle`: a
-  dedicated thread owning `libmpv2::Mpv`, driven by the command channel, pushing
-  `time-pos`/`eof` back out as `PlayerEvent`s (which drive queue-advance +
-  scrobble). The devshell already ships libmpv, so adding the dep links.
+- **Phase 1 - MpvPlayer + real browse. DONE (this commit).** Real playback
+  behind the same `PlayerHandle`: a dedicated thread owning `libmpv2::Mpv`,
+  driven by the command channel, pushing `time-pos`/`eof` back out as
+  `PlayerEvent`s (which drive queue-advance + scrobble). Browse mapping is real
+  (`artists`/`album_list`/`album_songs` map live wire types to the model).
+  Proven live + headless by the `play-probe` binary (see below).
 - **Phase 2 - MPD server loop.** The TCP accept loop + line codec + dispatch
   implementing the ncmpcpp-critical command subset, bound to `127.0.0.1:6601`
   in dev.
@@ -46,7 +48,7 @@ Subsonic library and plays the streams through mpv.
 
 ## What is BUILT vs next-phase (honest)
 
-**Built now, real, compiles, tested:**
+**Built now, real, compiles, tested (Phase 0 foundation + Phase 1):**
 
 - `config.rs` - TOML config, creds read from a file (never hardcoded). Default
   MPD bind is `127.0.0.1:6601` on purpose (mopidy owns 6600). Unit-tested.
@@ -55,8 +57,17 @@ Subsonic library and plays the streams through mpv.
 - `subsonic.rs` - `SubsonicClient` wrapping `opensubsonic::Client`. **Real:**
   `connect` (token auth), `ping`, `artists` (real `get_artists` -> flattened
   `Vec<Artist>`), `album_list` (real `get_album_list2` -> `Vec<Album>`),
+  `album_songs` (real `get_album` -> `Vec<Song>` from `AlbumWithSongsId3.song`),
   `stream_url` (returns `url::Url`, the handoff type to the player). Wire->model
-  mapping is exercised by the probe against a live server.
+  mapping is exercised both by unit tests (against the exact camelCase wire JSON,
+  deserialized through the real `opensubsonic::data` structs) and by the probes
+  against a live server.
+- `player.rs` (Phase 1) - `MpvPlayer`: the REAL libmpv-backed actor behind the
+  same `PlayerHandle`. A dedicated OS thread owns `libmpv2::Mpv`, maps commands
+  to `loadfile`/`pause`/`seek`/`volume`, and pushes `time-pos`/`eof` back out as
+  `PlayerEvent`s. `AudioOut` selects headless output (`Null` = `ao=null`, `File`
+  = encode decoded PCM to a WAV, `Device` = real speakers). Backend/init failures
+  log and fall back to `NullPlayer` - a playback failure never panics the daemon.
 - `player.rs` - the **actor boundary**: `PlayerHandle` (cloneable, `&self`
   command methods over mpsc+oneshot, state via `watch`, events via mpsc), the
   `PlayerEvent` stream, and a genuine `NullPlayer` actor over that boundary.
@@ -69,10 +80,10 @@ Subsonic library and plays the streams through mpv.
 
 **Clearly next-phase (marked `TODO(next-phase)`, not faked as done):**
 
-- `MpvPlayer` - the real libmpv-backed actor. The `NullPlayer` proves the
-  boundary works; the mpv thread is the swap-in.
 - `MpdServer::serve` - the TCP accept loop + line codec + dispatch. Bails with a
-  "next-phase" error today; it does not pretend to serve.
+  "next-phase" error today; it does not pretend to serve. This is the main
+  remaining gap: nothing yet drives `MpvPlayer` from an MPD client - the daemon
+  spawns the player headless (`AudioOut::Null`) but has no serve loop.
 - The remaining ~75 SubsonicClient endpoints (scrobble/star/search3/cover art
   etc.) - each lands as a method on the existing wrapper. The 8 endpoints the
   9-feature parity needs are all verified present in opensubsonic 0.3.0 with
@@ -100,6 +111,27 @@ names, and a resolved stream URL that independently returns `audio/flac`
 (HTTP 206, range-capable - what mpv needs for seeking). The stream URL carries
 the auth token in its query string, so the probe prints only scheme/host/path
 and redacts the query.
+
+## Running the Phase-1 playback proof (`play-probe`)
+
+`play-probe` extends the slice through REAL, headless audio decode:
+
+```
+nix develop
+cargo run -j2 --bin play-probe -- ./my-config.toml /tmp/out.wav 6
+```
+
+It browses -> lists the first album's songs (`get_album`) -> picks a track ->
+resolves its stream URL -> hands it to `MpvPlayer` configured with
+`AudioOut::File` (mpv encodes decoded PCM to a WAV; **no audio device is ever
+opened**) -> plays a few seconds -> stops -> asserts the WAV grew to real size.
+
+Verified live + headless against Navidrome: mpv reached `Playing`, `time-pos`
+advanced to ~27s, and a **4.7 MB WAV** was captured. The file independently
+re-decodes as `pcm_s16le 2ch 44100 Hz` under mpv, confirming real audio (not a
+stub). songrec did not recognize the sample track (niche electronic release,
+not in Shazam's DB), so the proof is the bytes-decoded + re-decode check - the
+sanctioned fallback. Nothing was ever sent to the speakers.
 
 ## Design decisions worth knowing
 
@@ -146,10 +178,12 @@ and redacts the query.
   the `SubsonicError`-as-string boundary mean a fallback to hand-rolled `reqwest`
   calls is survivable, and the dep is pinned to `=0.3.0` (with `Cargo.lock`
   committed) so a silent minor bump cannot reshape the wire types this layer maps.
-- **libmpv is a C system dependency** (Phase 1). Mitigation: the nix devshell
-  provides it reproducibly (`mpv-unwrapped` + `pkg-config`). The foundation stays
-  link-light (mpv is not yet a Cargo dep); Phase 1 must actually construct
-  `libmpv2::Mpv` and play one URL through the channel wrapper to fully de-risk.
+- **libmpv is a C system dependency** (now linked via `libmpv2` 4.1 /
+  `libmpv2-sys`). Mitigation: the nix devshell provides it reproducibly
+  (`mpv-unwrapped` + `pkg-config`). De-risked: `play-probe` constructs a real
+  `libmpv2::Mpv` and decodes a live stream URL to a WAV through the channel
+  wrapper. If libmpv is missing at runtime, `MpvPlayer::spawn` logs and falls
+  back to `NullPlayer` rather than panicking.
 - **The MPD server is hand-rolled** (no server-side crate exists; `mpd`/
   `mpd_client` are clients, `mpd_protocol` is a client codec). The risk is the
   scope of the command set, not per-command difficulty - which is why the

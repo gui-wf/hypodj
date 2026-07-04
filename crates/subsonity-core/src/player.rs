@@ -212,25 +212,224 @@ impl NullPlayer {
     }
 }
 
-// TODO(next-phase): MpvPlayer.
-//
-//   pub struct MpvPlayer;
-//   impl MpvPlayer {
-//       pub fn spawn() -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
-//           // 1. mpsc + watch + event channels, IDENTICAL to NullPlayer::spawn.
-//           // 2. std::thread::spawn a dedicated OS thread that:
-//           //      - constructs libmpv2::Mpv (NOT Send, so it is created and
-//           //        stays ON this thread; only channel ends cross threads),
-//           //      - loops: select between (a) cmd_rx.blocking_recv() and
-//           //        (b) mpv.wait_event(timeout) DRAINED to None each wakeup,
-//           //      - maps commands -> loadfile / set_property("pause") / seek /
-//           //        set_property("volume"),
-//           //      - maps mpv events -> PlayerEvent: PropertyChange("time-pos")
-//           //        -> TimePos, EndFile -> Eof(current_song) (drives scrobble +
-//           //        queue-advance), and pushes PlayState via the watch.
-//           // The PlayerHandle contract above does not change.
-//       }
-//   }
+/// Audio-output configuration for [`MpvPlayer`]. The whole point is the HARD
+/// CONSTRAINT: a test/headless run must NEVER hit the real speakers.
+#[derive(Debug, Clone, Default)]
+pub enum AudioOut {
+    /// Decode audio but send it nowhere (`ao=null`). Fully headless, no device
+    /// touched, no file written. This is the default so a mistaken construction
+    /// can never play to the user's speakers.
+    #[default]
+    Null,
+    /// Decode and encode audio to a WAV file (`ao=null` is NOT used; instead
+    /// `--o=<path>` drives mpv's encode path with a wav muxer + pcm codec). The
+    /// resulting file contains REAL decoded PCM, which is what the play-probe
+    /// checks (bytes grew / songrec) to prove playback actually happened.
+    File(std::path::PathBuf),
+    /// The real default device. Only reachable by explicitly asking for it;
+    /// nothing in the test path constructs this.
+    Device,
+}
+
+/// The real, libmpv-backed player actor. Lives behind the SAME [`PlayerHandle`]
+/// boundary as [`NullPlayer`], so no layer above it changes.
+///
+/// libmpv2::Mpv is not freely Send/Sync and its event loop is a blocking pull,
+/// so the Mpv handle is created ON a dedicated OS thread and never leaves it;
+/// only channel ends cross the thread boundary.
+pub struct MpvPlayer;
+
+impl MpvPlayer {
+    /// Spawn the mpv actor with the given audio-output policy. Returns the
+    /// handle + the event stream, identical contract to `NullPlayer::spawn`.
+    ///
+    /// If the `Mpv` handle cannot even be constructed (no libmpv at runtime),
+    /// we log and fall back to a `NullPlayer` actor so the daemon does not
+    /// panic - a playback backend failure must degrade, not crash.
+    pub fn spawn(out: AudioOut) -> (PlayerHandle, mpsc::Receiver<PlayerEvent>) {
+        use libmpv2::Mpv;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<PlayerCommand>(32);
+        let (state_tx, state_rx) = watch::channel(PlayState::Stopped);
+        let (evt_tx, evt_rx) = mpsc::channel::<PlayerEvent>(64);
+
+        // Build the Mpv instance up front so a construction failure can fall
+        // back to NullPlayer BEFORE we hand out a broken handle.
+        let mpv = Mpv::with_initializer(|init| {
+            // Audio-only, no window, no terminal control.
+            init.set_property("vid", "no")?;
+            init.set_property("video", "no")?;
+            init.set_property("terminal", "no")?;
+            match &out {
+                AudioOut::Null => {
+                    init.set_property("ao", "null")?;
+                }
+                AudioOut::File(path) => {
+                    // mpv's encode mode: write decoded audio to a WAV file
+                    // instead of a device. Real PCM bytes land on disk.
+                    init.set_property("o", path.to_string_lossy().as_ref())?;
+                    init.set_property("of", "wav")?;
+                    init.set_property("oac", "pcm_s16le")?;
+                }
+                AudioOut::Device => {}
+            }
+            Ok(())
+        });
+
+        let mpv = match mpv {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(error = %e, "mpv init failed; falling back to NullPlayer");
+                drop((cmd_rx, state_tx, state_rx, evt_tx, evt_rx, cmd_tx));
+                return NullPlayer::spawn();
+            }
+        };
+
+        std::thread::Builder::new()
+            .name("mpv-player".into())
+            .spawn(move || mpv_actor(mpv, cmd_rx, state_tx, evt_tx))
+            .expect("spawn mpv thread");
+
+        (PlayerHandle { cmd_tx, state_rx }, evt_rx)
+    }
+}
+
+/// The mpv actor body, running on its own OS thread. Owns the `Mpv` handle and
+/// drives it from the command channel, draining mpv events on every wakeup.
+fn mpv_actor(
+    mut mpv: libmpv2::Mpv,
+    mut cmd_rx: mpsc::Receiver<PlayerCommand>,
+    state_tx: watch::Sender<PlayState>,
+    evt_tx: mpsc::Sender<PlayerEvent>,
+) {
+    use libmpv2::{Format, events::Event};
+
+    // Observe time-pos so we can push TimePos events (drives scrobble + UI).
+    let ectx = mpv.event_context_mut();
+    let _ = ectx.observe_property("time-pos", Format::Double, 0);
+    let _ = ectx.observe_property("eof-reached", Format::Flag, 1);
+
+    let mut current: Option<SongId> = None;
+
+    loop {
+        // 1. Drain any pending commands without blocking.
+        match cmd_rx.try_recv() {
+            Ok(cmd) => {
+                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, cmd) {
+                    // Stop requested with shutdown intent is not modeled;
+                    // channel close is the only exit. Continue.
+                }
+                continue;
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => {}
+        }
+
+        // 2. Pump mpv events with a short timeout so we stay responsive to
+        //    commands. wait_event MUST be drained each wakeup.
+        let ectx = mpv.event_context_mut();
+        match ectx.wait_event(0.1) {
+            Some(Ok(Event::PropertyChange { name: "time-pos", change, .. })) => {
+                if let libmpv2::events::PropertyData::Double(t) = change {
+                    let _ = evt_tx.blocking_send(PlayerEvent::TimePos(t));
+                }
+            }
+            Some(Ok(Event::EndFile(_))) => {
+                if let Some(song) = current.take() {
+                    let _ = state_tx.send(PlayState::Stopped);
+                    let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
+                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped));
+                }
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "mpv event error");
+            }
+            None => {}
+        }
+    }
+    tracing::debug!("mpv actor exiting (command channel closed)");
+}
+
+/// Apply one command to the mpv handle. Errors are logged (never panic): a
+/// failed loadfile must reply Err to the caller and keep the actor alive.
+fn handle_cmd(
+    mpv: &libmpv2::Mpv,
+    state_tx: &watch::Sender<PlayState>,
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    current: &mut Option<SongId>,
+    cmd: PlayerCommand,
+) -> bool {
+    match cmd {
+        PlayerCommand::PlayUrl { song, url, reply } => {
+            let res = mpv
+                .command("loadfile", &[&quote(&url), "replace"])
+                .and_then(|_| mpv.set_property("pause", false))
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            match &res {
+                Ok(()) => {
+                    *current = Some(song);
+                    let _ = state_tx.send(PlayState::Playing);
+                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Playing));
+                }
+                Err(e) => tracing::error!(error = %e, "mpv loadfile failed"),
+            }
+            let _ = reply.send(res);
+        }
+        PlayerCommand::Pause(reply) => {
+            let res = mpv
+                .set_property("pause", true)
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            if res.is_ok() {
+                let _ = state_tx.send(PlayState::Paused);
+                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Paused));
+            }
+            let _ = reply.send(res);
+        }
+        PlayerCommand::Resume(reply) => {
+            let res = mpv
+                .set_property("pause", false)
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            if res.is_ok() {
+                let _ = state_tx.send(PlayState::Playing);
+                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Playing));
+            }
+            let _ = reply.send(res);
+        }
+        PlayerCommand::Stop(reply) => {
+            let res = mpv
+                .command("stop", &[])
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            *current = None;
+            let _ = state_tx.send(PlayState::Stopped);
+            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped));
+            let _ = reply.send(res);
+        }
+        PlayerCommand::Seek { secs, reply } => {
+            let res = mpv
+                .command("seek", &[&secs.to_string(), "absolute"])
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            if res.is_ok() {
+                let _ = evt_tx.blocking_send(PlayerEvent::TimePos(secs));
+            }
+            let _ = reply.send(res);
+        }
+        PlayerCommand::SetVolume { vol, reply } => {
+            let res = mpv
+                .set_property("volume", vol as i64)
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            let _ = reply.send(res);
+        }
+    }
+    false
+}
+
+/// mpv's `command`/`loadfile` treats spaces as argument separators, so a URL
+/// with special chars must be wrapped in `%N%<bytes>` percent-length quoting or
+/// double quotes. We use double-quotes (URLs never contain a literal `"`).
+fn quote(url: &str) -> String {
+    format!("\"{url}\"")
+}
 
 #[cfg(test)]
 mod tests {

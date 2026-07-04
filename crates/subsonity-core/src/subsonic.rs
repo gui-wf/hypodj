@@ -19,7 +19,7 @@
 //! existence and NOT a get()/raw fallback or a fork.
 
 use crate::config::ServerConfig;
-use crate::model::{Album, AlbumId, Artist, ArtistId, SongId};
+use crate::model::{Album, AlbumId, Artist, ArtistId, Song, SongId};
 use opensubsonic::{AlbumListType, data};
 use url::Url;
 
@@ -95,6 +95,20 @@ impl SubsonicClient {
         Ok(albums.into_iter().map(map_album).collect())
     }
 
+    /// List the songs of an album. REAL: calls `get_album` (returns
+    /// `AlbumWithSongsId3`, whose `song: Vec<Child>` are the tracks) and maps
+    /// each `Child` into our `Song`. This is the "resolve an album's tracks so
+    /// we can queue+stream them" step the play-probe needs to pick a real song
+    /// id without guessing.
+    pub async fn album_songs(&self, id: &AlbumId) -> Result<Vec<Song>, SubsonicError> {
+        let album = self
+            .inner
+            .get_album(&id.0)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(album.song.into_iter().map(map_song).collect())
+    }
+
     /// Resolve a playable stream URL for a song. Vertical-slice step 4.
     ///
     /// This is the handoff point to the audio player: hand this URL straight to
@@ -139,7 +153,117 @@ fn map_album(a: data::AlbumId3) -> Album {
     }
 }
 
+/// Map a wire `Child` (the universal media/song row) into our `Song`. Only the
+/// song-relevant fields are carried; video/rating/podcast fields are dropped at
+/// this boundary so the model never grows a wire-shaped tail.
+fn map_song(c: data::Child) -> Song {
+    Song {
+        id: SongId(c.id),
+        title: c.title,
+        album: c.album,
+        album_id: c.album_id.map(AlbumId),
+        artist: c.artist,
+        track: c.track.map(|t| t.max(0) as u32),
+        duration_secs: c.duration.map(|d| i64_to_u32(d)),
+        cover_art: c.cover_art,
+        starred: c.starred.is_some(),
+    }
+}
+
 /// Saturating i64 -> u32. Negative (never expected for a count) clamps to 0.
 fn i64_to_u32(v: i64) -> u32 {
     v.clamp(0, u32::MAX as i64) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These deserialize the EXACT camelCase wire JSON an OpenSubsonic server
+    // sends (through the real `opensubsonic::data` structs), then run our
+    // wire->model mappers. This exercises the boundary honestly: if the crate's
+    // field names/shapes drift, deserialization fails here, not silently in
+    // production. It does not need a live server (the wire shape is fixed).
+
+    #[test]
+    fn map_artist_flattens_optional_count_and_starred() {
+        let wire: data::ArtistId3 = serde_json::from_str(
+            r#"{ "id": "ar-1", "name": "Kalabrese", "albumCount": 3,
+                 "starred": "2024-01-02T03:04:05Z", "coverArt": "ca-9" }"#,
+        )
+        .unwrap();
+        let a = map_artist(wire);
+        assert_eq!(a.id, ArtistId("ar-1".into()));
+        assert_eq!(a.name, "Kalabrese");
+        assert_eq!(a.album_count, 3);
+        assert!(a.starred);
+        assert_eq!(a.cover_art.as_deref(), Some("ca-9"));
+    }
+
+    #[test]
+    fn map_artist_defaults_missing_count_to_zero_and_unstarred() {
+        let wire: data::ArtistId3 =
+            serde_json::from_str(r#"{ "id": "ar-2", "name": "1300" }"#).unwrap();
+        let a = map_artist(wire);
+        assert_eq!(a.album_count, 0);
+        assert!(!a.starred);
+        assert_eq!(a.cover_art, None);
+    }
+
+    #[test]
+    fn map_album_carries_year_genre_and_song_count() {
+        let wire: data::AlbumId3 = serde_json::from_str(
+            r#"{ "id": "al-1", "name": "Let Love Rumpel - Part 2",
+                 "artist": "Kalabrese", "artistId": "ar-1", "year": 2019,
+                 "genre": "Electronic", "songCount": 8 }"#,
+        )
+        .unwrap();
+        let al = map_album(wire);
+        assert_eq!(al.id, AlbumId("al-1".into()));
+        assert_eq!(al.name, "Let Love Rumpel - Part 2");
+        assert_eq!(al.artist, "Kalabrese");
+        assert_eq!(al.artist_id, Some(ArtistId("ar-1".into())));
+        assert_eq!(al.year, Some(2019));
+        assert_eq!(al.genre.as_deref(), Some("Electronic"));
+        assert_eq!(al.song_count, 8);
+    }
+
+    #[test]
+    fn map_album_tolerates_missing_optionals() {
+        let wire: data::AlbumId3 =
+            serde_json::from_str(r#"{ "id": "al-2", "name": "Untitled" }"#).unwrap();
+        let al = map_album(wire);
+        assert_eq!(al.artist, ""); // unwrap_or_default
+        assert_eq!(al.artist_id, None);
+        assert_eq!(al.year, None);
+        assert_eq!(al.song_count, 0);
+    }
+
+    #[test]
+    fn map_song_maps_child_track_duration_and_album_link() {
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-1", "title": "Independent Us", "album": "Let Love Rumpel",
+                 "albumId": "al-1", "artist": "Kalabrese", "track": 4,
+                 "duration": 372, "coverArt": "ca-1",
+                 "starred": "2024-05-01T00:00:00Z", "isDir": false }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.id, SongId("so-1".into()));
+        assert_eq!(s.title, "Independent Us");
+        assert_eq!(s.album.as_deref(), Some("Let Love Rumpel"));
+        assert_eq!(s.album_id, Some(AlbumId("al-1".into())));
+        assert_eq!(s.artist.as_deref(), Some("Kalabrese"));
+        assert_eq!(s.track, Some(4));
+        assert_eq!(s.duration_secs, Some(372));
+        assert!(s.starred);
+    }
+
+    #[test]
+    fn i64_to_u32_saturates_and_clamps() {
+        assert_eq!(i64_to_u32(-5), 0);
+        assert_eq!(i64_to_u32(0), 0);
+        assert_eq!(i64_to_u32(42), 42);
+        assert_eq!(i64_to_u32(i64::MAX), u32::MAX);
+    }
 }

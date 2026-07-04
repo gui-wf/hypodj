@@ -32,10 +32,14 @@ async fn main() -> anyhow::Result<()> {
     client.ping().await?;
     tracing::info!("connected to {}", cfg.server.url);
 
-    // Spawn the (currently headless) player actor. In Phase 1 this call site
-    // swaps NullPlayer::spawn() for MpvPlayer::spawn() and nothing else changes:
-    // the daemon holds the same PlayerHandle + event stream either way.
-    let (player, _player_events) = subsonity_core::player::NullPlayer::spawn();
+    // Spawn the real mpv-backed player actor behind the same PlayerHandle. It is
+    // constructed with AudioOut::Null here: the MPD server loop that would drive
+    // real playback is still next-phase, so the daemon must not open the audio
+    // device on startup. When the serve loop lands, this flips to
+    // AudioOut::Device. If libmpv is missing at runtime, spawn() logs and falls
+    // back to a NullPlayer actor rather than panicking.
+    use subsonity_core::player::{AudioOut, MpvPlayer};
+    let (player, _player_events) = MpvPlayer::spawn(AudioOut::Null);
     let _ = player.state();
 
     let bind: SocketAddr = cfg.mpd.bind.parse()?;

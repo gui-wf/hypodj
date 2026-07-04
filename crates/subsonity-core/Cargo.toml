@@ -14,3 +14,11 @@ thiserror.workspace = true
 tracing.workspace = true
 opensubsonic.workspace = true
 url.workspace = true
+# Real libmpv-backed player (Phase 1). The devshell ships mpv-unwrapped +
+# pkg-config, so libmpv2-sys links against it. Pinned to a known-good minor.
+libmpv2 = "4.1"
+
+[dev-dependencies]
+# Deserialize the exact camelCase wire JSON in the wire->model mapping tests,
+# through the real `opensubsonic::data` structs. Not a runtime dep.
+serde_json = "1"
