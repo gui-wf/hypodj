@@ -9,8 +9,7 @@ The name is from the Roman **hypocaust** (Greek *hypo-*, "beneath" + *kaustos*,
 tended out of sight. `hypodj` is the DJ underneath: it does the real work
 (browsing, streaming, playing your Navidrome library) hidden below, while your
 MPD client lounges in the warm room. It replaces the mopidy + mopidy-subidy
-Python stack with one Rust binary. (Bonus: rust is iron oxide - the furnace
-connection runs deep.)
+Python stack with one Rust binary.
 
 It is meant to replace the `mopidy` + `mopidy-subidy` Python stack entirely: no
 Python, no mopidy core, no MPRIS/GStreamer glue. ncmpcpp connects to hypodj
