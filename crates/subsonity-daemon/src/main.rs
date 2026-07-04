@@ -1,0 +1,49 @@
+//! subsonity daemon entrypoint.
+//!
+//! FOUNDATION wiring: load config, connect + ping the Subsonic server, then
+//! (TODO next-phase) start the MPD server bound to config.mpd.bind.
+//!
+//! HARD CONSTRAINT honored: default bind is 127.0.0.1:6601, NOT 6600 - the
+//! running mopidy service owns 6600 and must not be disturbed.
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use subsonity_core::config::Config;
+use subsonity_core::mpd::MpdServer;
+use subsonity_core::subsonic::SubsonicClient;
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    let cfg_path = std::env::args()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("subsonity.toml"));
+    let cfg = Config::load(&cfg_path)?;
+
+    let client = SubsonicClient::connect(&cfg.server)?;
+    client.ping().await?;
+    tracing::info!("connected to {}", cfg.server.url);
+
+    // Spawn the (currently headless) player actor. In Phase 1 this call site
+    // swaps NullPlayer::spawn() for MpvPlayer::spawn() and nothing else changes:
+    // the daemon holds the same PlayerHandle + event stream either way.
+    let (player, _player_events) = subsonity_core::player::NullPlayer::spawn();
+    let _ = player.state();
+
+    let bind: SocketAddr = cfg.mpd.bind.parse()?;
+    let server = MpdServer::new(bind);
+    tracing::info!(%bind, "MPD server layer is next-phase; not serving yet");
+
+    // TODO(next-phase): build the shared MpdHandler (holds `player` clone +
+    // `client`) and `server.serve(Arc::new(handler)).await`.
+    let _ = server;
+    Ok(())
+}

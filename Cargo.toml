@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/subsonity-core",
+    "crates/subsonity-daemon",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Pinned exactly: opensubsonic 0.3.0 is a young, single-maintainer crate (first
+# published Feb 2026). The `subsonic` wrapper is the mitigation seam; pinning the
+# exact version is the second guard so a silent minor bump can't reshape the wire
+# types this whole layer maps. See README "Accepted risks".
+opensubsonic = "=0.3.0"
+# opensubsonic::Client::stream_url returns url::Url; we keep that type through our
+# wrapper (no parse round-trip on the handoff to the player), so we name it here.
+url = "2"
+
+[profile.dev]
+# Keep foundation builds cheap; the audio/link step is the expensive part.
+opt-level = 0

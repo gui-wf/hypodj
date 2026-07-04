@@ -1,0 +1,21 @@
+# subsonity configuration.
+#
+# Copy to subsonity.toml (or any path) and pass it to the daemon/probe:
+#   cargo run -j2 --bin probe -- ./subsonity.toml <song-id>
+#
+# Creds live in this file only - they are NEVER hardcoded in the binary. Keep
+# this file 0600 if it holds a real password. In production you would render it
+# from your secrets manager (e.g. sops) rather than editing it by hand.
+
+[server]
+url = "https://navidrome.example.com"
+username = "your-username"
+password = "your-password"
+# Client name reported to the server (OpenSubsonic `c` param). Optional.
+client_name = "subsonity"
+
+[mpd]
+# The MPD-protocol listener bind address.
+# Default is 127.0.0.1:6601 ON PURPOSE: mopidy owns 6600 during the migration.
+# Production parity flips this to 6600 once mopidy is retired (Phase 4).
+bind = "127.0.0.1:6601"
