@@ -10,6 +10,8 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub mpd: MpdConfig,
+    #[serde(default)]
+    pub mpris: MprisConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,6 +40,26 @@ impl Default for MpdConfig {
     fn default() -> Self {
         Self { bind: default_mpd_bind() }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MprisConfig {
+    /// Expose the MPRIS (org.mpris.MediaPlayer2.hypodj) D-Bus server on the
+    /// session bus so desktops show now-playing + controls. Default true; set
+    /// false to disable. Registered under the `.hypodj` bus name (NOT `.mopidy`),
+    /// so it never conflicts with a running mopidy MPRIS server.
+    #[serde(default = "default_mpris_enable")]
+    pub enable: bool,
+}
+
+impl Default for MprisConfig {
+    fn default() -> Self {
+        Self { enable: default_mpris_enable() }
+    }
+}
+
+fn default_mpris_enable() -> bool {
+    true
 }
 
 fn default_client_name() -> String {

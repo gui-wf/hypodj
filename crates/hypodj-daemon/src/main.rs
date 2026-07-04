@@ -129,6 +129,25 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // MPRIS (org.mpris.MediaPlayer2.hypodj) on the session bus: desktops get
+    // now-playing + cover art + controls. Registered under the `.hypodj` bus name
+    // so it NEVER conflicts with a running mopidy's `.mopidy`. If mpris.enable is
+    // false, or there is no session bus (headless / no DBUS_SESSION_BUS_ADDRESS),
+    // we log and skip - never fatal, and the MPD serve loop is unaffected.
+    if cfg.mpris.enable {
+        match hypodj_core::mpris::serve(player.clone(), handler.clone(), client.clone()).await {
+            Ok(server) => {
+                tracing::info!("MPRIS server on org.mpris.MediaPlayer2.hypodj");
+                tokio::spawn(hypodj_core::mpris::run_property_updates(server));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "MPRIS unavailable (no session bus?); skipping");
+            }
+        }
+    } else {
+        tracing::info!("MPRIS disabled by config");
+    }
+
     let bind: SocketAddr = cfg.mpd.bind.parse()?;
     let server = MpdServer::new(bind);
     tracing::info!(%bind, "starting MPD server");

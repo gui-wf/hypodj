@@ -16,6 +16,7 @@ pub mod config;
 pub mod handler;
 pub mod model;
 pub mod mpd;
+pub mod mpris;
 pub mod player;
 pub mod scrobble;
 pub mod subsonic;

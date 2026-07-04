@@ -17,6 +17,9 @@ url.workspace = true
 # Real libmpv-backed player (Phase 1). The devshell ships mpv-unwrapped +
 # pkg-config, so libmpv2-sys links against it. Pinned to a known-good minor.
 libmpv2 = "4.1"
+# MPRIS (org.mpris.MediaPlayer2) D-Bus surface for desktop now-playing +
+# controls. Pure-Rust (zbus, no new system lib). 0.8 pins zbus 4.4.
+mpris-server = "0.8"
 
 [dev-dependencies]
 # Deserialize the exact camelCase wire JSON in the wire->model mapping tests,

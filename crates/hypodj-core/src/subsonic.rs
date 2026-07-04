@@ -336,6 +336,17 @@ impl SubsonicClient {
 
     // ── cover art (feature 2) ──────────────────────────────────────────────
 
+    /// Build a `getCoverArt` URL for a cover id, with auth baked in exactly like
+    /// [`stream_url`](Self::stream_url) (token + salt in the query). SYNC (no
+    /// request). This is what MPRIS hands desktops as `mpris:artUrl` so the
+    /// desktop fetches the image itself - the auth in the query makes it work
+    /// without any hypodj-side proxying.
+    pub fn cover_art_url(&self, cover_id: &str) -> Result<Url, SubsonicError> {
+        self.inner
+            .cover_art_url(cover_id, None)
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
     /// Fetch the full cover-art bytes for a cover id. NOTE the id is a cover-art
     /// id (`Child.cover_art`), NOT a song id - though most servers accept the
     /// media id directly as a fallback.
