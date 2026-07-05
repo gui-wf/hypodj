@@ -44,6 +44,55 @@ pub struct HypodjMpris {
     player: PlayerHandle,
     handler: Arc<HypodjHandler>,
     client: Arc<SubsonicClient>,
+    /// Command to spawn on MPRIS `Raise()` (e.g. a terminal + ncmpcpp). `None`
+    /// (or empty) means `CanRaise` is false and `Raise()` is a no-op.
+    raise_command: Option<Vec<String>>,
+}
+
+impl HypodjMpris {
+    /// True iff a non-empty raise command is configured. Pure; unit-tested.
+    fn can_raise_configured(&self) -> bool {
+        can_raise(self.raise_command.as_deref())
+    }
+
+    /// Spawn the configured raise command detached. See [`spawn_raise`].
+    fn do_raise(&self) {
+        spawn_raise(self.raise_command.as_deref());
+    }
+}
+
+/// True iff a non-empty raise command is configured. Pure; unit-tested.
+pub fn can_raise(raise_command: Option<&[String]>) -> bool {
+    raise_command.is_some_and(|c| !c.is_empty())
+}
+
+/// Spawn the configured raise command detached (no wait, null stdio). A spawn
+/// error is logged, never propagated - `Raise()` must never block the D-Bus
+/// method or panic. No-op when no (or empty) command is configured. Free-standing
+/// (independent of the networked struct) so it is hermetically unit-testable.
+pub fn spawn_raise(raise_command: Option<&[String]>) {
+    let Some(cmd) = raise_command.filter(|c| !c.is_empty()) else {
+        return;
+    };
+    let (program, args) = (&cmd[0], &cmd[1..]);
+    let spawn = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match spawn {
+        // Reap the child once it exits so a repeatedly-clicked Raise does not
+        // leak zombies; we still never block waiting for it here.
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, program = %program, "MPRIS Raise spawn failed");
+        }
+    }
 }
 
 impl HypodjMpris {
@@ -133,11 +182,13 @@ pub async fn serve(
     player: PlayerHandle,
     handler: Arc<HypodjHandler>,
     client: Arc<SubsonicClient>,
+    raise_command: Option<Vec<String>>,
 ) -> mpris_server::zbus::Result<Server<HypodjMpris>> {
     let imp = HypodjMpris {
         player,
         handler,
         client,
+        raise_command,
     };
     Server::new("hypodj", imp).await
 }
@@ -170,6 +221,7 @@ pub async fn run_property_updates(server: Server<HypodjMpris>) {
 
 impl RootInterface for HypodjMpris {
     async fn raise(&self) -> fdo::Result<()> {
+        self.do_raise();
         Ok(())
     }
     async fn quit(&self) -> fdo::Result<()> {
@@ -188,7 +240,7 @@ impl RootInterface for HypodjMpris {
         Ok(false)
     }
     async fn can_raise(&self) -> fdo::Result<bool> {
-        Ok(false)
+        Ok(self.can_raise_configured())
     }
     async fn has_track_list(&self) -> fdo::Result<bool> {
         Ok(false)
@@ -366,6 +418,55 @@ mod tests {
             comment: None,
             user_rating: None,
         }
+    }
+
+    #[test]
+    fn can_raise_reflects_config() {
+        // None -> false; Some empty -> false; Some non-empty -> true.
+        assert!(!can_raise(None));
+        assert!(!can_raise(Some(&[])));
+        let cmd = vec!["kitty".to_string(), "ncmpcpp".to_string()];
+        assert!(can_raise(Some(&cmd)));
+    }
+
+    #[test]
+    fn spawn_raise_runs_the_configured_command() {
+        // Deterministic + hermetic: spawn a command that touches a unique sentinel
+        // file, then confirm it appears. Uses the PID + nanos for uniqueness so
+        // parallel test runs never collide.
+        let dir = std::env::temp_dir();
+        let sentinel = dir.join(format!(
+            "hypodj_raise_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&sentinel);
+        let cmd = vec![
+            "touch".to_string(),
+            sentinel.to_string_lossy().into_owned(),
+        ];
+        spawn_raise(Some(&cmd));
+        // Poll briefly: spawn is async of the child running to completion.
+        let mut created = false;
+        for _ in 0..50 {
+            if sentinel.exists() {
+                created = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_file(&sentinel);
+        assert!(created, "Raise must spawn the command (sentinel file expected)");
+    }
+
+    #[test]
+    fn spawn_raise_is_noop_without_command() {
+        // None and empty must not panic and must do nothing.
+        spawn_raise(None);
+        spawn_raise(Some(&[]));
     }
 
     #[test]

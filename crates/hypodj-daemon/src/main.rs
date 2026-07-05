@@ -135,7 +135,14 @@ async fn main() -> anyhow::Result<()> {
     // false, or there is no session bus (headless / no DBUS_SESSION_BUS_ADDRESS),
     // we log and skip - never fatal, and the MPD serve loop is unaffected.
     if cfg.mpris.enable {
-        match hypodj_core::mpris::serve(player.clone(), handler.clone(), client.clone()).await {
+        match hypodj_core::mpris::serve(
+            player.clone(),
+            handler.clone(),
+            client.clone(),
+            cfg.mpris.raise_command.clone(),
+        )
+        .await
+        {
             Ok(server) => {
                 tracing::info!("MPRIS server on org.mpris.MediaPlayer2.hypodj");
                 tokio::spawn(hypodj_core::mpris::run_property_updates(server));

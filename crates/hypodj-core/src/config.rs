@@ -50,11 +50,17 @@ pub struct MprisConfig {
     /// so it never conflicts with a running mopidy MPRIS server.
     #[serde(default = "default_mpris_enable")]
     pub enable: bool,
+    /// Command run by the MPRIS root `Raise()` method when a desktop media widget
+    /// is clicked - typically a terminal running the user's music client
+    /// (e.g. `["kitty", "ncmpcpp"]`). The first element is the program, the rest
+    /// are args. Absent = None = `CanRaise` reports false and `Raise()` is a no-op.
+    #[serde(default)]
+    pub raise_command: Option<Vec<String>>,
 }
 
 impl Default for MprisConfig {
     fn default() -> Self {
-        Self { enable: default_mpris_enable() }
+        Self { enable: default_mpris_enable(), raise_command: None }
     }
 }
 
