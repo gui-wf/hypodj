@@ -319,6 +319,11 @@ fn mpv_actor(
 ) {
     use libmpv2::{Format, events::Event};
 
+    // mpv's `MPV_END_FILE_REASON_EOF`. libmpv2 surfaces EndFile's reason as a
+    // raw u32 (the bindgen `mpv_end_file_reason` alias), so we name the natural
+    // end-of-file value here instead of matching an enum variant.
+    const MPV_END_FILE_REASON_EOF: u32 = 0;
+
     // Observe time-pos so we can push TimePos events (drives scrobble + UI).
     let ectx = mpv.event_context_mut();
     let _ = ectx.observe_property("time-pos", Format::Double, 0);
@@ -349,16 +354,33 @@ fn mpv_actor(
                     let _ = evt_tx.blocking_send(PlayerEvent::TimePos(t));
                 }
             }
-            Some(Ok(Event::EndFile(_))) => {
-                // A library track carries a SongId -> emit Eof (drives
-                // queue-advance + scrobble). A raw stream has no id -> just
-                // report Stopped, never scrobble it.
-                let song = current.take();
-                let _ = state_tx.send(PlayState::Stopped);
-                if let Some(song) = song {
-                    let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
+            Some(Ok(Event::EndFile(reason))) => {
+                // Only a NATURAL end-of-file advances the queue / scrobbles. mpv
+                // also fires EndFile with reason `Stop` when our own `loadfile`
+                // REPLACES the current track (next/prev/play) and on an explicit
+                // stop, plus `Redirect`/`Quit`/`Error`. Treating those as EOF
+                // caused a phantom-advance cascade: a manual `next` loads the new
+                // track (repointing `current` in handle_cmd), then the outgoing
+                // track's EndFile(Stop) was read as an EOF, taking the NEW id and
+                // emitting Eof -> advance_on_eof double-skipped and could leave
+                // the queue index desynced to None while audio kept playing (the
+                // ncmpcpp `>` freeze + empty currentsong/MPRIS notification).
+                //
+                // So act ONLY on `Eof`. For `Stop` we must NOT `current.take()`:
+                // by the time this event is pumped, handle_cmd has already set
+                // `current` to the incoming track, so taking it would clear the
+                // now-playing id. The explicit-stop path reports Stopped itself.
+                if reason == MPV_END_FILE_REASON_EOF {
+                    // A library track carries a SongId -> emit Eof (drives
+                    // queue-advance + scrobble). A raw stream has no id -> just
+                    // report Stopped, never scrobble it.
+                    let song = current.take();
+                    let _ = state_tx.send(PlayState::Stopped);
+                    if let Some(song) = song {
+                        let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
+                    }
+                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
                 }
-                let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => {
