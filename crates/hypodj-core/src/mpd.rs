@@ -125,8 +125,21 @@ pub enum MpdCommand {
     /// precisely; search3 itself is full-text only.
     Find(Vec<(String, String)>),
     Search(Vec<(String, String)>),
-    /// `list <tag> [filter]` -> Subsonic list/browse (e.g. `list genre`).
-    List(String),
+    /// `findadd <filter...>` (exact) / `searchadd <filter...>`
+    /// (case-insensitive substring) -> the same Subsonic search3 + client-side
+    /// tag post-filter as [`MpdCommand::Find`]/[`MpdCommand::Search`], but every
+    /// matching song is appended to the play queue instead of listed. Carries
+    /// the tag->value pairs verbatim (lowercased tag).
+    FindAdd(Vec<(String, String)>),
+    SearchAdd(Vec<(String, String)>),
+    /// `list <tag> [filter]` -> Subsonic list/browse (e.g. `list genre`). The
+    /// optional filter narrows the listing (e.g. `list album artist "Tosca"` or
+    /// the modern `list album "(artist == \"Tosca\")"`); `tag` is the thing to
+    /// list, `filter` the tag->value constraints to honor.
+    List {
+        tag: String,
+        filter: Vec<(String, String)>,
+    },
     /// `sticker <subcmd> song <uri> [name] [value]` - MPD's per-song key/value
     /// store. We back ONLY the `rating` sticker (ncmpcpp's rating path) onto the
     /// Subsonic 0..=5 `setRating`/`userRating`. See [`StickerCmd`].
@@ -315,7 +328,13 @@ pub fn parse(line: &str) -> MpdCommand {
         // dispatch can post-filter search3 (full-text) with MPD-tag precision.
         "find" => MpdCommand::Find(parse_filter(&args)),
         "search" => MpdCommand::Search(parse_filter(&args)),
-        "list" => MpdCommand::List(args.join(" ")),
+        "findadd" => MpdCommand::FindAdd(parse_filter(&args)),
+        "searchadd" => MpdCommand::SearchAdd(parse_filter(&args)),
+        "list" => {
+            let tag = args.first().cloned().unwrap_or_default().to_lowercase();
+            let filter = parse_list_filter(&args[args.len().min(1)..]);
+            MpdCommand::List { tag, filter }
+        }
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -393,6 +412,59 @@ mod parse_tests {
         match parse("search kalabrese") {
             MpdCommand::Search(pairs) => {
                 assert_eq!(pairs, vec![("any".to_string(), "kalabrese".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn findadd_searchadd_keep_tag_value_pairs() {
+        match parse("findadd Artist bar Album baz") {
+            MpdCommand::FindAdd(pairs) => assert_eq!(
+                pairs,
+                vec![
+                    ("artist".to_string(), "bar".to_string()),
+                    ("album".to_string(), "baz".to_string()),
+                ]
+            ),
+            other => panic!("got {other:?}"),
+        }
+        match parse("searchadd kalabrese") {
+            MpdCommand::SearchAdd(pairs) => {
+                assert_eq!(pairs, vec![("any".to_string(), "kalabrese".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_parses_tag_only() {
+        match parse("list album") {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert!(filter.is_empty());
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_parses_positional_filter() {
+        match parse(r#"list album artist "Tosca""#) {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert_eq!(filter, vec![("artist".to_string(), "Tosca".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_parses_expression_filter() {
+        match parse(r#"list album "(artist == \"Tosca\")""#) {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert_eq!(filter, vec![("artist".to_string(), "Tosca".to_string())]);
             }
             other => panic!("got {other:?}"),
         }
@@ -509,6 +581,38 @@ fn parse_filter(args: &[String]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Parse the filter remainder of a `list <tag> [filter]` request into
+/// `(tag, value)` pairs. Two forms are supported:
+///   - classic positional, `list album artist "Tosca"` -> the remainder is
+///     `artist "Tosca"`, parsed like a find/search filter;
+///   - modern expression, `list album "(artist == \"Tosca\")"` -> the remainder
+///     is the single token `(artist == "Tosca")`, parsed here into
+///     `[(artist, Tosca)]`.
+/// An empty remainder yields no filter (the whole-library listing).
+fn parse_list_filter(rest: &[String]) -> Vec<(String, String)> {
+    // Modern single-arg expression form: `(tag == "value")`.
+    if rest.len() == 1 && rest[0].contains("==") {
+        if let Some(pair) = parse_filter_expression(&rest[0]) {
+            return vec![pair];
+        }
+    }
+    parse_filter(rest)
+}
+
+/// Parse a single MPD filter expression `(tag == "value")` (also tolerating
+/// missing outer parens / quotes) into one `(tag, value)` pair. Only the flat
+/// `==` equality form is modeled; anything else yields `None`.
+fn parse_filter_expression(expr: &str) -> Option<(String, String)> {
+    let inner = expr.trim().trim_start_matches('(').trim_end_matches(')');
+    let (tag, value) = inner.split_once("==")?;
+    let tag = tag.trim().to_lowercase();
+    let value = value.trim().trim_matches('"').to_string();
+    if tag.is_empty() {
+        return None;
+    }
+    Some((tag, value))
 }
 
 /// What a handler produces for one command.

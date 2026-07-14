@@ -581,31 +581,52 @@ impl MpdHandler for HypodjHandler {
 
             MpdCommand::Find(filters) => self.search_filtered(filters, true).await,
             MpdCommand::Search(filters) => self.search_filtered(filters, false).await,
+            MpdCommand::FindAdd(filters) => self.find_add(filters, true).await,
+            MpdCommand::SearchAdd(filters) => self.find_add(filters, false).await,
 
-            MpdCommand::List(spec) => {
-                // `list <tag>`: support Artist, Album, Genre.
-                let tag = spec.split_whitespace().next().unwrap_or("").to_lowercase();
+            MpdCommand::List { tag, filter } => {
+                // `list <tag> [filter]`: support Artist, Album, Genre. When a
+                // filter is present it MUST narrow the result - never fall back
+                // to the unfiltered library dump (see list_album_by_artist).
                 match tag.as_str() {
                     "artist" | "albumartist" => match self.client.artists().await {
                         Ok(artists) => {
                             let pairs = artists
                                 .into_iter()
+                                .filter(|a| artist_passes_filter(&a.name, &filter))
                                 .map(|a| ("Artist".to_string(), a.name))
                                 .collect();
                             MpdResponse::Pairs(pairs)
                         }
                         Err(e) => ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
                     },
-                    "album" => match self.client.album_list(AlbumListType::AlphabeticalByName, Some(500)).await {
-                        Ok(albums) => {
-                            let pairs = albums
-                                .into_iter()
-                                .map(|a| ("Album".to_string(), a.name))
-                                .collect();
-                            MpdResponse::Pairs(pairs)
+                    "album" => {
+                        // A filter constraining the artist restricts to that
+                        // artist's albums; any other (or absent) filter lists all.
+                        if let Some(artist) = filter_value(&filter, &["artist", "albumartist"]) {
+                            return self.list_albums_by_artist(&artist).await;
                         }
-                        Err(e) => ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
-                    },
+                        if !filter.is_empty() {
+                            // A filter we cannot honor: narrow to nothing rather
+                            // than silently dumping the whole library.
+                            return MpdResponse::ok();
+                        }
+                        match self.client.album_list(AlbumListType::AlphabeticalByName, Some(500)).await {
+                            Ok(albums) => {
+                                let pairs = albums
+                                    .into_iter()
+                                    .map(|a| ("Album".to_string(), a.name))
+                                    .collect();
+                                MpdResponse::Pairs(pairs)
+                            }
+                            Err(e) => ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
+                        }
+                    }
+                    "genre" if !filter.is_empty() => {
+                        // No Subsonic genre-by-filter path; narrow to nothing
+                        // rather than dumping the whole genre list.
+                        MpdResponse::ok()
+                    }
                     "genre" => match self.genres().await {
                         Ok(genres) => {
                             let pairs = genres
@@ -637,13 +658,14 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Commands => {
                 let cmds = [
                     "add", "addid", "albumart", "binarylimit", "clear",
-                    "commands", "currentsong", "delete", "find", "getvol", "idle",
+                    "commands", "currentsong", "delete", "find", "findadd",
+                    "getvol", "idle",
                     "list", "listall", "listallinfo", "listplaylistinfo",
                     "listplaylists", "load", "lsinfo", "next", "noidle",
                     "notcommands", "outputs", "pause", "ping", "play", "playid",
                     "playlistadd", "playlistclear", "playlistdelete", "playlistid",
                     "playlistinfo", "plchanges", "previous", "readpicture",
-                    "search", "seek", "seekcur", "seekid", "setvol", "stats", "sticker",
+                    "search", "searchadd", "seek", "seekcur", "seekid", "setvol", "stats", "sticker",
                     "status", "stop", "tagtypes", "urlhandlers",
                 ];
                 let pairs = cmds
@@ -1002,25 +1024,91 @@ impl HypodjHandler {
         if filters.is_empty() {
             return MpdResponse::ok();
         }
+        let matches = match self.collect_matches(&filters, exact).await {
+            Ok(m) => m,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "search", &e),
+        };
+        let mut pairs = Vec::new();
+        for s in &matches {
+            pairs.extend(browse_song_pairs(s));
+        }
+        MpdResponse::Pairs(pairs)
+    }
+
+    /// The shared core of find/search/findadd/searchadd: run search3 (full-text)
+    /// for the combined filter values, then recover MPD-tag precision with a
+    /// client-side post-filter. `exact` (find) matches equality; otherwise
+    /// (search) case-insensitive substring. Returns the matching songs so a
+    /// caller can either list them (`search_filtered`) or enqueue them
+    /// (`find_add`). search3 results are query-specific + ephemeral -> NEVER
+    /// cached. On a search3 error, returns the error string for the caller to ACK.
+    async fn collect_matches(
+        &self,
+        filters: &[(String, String)],
+        exact: bool,
+    ) -> Result<Vec<Song>, String> {
         // Build the full-text query from all values (search3 is full-text).
         let query = filters
             .iter()
             .map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        // search3 results are query-specific + ephemeral -> NEVER cached.
-        let hits = match self.client.search3(&query).await {
-            Ok(h) => h,
-            Err(e) => return ack(ACK_ERROR_UNKNOWN, "search", &e.to_string()),
-        };
-        let matches = |song: &Song| -> bool {
-            filters.iter().all(|(tag, val)| tag_matches(song, tag, val, exact))
-        };
-        let mut pairs = Vec::new();
-        for s in hits.songs.iter().filter(|s| matches(s)) {
-            pairs.extend(browse_song_pairs(s));
+        let hits = self.client.search3(&query).await.map_err(|e| e.to_string())?;
+        let matches = hits
+            .songs
+            .into_iter()
+            .filter(|s| filters.iter().all(|(tag, val)| tag_matches(s, tag, val, exact)))
+            .collect();
+        Ok(matches)
+    }
+
+    /// Back `findadd`/`searchadd`: collect the matching songs (same path as
+    /// find/search) and append every one to the play queue via its `song/<id>`
+    /// uri, then wake idle subscribers. Empty filters is a no-op empty-OK (mirrors
+    /// `search_filtered`). A search3 failure ACKs; a per-song enqueue failure is
+    /// skipped (a stale hit should not abort the whole batch).
+    async fn find_add(&self, filters: Vec<(String, String)>, exact: bool) -> MpdResponse {
+        if filters.is_empty() {
+            return MpdResponse::ok();
         }
-        MpdResponse::Pairs(pairs)
+        let cmd = if exact { "findadd" } else { "searchadd" };
+        let matches = match self.collect_matches(&filters, exact).await {
+            Ok(m) => m,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, cmd, &e),
+        };
+        for s in &matches {
+            let _ = self.enqueue_uri(&format!("song/{}", s.id.0)).await;
+        }
+        self.notify_change();
+        MpdResponse::ok()
+    }
+
+    /// Back `list album` narrowed by an artist filter: resolve the artist by
+    /// (case-insensitive) name, then list that artist's albums. An unknown
+    /// artist yields an empty listing - never the full album library (honoring
+    /// the "a present filter must narrow" contract).
+    async fn list_albums_by_artist(&self, artist: &str) -> MpdResponse {
+        let artists = match self.client.artists().await {
+            Ok(a) => a,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
+        };
+        let id = match artists
+            .into_iter()
+            .find(|a| a.name.eq_ignore_ascii_case(artist))
+        {
+            Some(a) => a.id,
+            None => return MpdResponse::ok(),
+        };
+        match self.client.artist_albums(&id).await {
+            Ok(albums) => {
+                let pairs = albums
+                    .into_iter()
+                    .map(|a| ("Album".to_string(), a.name))
+                    .collect();
+                MpdResponse::Pairs(pairs)
+            }
+            Err(e) => ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
+        }
     }
 
     /// Back the `sticker` command for the `rating` sticker only (ncmpcpp's
@@ -1135,6 +1223,30 @@ fn tag_matches(song: &Song, tag: &str, val: &str, exact: bool) -> bool {
         // Unknown/unsupported tag: don't exclude (search3 already matched text).
         _ => true,
     }
+}
+
+/// The value of the first filter pair whose tag matches one of `tags`, if any.
+/// Used to pull e.g. the `artist` constraint out of a `list album` filter.
+fn filter_value(filter: &[(String, String)], tags: &[&str]) -> Option<String> {
+    filter
+        .iter()
+        .find(|(tag, _)| tags.contains(&tag.as_str()))
+        .map(|(_, v)| v.clone())
+}
+
+/// Does an artist named `name` pass the `list artist`/`list albumartist` filter?
+/// An empty filter passes everything. An artist/albumartist constraint matches
+/// (case-insensitively) on the name. Any other constraint we cannot honor
+/// excludes the row, so a present-but-unhonorable filter narrows to nothing
+/// rather than dumping the whole artist list.
+fn artist_passes_filter(name: &str, filter: &[(String, String)]) -> bool {
+    if filter.is_empty() {
+        return true;
+    }
+    filter.iter().all(|(tag, val)| match tag.as_str() {
+        "artist" | "albumartist" => name.eq_ignore_ascii_case(val),
+        _ => false,
+    })
 }
 
 /// Parse a `song/<id>` uri into a `SongId`.
