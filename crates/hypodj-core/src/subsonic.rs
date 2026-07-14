@@ -143,6 +143,24 @@ impl SubsonicClient {
         Ok(albums.into_iter().map(map_album).collect())
     }
 
+    /// List albums of a given genre. REAL: calls `get_album_list2` with
+    /// `type=byGenre` and the `genre` arg (both confirmed present in
+    /// opensubsonic 0.3.0). Backs `list album genre <X>`, which the generic
+    /// [`album_list`](Self::album_list) cannot serve (it hardcodes `genre=None`).
+    pub async fn album_list_by_genre(
+        &self,
+        genre: &str,
+        size: Option<i32>,
+        offset: Option<i32>,
+    ) -> Result<Vec<Album>, SubsonicError> {
+        let albums = self
+            .inner
+            .get_album_list2(AlbumListType::ByGenre, size, offset, None, None, Some(genre), None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(albums.into_iter().map(map_album).collect())
+    }
+
     /// List the songs of an album. REAL: calls `get_album` (returns
     /// `AlbumWithSongsId3`, whose `song: Vec<Child>` are the tracks) and maps
     /// each `Child` into our `Song`. This is the "resolve an album's tracks so
@@ -325,6 +343,28 @@ impl SubsonicClient {
         let res = self
             .inner
             .search3(query, Some(20), None, Some(50), None, Some(200), None, None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(SearchHits {
+            artists: res.artist.into_iter().map(map_artist).collect(),
+            albums: res.album.into_iter().map(map_album).collect(),
+            songs: res.song.into_iter().map(map_song).collect(),
+        })
+    }
+
+    /// Paged search3: same as [`search3`](Self::search3) but lets the caller
+    /// drive `song_count`/`song_offset` so a bulk findadd can page past the
+    /// default 200-song cap instead of silently truncating. Artist/album counts
+    /// are irrelevant to the paging caller so they stay at the fixed defaults.
+    pub async fn search3_paged(
+        &self,
+        query: &str,
+        song_count: Option<i32>,
+        song_offset: Option<i32>,
+    ) -> Result<SearchHits, SubsonicError> {
+        let res = self
+            .inner
+            .search3(query, Some(20), None, Some(50), None, song_count, song_offset, None)
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))?;
         Ok(SearchHits {

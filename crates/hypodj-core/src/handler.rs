@@ -26,6 +26,7 @@ use tokio::sync::Notify;
 
 use crate::cache::TtlLru;
 use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
+use crate::subsonic::SubsonicError;
 use crate::mpd::{MpdCommand, MpdHandler, MpdResponse, StickerCmd};
 use crate::player::{PlayState, PlayerHandle};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
@@ -201,6 +202,26 @@ impl HypodjHandler {
         drop(st);
         self.notify_change();
         Ok(id)
+    }
+
+    /// Append an already-resolved [`Song`] to the queue, returning its MPD id.
+    /// This is the shared, INFALLIBLE push path (no network, no parse): it mirrors
+    /// [`enqueue_uri`](Self::enqueue_uri)'s id/version/notify bookkeeping. Used by
+    /// `findadd`/`searchadd`, whose matches are already full `Song`s from
+    /// `collect_matches`, so re-fetching each via `song/<id>` would be a wasted
+    /// round-trip.
+    async fn enqueue_song(&self, song: Song) -> u64 {
+        let mut st = self.state.lock().unwrap();
+        let id = st.next_id;
+        st.next_id += 1;
+        st.queue.push(QueueItem {
+            id,
+            entry: QueueEntry::Song(song),
+        });
+        st.playlist_version += 1;
+        drop(st);
+        self.notify_change();
+        id
     }
 }
 
@@ -603,8 +624,50 @@ impl MpdHandler for HypodjHandler {
                     "album" => {
                         // A filter constraining the artist restricts to that
                         // artist's albums; any other (or absent) filter lists all.
-                        if let Some(artist) = filter_value(&filter, &["artist", "albumartist"]) {
+                        // A bare positional `list album "Tosca"` parses to
+                        // filter=[(any,Tosca)], so treat an `any` value as an
+                        // artist name too (classic 2-arg `list album <ARTIST>`).
+                        if let Some(artist) =
+                            filter_value(&filter, &["artist", "albumartist", "any"])
+                        {
                             return self.list_albums_by_artist(&artist).await;
+                        }
+                        // `list album genre X` -> albums of that genre, via
+                        // getAlbumList2 type=byGenre (confirmed backend path).
+                        // Page it (getAlbumList2 caps `size` at 500 per call) so a
+                        // large genre is not silently truncated - same "no silent
+                        // caps" contract the search3 paging honors.
+                        if let Some(genre) = filter_value(&filter, &["genre"]) {
+                            const PAGE: i32 = 500;
+                            // Ceiling so a backend that ignores `offset` (returns a
+                            // full page forever) cannot spin unboundedly or overflow
+                            // the i32 offset. 20 pages = 10000 albums, far beyond any
+                            // real genre.
+                            const MAX_PAGES: i32 = 20;
+                            let mut names: Vec<(String, String)> = Vec::new();
+                            let mut offset: i32 = 0;
+                            let mut page = 0;
+                            loop {
+                                match self
+                                    .client
+                                    .album_list_by_genre(&genre, Some(PAGE), Some(offset))
+                                    .await
+                                {
+                                    Ok(albums) => {
+                                        let got = albums.len();
+                                        names.extend(
+                                            albums.into_iter().map(|a| ("Album".to_string(), a.name)),
+                                        );
+                                        page += 1;
+                                        if (got as i32) < PAGE || page >= MAX_PAGES {
+                                            break;
+                                        }
+                                        offset += PAGE;
+                                    }
+                                    Err(e) => return ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
+                                }
+                            }
+                            return MpdResponse::Pairs(names);
                         }
                         if !filter.is_empty() {
                             // A filter we cannot honor: narrow to nothing rather
@@ -623,8 +686,10 @@ impl MpdHandler for HypodjHandler {
                         }
                     }
                     "genre" if !filter.is_empty() => {
-                        // No Subsonic genre-by-filter path; narrow to nothing
-                        // rather than dumping the whole genre list.
+                        // No Subsonic genre-by-filter path for the genre LIST
+                        // itself (a genre filter on `list genre` is meaningless);
+                        // narrow to nothing rather than dumping the whole list.
+                        // (`list album genre X` is tag=album and handled above.)
                         MpdResponse::ok()
                     }
                     "genre" => match self.genres().await {
@@ -951,24 +1016,38 @@ impl HypodjHandler {
         for d in ["Genres", "Lists", "Radio", "Starred"] {
             pairs.push(("directory".to_string(), d.to_string()));
         }
-        if let Some(cached) = self.dir_cache.get(&"artists".to_string()) {
-            pairs.extend(cached);
-            return MpdResponse::Pairs(pairs);
-        }
-        match self.client.artists().await {
+        match self.cached_artists().await {
             Ok(artists) => {
-                let mut artist_rows = Vec::new();
-                for a in &artists {
-                    artist_rows
-                        .push(("directory".to_string(), format!("artist/{}", a.id.0)));
-                    artist_rows.push(("Artist".to_string(), a.name.clone()));
+                for (id, name) in artists {
+                    pairs.push(("directory".to_string(), format!("artist/{}", id.0)));
+                    pairs.push(("Artist".to_string(), name));
                 }
-                self.dir_cache.put("artists".to_string(), artist_rows.clone());
-                pairs.extend(artist_rows);
                 MpdResponse::Pairs(pairs)
             }
             Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
         }
+    }
+
+    /// Artist id+name list, served from the shared `dir_cache` "artists" slot
+    /// (the `directory`/`Artist` rows) or fetched + cached on a miss. Both
+    /// `lsinfo_root` and `list_albums_by_artist` go through here so
+    /// `list album artist X` hits the same cache instead of re-fetching.
+    async fn cached_artists(&self) -> Result<Vec<(ArtistId, String)>, SubsonicError> {
+        if let Some(rows) = self.dir_cache.get(&"artists".to_string()) {
+            return Ok(parse_artist_rows(&rows));
+        }
+        let artists = self.client.artists().await?;
+        let rows: Vec<(String, String)> = artists
+            .iter()
+            .flat_map(|a| {
+                [
+                    ("directory".to_string(), format!("artist/{}", a.id.0)),
+                    ("Artist".to_string(), a.name.clone()),
+                ]
+            })
+            .collect();
+        self.dir_cache.put("artists".to_string(), rows);
+        Ok(artists.into_iter().map(|a| (a.id, a.name)).collect())
     }
 
     /// Genres list, cached in a dedicated slot (stable, benefits from reuse).
@@ -1024,9 +1103,12 @@ impl HypodjHandler {
         if filters.is_empty() {
             return MpdResponse::ok();
         }
+        // Thread the true command name into the ACK (mirrors find_add's cmd),
+        // so a failing `find` acks as `find`, not a hardcoded `search`.
+        let cmd = if exact { "find" } else { "search" };
         let matches = match self.collect_matches(&filters, exact).await {
             Ok(m) => m,
-            Err(e) => return ack(ACK_ERROR_UNKNOWN, "search", &e),
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, cmd, &e),
         };
         let mut pairs = Vec::new();
         for s in &matches {
@@ -1053,9 +1135,32 @@ impl HypodjHandler {
             .map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        let hits = self.client.search3(&query).await.map_err(|e| e.to_string())?;
-        let matches = hits
-            .songs
+        // Page search3 so a bulk findadd is COMPLETE, not silently truncated at
+        // the 200-song cap: request 200 at a time, accumulating until a short
+        // page (< PAGE) signals exhaustion (honors CLAUDE.md "no silent caps").
+        const PAGE: i32 = 200;
+        // Ceiling so a backend that ignores `song_offset` (keeps returning a full
+        // page) cannot loop forever, grow `songs` without bound, or overflow the
+        // i32 offset. 25 pages = 5000 songs is far beyond any real findadd target.
+        const MAX_PAGES: i32 = 25;
+        let mut songs: Vec<Song> = Vec::new();
+        let mut offset: i32 = 0;
+        let mut page = 0;
+        loop {
+            let hits = self
+                .client
+                .search3_paged(&query, Some(PAGE), Some(offset))
+                .await
+                .map_err(|e| e.to_string())?;
+            let got = hits.songs.len();
+            songs.extend(hits.songs);
+            page += 1;
+            if (got as i32) < PAGE || page >= MAX_PAGES {
+                break;
+            }
+            offset += PAGE;
+        }
+        let matches = songs
             .into_iter()
             .filter(|s| filters.iter().all(|(tag, val)| tag_matches(s, tag, val, exact)))
             .collect();
@@ -1063,10 +1168,11 @@ impl HypodjHandler {
     }
 
     /// Back `findadd`/`searchadd`: collect the matching songs (same path as
-    /// find/search) and append every one to the play queue via its `song/<id>`
-    /// uri, then wake idle subscribers. Empty filters is a no-op empty-OK (mirrors
-    /// `search_filtered`). A search3 failure ACKs; a per-song enqueue failure is
-    /// skipped (a stale hit should not abort the whole batch).
+    /// find/search) and append every one to the play queue directly (they are
+    /// already full `Song`s from `collect_matches`, so no per-song refetch), then
+    /// wake idle subscribers. Empty filters is a no-op empty-OK (mirrors
+    /// `search_filtered`). A search3 failure ACKs; the per-song push is infallible
+    /// so every match is honestly enqueued (nothing is silently dropped).
     async fn find_add(&self, filters: Vec<(String, String)>, exact: bool) -> MpdResponse {
         if filters.is_empty() {
             return MpdResponse::ok();
@@ -1076,8 +1182,8 @@ impl HypodjHandler {
             Ok(m) => m,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, cmd, &e),
         };
-        for s in &matches {
-            let _ = self.enqueue_uri(&format!("song/{}", s.id.0)).await;
+        for s in matches {
+            self.enqueue_song(s).await;
         }
         self.notify_change();
         MpdResponse::ok()
@@ -1088,15 +1194,18 @@ impl HypodjHandler {
     /// artist yields an empty listing - never the full album library (honoring
     /// the "a present filter must narrow" contract).
     async fn list_albums_by_artist(&self, artist: &str) -> MpdResponse {
-        let artists = match self.client.artists().await {
+        let artists = match self.cached_artists().await {
             Ok(a) => a,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, "list", &e.to_string()),
         };
+        // Unicode-aware case-insensitive compare (eq_ignore_ascii_case only folds
+        // ASCII, so case-differing non-ASCII names would fail to match).
+        let wanted = artist.to_lowercase();
         let id = match artists
             .into_iter()
-            .find(|a| a.name.eq_ignore_ascii_case(artist))
+            .find(|(_, name)| name.to_lowercase() == wanted)
         {
-            Some(a) => a.id,
+            Some((id, _)) => id,
             None => return MpdResponse::ok(),
         };
         match self.client.artist_albums(&id).await {
@@ -1215,13 +1324,24 @@ fn tag_matches(song: &Song, tag: &str, val: &str, exact: bool) -> bool {
         "artist" | "albumartist" => song.artist.as_deref().map(cmp).unwrap_or(false),
         "album" => song.album.as_deref().map(cmp).unwrap_or(false),
         "genre" => song.genre.as_deref().map(cmp).unwrap_or(false),
+        // Numeric tags the Song carries: compare on the string form (Date is the
+        // release year; MPD emits `Date` from `year`).
+        "date" => song.year.map(|y| cmp(&y.to_string())).unwrap_or(false),
+        "track" => song.track.map(|t| cmp(&t.to_string())).unwrap_or(false),
+        "disc" => song.disc.map(|d| cmp(&d.to_string())).unwrap_or(false),
+        "comment" => song.comment.as_deref().map(cmp).unwrap_or(false),
         "any" => {
             cmp(&song.title)
                 || song.artist.as_deref().map(cmp).unwrap_or(false)
                 || song.album.as_deref().map(cmp).unwrap_or(false)
         }
-        // Unknown/unsupported tag: don't exclude (search3 already matched text).
-        _ => true,
+        // Genuinely unmodeled tag (composer, performer, base, file,
+        // modified-since, or unknown): the Song carries no data to satisfy it, so
+        // it matches NOTHING rather than passing all. tag_matches is shared by
+        // find (list) and findadd (enqueue); passing-all would make findadd
+        // over-add on an unsatisfiable constraint. MPD-correct: an unsatisfiable
+        // constraint yields no matches.
+        _ => false,
     }
 }
 
@@ -1244,9 +1364,29 @@ fn artist_passes_filter(name: &str, filter: &[(String, String)]) -> bool {
         return true;
     }
     filter.iter().all(|(tag, val)| match tag.as_str() {
-        "artist" | "albumartist" => name.eq_ignore_ascii_case(val),
+        // Unicode-aware fold (eq_ignore_ascii_case only folds ASCII).
+        "artist" | "albumartist" => name.to_lowercase() == val.to_lowercase(),
         _ => false,
     })
+}
+
+/// Reconstruct `(ArtistId, name)` pairs from the cached `directory`/`Artist`
+/// rows that `cached_artists` stores (a `directory: artist/<id>` row followed by
+/// its `Artist: <name>` row). Malformed pairs are skipped.
+fn parse_artist_rows(rows: &[(String, String)]) -> Vec<(ArtistId, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < rows.len() {
+        if rows[i].0 == "directory" {
+            if let (Some(id), true) =
+                (rows[i].1.strip_prefix("artist/"), rows[i + 1].0 == "Artist")
+            {
+                out.push((ArtistId(id.to_string()), rows[i + 1].1.clone()));
+            }
+        }
+        i += 2;
+    }
+    out
 }
 
 /// Parse a `song/<id>` uri into a `SongId`.
@@ -1345,6 +1485,71 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    fn sample_song() -> Song {
+        Song {
+            id: SongId("so-1".into()),
+            title: "Independent Us".into(),
+            album: Some("Let Love Rumpel".into()),
+            album_id: Some(AlbumId("al-1".into())),
+            artist: Some("Kalabrese".into()),
+            track: Some(4),
+            duration_secs: Some(372),
+            cover_art: None,
+            starred: false,
+            musicbrainz_id: None,
+            disc: Some(2),
+            year: Some(2019),
+            genre: Some("Electronic".into()),
+            bitrate: None,
+            comment: Some("vinyl rip".into()),
+            user_rating: None,
+        }
+    }
+
+    #[test]
+    fn tag_matches_constrains_date_track_disc_and_comment() {
+        let s = sample_song();
+        // date -> year; exact + substring both work.
+        assert!(tag_matches(&s, "date", "2019", true));
+        assert!(!tag_matches(&s, "date", "2020", true));
+        assert!(tag_matches(&s, "date", "201", false));
+        // track / disc compare on the numeric string form.
+        assert!(tag_matches(&s, "track", "4", true));
+        assert!(!tag_matches(&s, "track", "5", true));
+        assert!(tag_matches(&s, "disc", "2", true));
+        // comment.
+        assert!(tag_matches(&s, "comment", "vinyl", false));
+        assert!(!tag_matches(&s, "comment", "cd", false));
+    }
+
+    #[test]
+    fn tag_matches_rejects_unmodeled_tag_rather_than_passing_all() {
+        // A genuinely unsupported tag (composer/performer/base/...) must match
+        // NOTHING so findadd never over-adds on an unsatisfiable constraint.
+        let s = sample_song();
+        assert!(!tag_matches(&s, "composer", "anything", false));
+        assert!(!tag_matches(&s, "performer", "anyone", false));
+        assert!(!tag_matches(&s, "modified-since", "2020", false));
+    }
+
+    #[test]
+    fn parse_artist_rows_reconstructs_id_and_name() {
+        let rows = vec![
+            ("directory".to_string(), "artist/ar-1".to_string()),
+            ("Artist".to_string(), "Kalabrese".to_string()),
+            ("directory".to_string(), "artist/ar-2".to_string()),
+            ("Artist".to_string(), "Tosca".to_string()),
+        ];
+        let out = parse_artist_rows(&rows);
+        assert_eq!(
+            out,
+            vec![
+                (ArtistId("ar-1".into()), "Kalabrese".to_string()),
+                (ArtistId("ar-2".into()), "Tosca".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]
