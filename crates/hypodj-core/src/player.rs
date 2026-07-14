@@ -309,6 +309,49 @@ impl MpvPlayer {
     }
 }
 
+/// The classified `EndFile` reason. mpv reports the raw code as a u32; we name
+/// every value (see `end_reason`) so the EndFile arm reasons over intent, not a
+/// bare integer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndReason {
+    /// Natural end of the current track.
+    Eof,
+    /// Our own `loadfile ... replace` (next/prev/play) or an explicit stop.
+    Stop,
+    /// mpv is quitting.
+    Quit,
+    /// Playback failed after a successful loadfile (expired token, 404, dropped).
+    Error,
+    /// The current URL was redirected to another.
+    Redirect,
+    /// Any other/unknown reason.
+    Other,
+}
+
+// libmpv2 surfaces EndFile's reason as a raw u32 (the bindgen
+// `mpv_end_file_reason` alias), so we name ALL reason codes here and classify
+// them rather than matching a lone magic value.
+const MPV_END_FILE_REASON_EOF: u32 = 0;
+const MPV_END_FILE_REASON_STOP: u32 = 2;
+const MPV_END_FILE_REASON_QUIT: u32 = 3;
+const MPV_END_FILE_REASON_ERROR: u32 = 4;
+const MPV_END_FILE_REASON_REDIRECT: u32 = 5;
+
+/// Classify a raw mpv `EndFile` reason code. `Eof` (natural end) and `Error` (a
+/// track that failed AFTER a successful loadfile - expired token, 404, dropped
+/// stream) both advance the queue and scrobble the just-finished id.
+/// `Stop`/`Quit`/`Redirect`/`Other` are ignored by the EndFile arm.
+fn end_reason(raw: u32) -> EndReason {
+    match raw {
+        MPV_END_FILE_REASON_EOF => EndReason::Eof,
+        MPV_END_FILE_REASON_STOP => EndReason::Stop,
+        MPV_END_FILE_REASON_QUIT => EndReason::Quit,
+        MPV_END_FILE_REASON_ERROR => EndReason::Error,
+        MPV_END_FILE_REASON_REDIRECT => EndReason::Redirect,
+        _ => EndReason::Other,
+    }
+}
+
 /// The mpv actor body, running on its own OS thread. Owns the `Mpv` handle and
 /// drives it from the command channel, draining mpv events on every wakeup.
 fn mpv_actor(
@@ -318,11 +361,6 @@ fn mpv_actor(
     evt_tx: mpsc::Sender<PlayerEvent>,
 ) {
     use libmpv2::{Format, events::Event};
-
-    // mpv's `MPV_END_FILE_REASON_EOF`. libmpv2 surfaces EndFile's reason as a
-    // raw u32 (the bindgen `mpv_end_file_reason` alias), so we name the natural
-    // end-of-file value here instead of matching an enum variant.
-    const MPV_END_FILE_REASON_EOF: u32 = 0;
 
     // Observe time-pos so we can push TimePos events (drives scrobble + UI).
     let ectx = mpv.event_context_mut();
@@ -366,20 +404,36 @@ fn mpv_actor(
                 // the queue index desynced to None while audio kept playing (the
                 // ncmpcpp `>` freeze + empty currentsong/MPRIS notification).
                 //
-                // So act ONLY on `Eof`. For `Stop` we must NOT `current.take()`:
-                // by the time this event is pumped, handle_cmd has already set
-                // `current` to the incoming track, so taking it would clear the
-                // now-playing id. The explicit-stop path reports Stopped itself.
-                if reason == MPV_END_FILE_REASON_EOF {
-                    // A library track carries a SongId -> emit Eof (drives
-                    // queue-advance + scrobble). A raw stream has no id -> just
-                    // report Stopped, never scrobble it.
-                    let song = current.take();
-                    let _ = state_tx.send(PlayState::Stopped);
-                    if let Some(song) = song {
-                        let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
+                // So act ONLY on `Eof` and `Error`. For `Stop` we must NOT
+                // `current.take()`: by the time this event is pumped, handle_cmd
+                // has already set `current` to the incoming track, so taking it
+                // would clear the now-playing id. The explicit-stop path reports
+                // Stopped itself.
+                //
+                // `Error` reuses the exact Eof body so a track that fails AFTER a
+                // successful loadfile (expired token/404/dropped stream) advances
+                // the queue and scrobbles the just-finished id like a natural EOF
+                // - never wedging the player in a phantom Playing. (A hard
+                // loadfile failure returns Err synchronously in handle_cmd and
+                // does not repoint `current`, so this path only covers post-load
+                // failures.)
+                match end_reason(reason) {
+                    EndReason::Eof | EndReason::Error => {
+                        // A library track carries a SongId -> emit Eof (drives
+                        // queue-advance + scrobble). A raw stream has no id -> just
+                        // report Stopped, never scrobble it.
+                        let song = current.take();
+                        let _ = state_tx.send(PlayState::Stopped);
+                        if let Some(song) = song {
+                            let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
+                        }
+                        let _ = evt_tx
+                            .blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
                     }
-                    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
+                    // Stop/Quit/Redirect/Other: do NOTHING. Critically do NOT take
+                    // `current` (handle_cmd already repointed it), which preserves
+                    // the phantom-skip cascade fix.
+                    _ => {}
                 }
             }
             Some(Ok(_)) => {}
@@ -512,6 +566,22 @@ mod tests {
 
         player.stop().await.unwrap();
         assert_eq!(player.state(), PlayState::Stopped);
+    }
+
+    // The EndFile arm advances (take current + emit Eof) on exactly Eof AND
+    // Error, and does NOTHING on Stop/Quit/Redirect - encoded here as: does this
+    // reason classify into the advancing set? This locks the F1 fix (a
+    // post-loadfile failure advances/scrobbles like EOF) without regressing the
+    // phantom-skip cascade cure (our own loadfile-replace fires Stop, ignored).
+    #[test]
+    fn end_reason_advances_on_eof_and_error_only() {
+        let advances = |raw: u32| matches!(end_reason(raw), EndReason::Eof | EndReason::Error);
+        assert!(advances(MPV_END_FILE_REASON_EOF));
+        assert!(advances(MPV_END_FILE_REASON_ERROR));
+        assert!(!advances(MPV_END_FILE_REASON_STOP));
+        assert!(!advances(MPV_END_FILE_REASON_QUIT));
+        assert!(!advances(MPV_END_FILE_REASON_REDIRECT));
+        assert!(!advances(999));
     }
 
     // The handle is cloneable and shared: a second clone sees the same state,

@@ -460,6 +460,50 @@ mod parse_tests {
     }
 
     #[test]
+    fn list_strips_group_suffix() {
+        // `list album group albumartist` -> the `group` clause must be dropped,
+        // leaving an EMPTY filter (a whole-library album listing), not a bogus
+        // (any, group)/(any, albumartist) filter that would return empty.
+        match parse("list album group albumartist") {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert!(filter.is_empty(), "group clause must be stripped, got {filter:?}");
+            }
+            other => panic!("got {other:?}"),
+        }
+        // A real filter followed by a group clause keeps only the filter.
+        match parse(r#"list album artist "X" group albumartist"#) {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert_eq!(filter, vec![("artist".to_string(), "X".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+        // A filter VALUE literally equal to "group" must be KEPT, not treated as
+        // the start of a grouping clause (group only cuts at a tag slot).
+        match parse("list album artist group") {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert_eq!(filter, vec![("artist".to_string(), "group".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_bare_positional_album_files_under_any() {
+        // Classic 2-arg `list album <ARTIST>` files the bare value under `any`;
+        // the handler then treats an `any` value as an artist name.
+        match parse("list album Tosca") {
+            MpdCommand::List { tag, filter } => {
+                assert_eq!(tag, "album");
+                assert_eq!(filter, vec![("any".to_string(), "Tosca".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
     fn list_parses_expression_filter() {
         match parse(r#"list album "(artist == \"Tosca\")""#) {
             MpdCommand::List { tag, filter } => {
@@ -591,7 +635,25 @@ fn parse_filter(args: &[String]) -> Vec<(String, String)> {
 ///     is the single token `(artist == "Tosca")`, parsed here into
 ///     `[(artist, Tosca)]`.
 /// An empty remainder yields no filter (the whole-library listing).
+///
+/// MPD's `group <tag>` suffix (e.g. `list album group albumartist`) is stripped
+/// before filter parsing: the grouping clause always trails the real filter, so
+/// everything from `group` onward is dropped rather than mis-parsed into a bogus
+/// `(any, group)` / `(any, albumartist)` filter that would return empty.
 fn parse_list_filter(rest: &[String]) -> Vec<(String, String)> {
+    // Drop a trailing `group <tag>` clause (we do not yet honor grouping, but we
+    // must not let it corrupt the filter). MPD grouping trails the `TAG VALUE`
+    // filter pairs, so `group` only begins the clause when it lands on a tag slot
+    // (even index); a filter VALUE that is literally "group" sits on an odd index
+    // and must be kept.
+    let cut = rest
+        .iter()
+        .enumerate()
+        .position(|(i, t)| i % 2 == 0 && t.eq_ignore_ascii_case("group"));
+    let rest = match cut {
+        Some(pos) => &rest[..pos],
+        None => rest,
+    };
     // Modern single-arg expression form: `(tag == "value")`.
     if rest.len() == 1 && rest[0].contains("==") {
         if let Some(pair) = parse_filter_expression(&rest[0]) {
