@@ -201,7 +201,13 @@ impl<C: Clock> Executor<C> {
         // that then fires on a paused track at the wrong wall-time.
         match ev.kind {
             DjEventKind::StateChanged(PlayState::Paused, _) => self.paused = true,
-            DjEventKind::StateChanged(PlayState::Playing, _) => self.paused = false,
+            // A fresh track that starts playing surfaces as TrackStart (never a
+            // StateChanged(Playing) edge), and a Stopped edge means nothing is
+            // paused - both must clear the durable flag so TimeRemaining plans
+            // re-arm for the now-playing track.
+            DjEventKind::StateChanged(PlayState::Playing, _)
+            | DjEventKind::StateChanged(PlayState::Stopped, _)
+            | DjEventKind::TrackStart(_) => self.paused = false,
             _ => {}
         }
         let snap = self.handler.queue_snapshot();

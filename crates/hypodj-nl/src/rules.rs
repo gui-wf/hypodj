@@ -354,9 +354,10 @@ fn strip_trailing_filler(s: &str) -> &str {
     loop {
         let mut stripped = false;
         for f in FILLER {
-            if cur.len() > f.len() {
-                let head = &cur[..cur.len() - f.len()];
-                let tail = &cur[cur.len() - f.len()..];
+            if cur.len() > f.len() && cur.is_char_boundary(cur.len() - f.len()) {
+                let split = cur.len() - f.len();
+                let head = &cur[..split];
+                let tail = &cur[split..];
                 // Whole-word boundary: the filler must be preceded by a space so
                 // "increase" is never truncated by the "please"... (it is not a
                 // suffix here, but the space guard keeps the match honest).
