@@ -25,3 +25,6 @@ mpris-server = "0.8"
 # Deserialize the exact camelCase wire JSON in the wire->model mapping tests,
 # through the real `opensubsonic::data` structs. Not a runtime dep.
 serde_json = "1"
+# The fade/clock tests use tokio's paused virtual clock (start_paused +
+# time::advance) for deterministic fake-time scheduling with no real sleeping.
+tokio = { workspace = true, features = ["test-util"] }

@@ -12,7 +12,9 @@
 //!               accept/codec loop is next-phase.
 
 pub mod cache;
+pub mod clock;
 pub mod config;
+pub mod fade;
 pub mod handler;
 pub mod model;
 pub mod mpd;

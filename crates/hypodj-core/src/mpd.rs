@@ -29,6 +29,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -169,9 +170,44 @@ pub enum MpdCommand {
     Decoders,
     UrlHandlers,
 
+    /// `fade out|in|to ...` - drive the startle-safe volume envelope
+    /// ([`crate::fade`]). An immediate, cancellable, mid-track fade. See
+    /// [`FadeArgs`]. NOT a standard MPD command; a hypodj extension.
+    Fade(FadeArgs),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
+}
+
+/// Which direction / target a `fade` drives toward. `To(vol)` fades to an
+/// explicit 0..=100 volume; `ToFloor` winds down to the configured non-silence
+/// floor (`floor_level_db`) leaving playback running; `Out` ramps to silence
+/// (then stops + restores the pre-fade volume); `In` ramps up from the current
+/// level to the comfort ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FadeKind {
+    To(u8),
+    /// `fade to floor` - wind down to the configured `floor_level_db`.
+    ToFloor,
+    Out,
+    In,
+}
+
+/// A parsed `fade` request: the direction and the RAW, optional duration.
+///
+/// The parser is deliberately config-free (pure + unit-testable): it does NOT
+/// bake in any default duration or clamp bounds. `dur == None` means "the user
+/// gave no duration, use the per-kind config default"; `Some(d)` is the raw
+/// requested duration (still unclamped). The handler ([`crate::handler`])
+/// resolves the default and clamps to `[min_slew, max_dur]` from the live
+/// [`crate::config::FadeConfig`], so a user's `[fade]` TOML overrides actually
+/// take effect. A present-but-invalid duration (NaN/inf/negative) is rejected by
+/// the parser as [`MpdCommand::Unsupported`] before it ever reaches here.
+#[derive(Debug, Clone, Copy)]
+pub struct FadeArgs {
+    pub kind: FadeKind,
+    pub dur: Option<Duration>,
 }
 
 /// The parsed `sticker` subcommand. MPD's sticker verb is
@@ -218,6 +254,82 @@ fn parse_sticker(args: &[String]) -> StickerCmd {
         },
         _ => StickerCmd::Unsupported,
     }
+}
+
+/// Parse a `fade` request into a [`FadeArgs`]. Grammar:
+///   - `fade out [secs]`        -> ramp to silence (then stop + restore)
+///   - `fade in  [secs]`        -> ramp up to the comfort ceiling
+///   - `fade to  <vol> [secs]`  -> ramp to an explicit 0..=100 volume
+///   - `fade to  floor [secs]`  -> wind down to the configured non-silence floor
+///
+/// `secs` is bare or `s`-suffixed. A MISSING duration parses to `dur: None` (the
+/// handler substitutes the per-kind config default); a present-but-non-finite or
+/// negative duration is rejected as [`MpdCommand::Unsupported`]. This parser is
+/// pure and config-free: it never bakes in a default duration or clamp bound -
+/// the handler resolves both from [`crate::config::FadeConfig`] so a user's
+/// `[fade]` TOML override actually takes effect. `vol` is clamped to `0..=100`
+/// (a pure numeric bound, not a config knob).
+fn parse_fade(args: &[String], line: &str) -> MpdCommand {
+    let unsupported = || MpdCommand::Unsupported(line.to_string());
+    // Parse an optional duration token: absent -> Ok(None) (use the config
+    // default), present+valid -> Ok(Some(dur)), present+invalid -> Err.
+    let opt_dur = |tok: Option<&String>| -> Result<Option<Duration>, ()> {
+        match tok {
+            None => Ok(None),
+            Some(t) => match parse_secs(t) {
+                // try_from_secs_f64 (not from_secs_f64) so a pathological huge
+                // token like `fade out 1e20` is rejected as invalid rather than
+                // panicking Duration construction on the connection task. A valid
+                // duration is still clamped to [min_slew, max_dur] in the handler.
+                Some(s) => match Duration::try_from_secs_f64(s) {
+                    Ok(d) => Ok(Some(d)),
+                    Err(_) => Err(()),
+                },
+                None => Err(()),
+            },
+        }
+    };
+    let sub = match args.first() {
+        Some(s) => s.to_lowercase(),
+        None => return unsupported(),
+    };
+    match sub.as_str() {
+        "out" | "in" => {
+            let kind = if sub == "in" { FadeKind::In } else { FadeKind::Out };
+            let dur = match opt_dur(args.get(1)) {
+                Ok(d) => d,
+                Err(()) => return unsupported(),
+            };
+            MpdCommand::Fade(FadeArgs { kind, dur })
+        }
+        "to" => {
+            // Second token is `floor` (wind-down to the config floor) or a 0..=100
+            // volume. vol is required; reject NaN/inf/negative, clamp to 0..=100.
+            let is_floor = args.get(1).map(|t| t.eq_ignore_ascii_case("floor")).unwrap_or(false);
+            let kind = if is_floor {
+                FadeKind::ToFloor
+            } else {
+                match args.get(1).and_then(|v| v.parse::<f64>().ok()) {
+                    Some(v) if v.is_finite() && v >= 0.0 => FadeKind::To(v.min(100.0) as u8),
+                    _ => return unsupported(),
+                }
+            };
+            let dur = match opt_dur(args.get(2)) {
+                Ok(d) => d,
+                Err(()) => return unsupported(),
+            };
+            MpdCommand::Fade(FadeArgs { kind, dur })
+        }
+        _ => unsupported(),
+    }
+}
+
+/// Parse a `secs` token (bare `30` or `s`-suffixed `30s`) into a finite,
+/// non-negative float, or `None` (reject NaN / inf / negative / non-numeric).
+fn parse_secs(tok: &str) -> Option<f64> {
+    let t = tok.strip_suffix('s').unwrap_or(tok);
+    let v: f64 = t.parse().ok()?;
+    (v.is_finite() && v >= 0.0).then_some(v)
 }
 
 /// Tokenize an MPD request line, honoring double-quoted arguments (MPD quotes
@@ -348,6 +460,7 @@ pub fn parse(line: &str) -> MpdCommand {
             let filter = parse_list_filter(&args[args.len().min(1)..]);
             MpdCommand::List { tag, filter }
         }
+        "fade" => parse_fade(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -638,6 +751,92 @@ mod parse_tests {
             parse("sticker get playlist foo rating"),
             MpdCommand::Sticker(StickerCmd::Unsupported)
         ));
+    }
+
+    #[test]
+    fn parses_fade_commands() {
+        // fade out / in with no secs -> dur None (handler substitutes the config
+        // default; the parser stays config-free).
+        match parse("fade out") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::Out, dur }) => assert_eq!(dur, None),
+            other => panic!("got {other:?}"),
+        }
+        match parse("fade in") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::In, dur }) => assert_eq!(dur, None),
+            other => panic!("got {other:?}"),
+        }
+        // Bare and s-suffixed secs both parse to the RAW (unclamped) duration.
+        match parse("fade out 30") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::Out, dur }) => {
+                assert_eq!(dur, Some(Duration::from_secs(30)));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("fade out 30s") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::Out, dur }) => {
+                assert_eq!(dur, Some(Duration::from_secs(30)));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("fade in 300") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::In, dur }) => {
+                assert_eq!(dur, Some(Duration::from_secs(300)));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // fade to <vol> <secs>.
+        match parse("fade to 40 20") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::To(40), dur }) => {
+                assert_eq!(dur, Some(Duration::from_secs(20)));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // fade to floor [secs] -> the wind-down-to-floor kind.
+        match parse("fade to floor") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::ToFloor, dur }) => assert_eq!(dur, None),
+            other => panic!("got {other:?}"),
+        }
+        match parse("fade to floor 45") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::ToFloor, dur }) => {
+                assert_eq!(dur, Some(Duration::from_secs(45)));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fade_raw_dur_unclamped_and_rejects() {
+        // A runaway duration is NOT clamped here (the handler clamps it against
+        // config); the parser passes it through raw.
+        match parse("fade to 50 999999") {
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::To(50), dur }) => {
+                assert_eq!(dur, Some(Duration::from_secs(999999)));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // vol clamps to 100 (a pure numeric bound, not a config knob).
+        assert!(matches!(
+            parse("fade to 250 10"),
+            MpdCommand::Fade(FadeArgs { kind: FadeKind::To(100), .. })
+        ));
+        // A zero duration parses raw (Some(0)); the handler lifts it to one slewed
+        // step - the parser does not.
+        match parse("fade out 0") {
+            MpdCommand::Fade(FadeArgs { dur, .. }) => assert_eq!(dur, Some(Duration::ZERO)),
+            other => panic!("got {other:?}"),
+        }
+        // NaN / inf / negative secs are rejected.
+        assert!(matches!(parse("fade out nan"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("fade out inf"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("fade out -5"), MpdCommand::Unsupported(_)));
+        // A finite-but-huge duration overflows Duration; it must be REJECTED at
+        // parse (via try_from_secs_f64), never panic the connection task.
+        assert!(matches!(parse("fade out 1e20"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("fade to 40 1e30"), MpdCommand::Unsupported(_)));
+        // A bad subcommand / missing vol is unsupported.
+        assert!(matches!(parse("fade sideways"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("fade to"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("fade"), MpdCommand::Unsupported(_)));
     }
 
     #[test]
