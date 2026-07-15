@@ -108,6 +108,16 @@ struct State {
     /// Paused at request time, so an ACK, a mid-fade checkpoint, and a Play-during-
     /// fade branch all see the true intent, not a stale Playing.
     pending_pause: bool,
+    /// PENDING-SKIP intent: the TARGET index of an in-flight startle-safe user
+    /// skip (Next/Previous while playing). Set the instant the skip is requested,
+    /// mirroring [`Self::pending_pause`], so status/MPRIS/currentsong report the
+    /// TARGET track IMMEDIATELY during the dip-to-silence WITHOUT mutating
+    /// `current` yet (mpv still plays the OLD track through the dip). Committed to
+    /// `current` and cleared in the [`Terminal::SkipLoad`] terminal when the target
+    /// actually loads; cleared by any manual volume set / stop / end-of-queue / pause
+    /// so a superseded skip never leaves the reported current pointing at a track
+    /// that never loaded.
+    pending_skip: Option<usize>,
     /// Bumped whenever the queue changes (MPD "playlist version").
     playlist_version: u64,
     /// Client-negotiated binary chunk size (ncmpcpp sends `binarylimit`). MPD is
@@ -177,6 +187,7 @@ impl Default for State {
             fade_epoch: 0,
             fading: false,
             pending_pause: false,
+            pending_skip: None,
             playlist_version: 0,
             binary_limit: 8192,
             last_starred_order: Vec::new(),
@@ -221,6 +232,19 @@ impl State {
         self.live_gain_db = mpv_volume_to_db(v as f64);
         self.fading = false;
         self.pending_pause = false;
+        // A manual volume commit also supersedes any in-flight skip: the deck is
+        // being reconciled to a concrete baseline on the STILL-loaded current
+        // track, so the reported current must revert from the (never-loaded) skip
+        // target back to `current` (mirrors clearing `pending_pause`).
+        self.pending_skip = None;
+    }
+
+    /// The current index to REPORT outward (status/MPRIS/currentsong). During an
+    /// in-flight user skip this is the SKIP TARGET (`pending_skip`), so the outward
+    /// view collapses the dip window to the target immediately; otherwise it is the
+    /// real `current`. Mirrors [`Self::reported_play_state`]'s pending-pause layer.
+    fn reported_current(&self) -> Option<usize> {
+        self.pending_skip.or(self.current)
     }
 }
 
@@ -316,7 +340,19 @@ impl FadeSlot {
 /// What happens AFTER a fade's ramp completes. Lives in the wrapper task, not in
 /// the pure driver. Skipped on abort (a superseded/cancelled fade) and on a sink
 /// error, so a manual action that cancelled the fade is never undone.
-#[derive(Clone, Copy)]
+/// A target's play arguments, pre-resolved SYNCHRONOUSLY (the Subsonic
+/// `stream_url` is sync) so the skip dip terminal only needs a SINK-level
+/// `play_url`, never a `&self` handler call under the fade slot lock.
+#[derive(Clone)]
+struct ResolvedPlay {
+    song_id: Option<SongId>,
+    qid: QueueId,
+    url: String,
+}
+
+// NOTE: no `Copy` - the `SkipLoad` arm carries owned, non-Copy fields
+// (`ResolvedPlay`, `FadeSpec`) that are MOVED exactly once (into the terminal,
+// then into the follow-on spawn). The remaining arms stay trivially matchable.
 enum Terminal {
     /// A bare ramp: adopt the reached level as the new baseline, clear `fading`,
     /// nothing else (no stop, no `set_volume` re-assert).
@@ -346,6 +382,21 @@ enum Terminal {
     /// so this restore never causes a resume to skip the ramp. Distinct from
     /// [`Terminal::StopRestore`] (which stops and restores).
     Pause,
+    /// The heart of SKIP-FADE: the dip-to-silence has landed, so LOAD the
+    /// pre-resolved target from silence and hand off to a follow-on ResumeIn.
+    /// Runs UNDER the fade slot lock, only when still the current epoch (a
+    /// superseding skip/setvol/stop aborted this task before it reached here, so a
+    /// stale dip can NEVER load the wrong track). The deck is already at silence;
+    /// `sink.play_url` loads the target (mpv softvol ~0 persists across loadfile),
+    /// then `current` is committed, `pending_skip` cleared, and a fresh ResumeIn
+    /// fade (`resume_spec` -> `SetBaseline(resume_vol)`) is spawned into the SAME
+    /// slot - one path, one arbiter.
+    SkipLoad {
+        idx: usize,
+        play: ResolvedPlay,
+        resume_spec: FadeSpec,
+        resume_vol: u8,
+    },
 }
 
 /// A fade-NATIVE request: the abstract intent plus the (already resolved +
@@ -464,8 +515,14 @@ impl FadeIntent {
 /// hundreds). It no-ops entirely if the epoch has moved on (a superseded
 /// straggler), so an aborted fade's last in-flight report cannot clobber a newer
 /// fade's live gain.
+// Returns a BOXED, explicitly-`Send` future rather than being a plain
+// `async fn`: `fade_task` is RECURSIVE (the `Terminal::SkipLoad` arm spawns a
+// follow-on `fade_task`), and a recursive `async fn` has an infinitely-sized,
+// self-referential future whose `Send` auto-trait cannot be inferred (cyclic).
+// Boxing to a `dyn Future + Send` breaks the type cycle and asserts `Send` at
+// the boundary, so `tokio::spawn(fade_task(..))` type-checks at every call site.
 #[allow(clippy::too_many_arguments)]
-async fn fade_task(
+fn fade_task(
     sink: PlayerHandle,
     spec: FadeSpec,
     state: Arc<Mutex<State>>,
@@ -484,7 +541,8 @@ async fn fade_task(
     // `live_gain_db` so a fade STARTED during the mute window reads a finite
     // `from_db` and is not rejected as `NonFinite` (see F8).
     synth_floor_db: f64,
-) -> FadeOutcome {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = FadeOutcome> + Send>> {
+    Box::pin(async move {
     let clock = TokioClock;
     let outcome = {
         let state_r = state.clone();
@@ -518,7 +576,7 @@ async fn fade_task(
     // so the `still_current` check is stable and meaningful: if a supersede
     // already ran, it aborted this task before it reached here, OR it is blocked
     // waiting for this lock and will abort a task that has already finished.
-    let _slot_guard = fade_slot.inner.lock().await;
+    let mut slot_guard = fade_slot.inner.lock().await;
     // Only settle if still the current generation (a superseding fade owns the
     // state otherwise). On completion, run the terminal action AND clear `fading`;
     // on a sink error, settle the baseline to the last-good level and clear
@@ -593,6 +651,49 @@ async fn fade_task(
                     // widget refresh) and MPD `idle` wakes.
                     changed.notify_waiters();
                 }
+                Terminal::SkipLoad { idx, play, resume_spec, resume_vol } => {
+                    // The dip reached silence AND this is still the current epoch, so
+                    // no superseding skip/setvol/stop got here first: it is SAFE to
+                    // load the target. mpv's softvol (~0) persists across the loadfile
+                    // (the play_index_from_silence contract), so the new track starts
+                    // silent and the follow-on ResumeIn owns the rise.
+                    let _ = sink.play_url(play.song_id, Some(play.qid), &play.url).await;
+                    // Commit the target as the real current, clear the reported-target
+                    // override, force the live gain to the synth floor (silence) and
+                    // keep `fading` true - the follow-on ResumeIn continues the envelope
+                    // without a gap. Bump the epoch so the follow-on is tagged strictly
+                    // newer than this (now-finished) dip.
+                    let epoch2 = {
+                        let mut st = state.lock().unwrap();
+                        st.current = Some(idx);
+                        st.pending_skip = None;
+                        st.live_gain_db = synth_floor_db;
+                        st.fading = true;
+                        st.fade_epoch += 1;
+                        st.fade_epoch
+                    };
+                    // Spawn the follow-on ResumeIn (silence -> baseline) into the SAME
+                    // slot we already hold, reclaiming the dip's now-finished handle.
+                    // REUSES fade_task verbatim: the FadeSlot + fade_epoch stay the sole
+                    // arbiter (a 2nd skip during this ramp is an ordinary slot fade that
+                    // supersede aborts, SetBaseline never running).
+                    // fade_task returns a boxed Send future (it is recursive), so
+                    // this follow-on spawn is a plain call - the FadeSlot + epoch
+                    // stay the sole arbiter.
+                    let join = tokio::spawn(fade_task(
+                        sink,
+                        resume_spec,
+                        state.clone(),
+                        changed.clone(),
+                        epoch2,
+                        Terminal::SetBaseline(resume_vol),
+                        fade_slot.clone(),
+                        synth_floor_db,
+                    ));
+                    *slot_guard = Some(FadeHandle { abort: join.abort_handle(), join: Some(join) });
+                    // Notify the Playing / new-track edge (MPD idle + MPRIS refresh).
+                    changed.notify_waiters();
+                }
             },
             FadeOutcome::SinkError(_) => {
                 let mut st = state.lock().unwrap();
@@ -605,6 +706,7 @@ async fn fade_task(
         }
     }
     outcome
+    })
 }
 
 pub struct HypodjHandler {
@@ -1759,7 +1861,17 @@ impl HypodjHandler {
         // Flip the REPORTED state to Paused IMMEDIATELY (F2): set the pending-pause
         // intent and notify BEFORE the fade runs, so status/MPRIS/checkpoints see
         // Paused at once and the whole fade window is consistent.
-        self.state.lock().unwrap().pending_pause = true;
+        {
+            let mut st = self.state.lock().unwrap();
+            st.pending_pause = true;
+            // A pause issued during a skip dip supersedes that dip: the PauseOut fade
+            // aborts it before Terminal::SkipLoad runs, so the skip target never
+            // loads and mpv stays paused on the OLD (still-loaded) track. Clear the
+            // skip intent so the reported current reverts from the never-loaded
+            // target back to `current`, matching what mpv actually holds (mirrors
+            // set_manual_volume clearing pending_skip).
+            st.pending_skip = None;
+        }
         self.notify_change();
         let dur = self.pause_fade_dur();
         match self
@@ -2236,7 +2348,12 @@ impl HypodjHandler {
     /// unit-testable.
     fn plan_next(&self, auto: bool) -> Option<usize> {
         let mut st = self.state.lock().unwrap();
-        let cur = st.current?;
+        // Anchor on the REPORTED current so a manual `next`/`prev` during an
+        // in-flight skip steps past the target the user already sees, not the
+        // still-loaded old track. On the auto (EOF) path this equals `current` -
+        // advance_on_eof early-returns whenever a skip is pending, so pending_skip
+        // is always None here for auto advances.
+        let cur = st.reported_current()?;
         let len = st.queue.len();
         if len == 0 {
             return None;
@@ -2292,6 +2409,15 @@ impl HypodjHandler {
     /// next queue entry (honoring random/repeat/single/consume via
     /// [`Self::plan_next`]), or leave the state stopped at the end of the queue.
     pub async fn advance_on_eof(&self) {
+        // A skip dip in flight (pending_skip Some) OWNS the next load: the OLD
+        // track keeps playing audibly through the dip and may reach its natural
+        // EOF inside that window. Advancing here would load an unrelated track and
+        // collide with the pending Terminal::SkipLoad, which still fires afterward
+        // and loads the skip target a second time - a spurious load plus an audible
+        // double-load glitch. Leave the advance to the skip terminal.
+        if self.state.lock().unwrap().pending_skip.is_some() {
+            return;
+        }
         let next = self.plan_next(true);
         match next {
             Some(idx) => {
@@ -2305,12 +2431,189 @@ impl HypodjHandler {
             None => {
                 let mut st = self.state.lock().unwrap();
                 st.current = None;
-                // End of queue: no pending pause can survive a stopped deck.
+                // End of queue: no pending pause / skip can survive a stopped deck.
                 st.pending_pause = false;
+                st.pending_skip = None;
                 drop(st);
                 self.notify_change();
             }
         }
+    }
+
+    // ── startle-safe USER skip (skip-fade) ──────────────────────────────────
+
+    /// Resolve a queue item's play args SYNCHRONOUSLY (the Subsonic `stream_url`
+    /// is sync), so a caller can hand a sink-level [`ResolvedPlay`] to a fade
+    /// terminal that runs under the slot lock (no `&self` handler call there).
+    /// Shared by [`Self::play_index_inner`] and [`Self::skip_with_fade`].
+    fn resolve_play(&self, item: &QueueItem) -> Result<ResolvedPlay, String> {
+        match &item.entry {
+            QueueEntry::Song(song) => {
+                let url = self.client.stream_url(&song.id).map_err(|e| e.to_string())?;
+                Ok(ResolvedPlay {
+                    song_id: Some(song.id.clone()),
+                    qid: QueueId(item.id),
+                    url: url.to_string(),
+                })
+            }
+            QueueEntry::Stream { url, .. } => Ok(ResolvedPlay {
+                song_id: None,
+                qid: QueueId(item.id),
+                url: url.clone(),
+            }),
+        }
+    }
+
+    /// The clamped skip-dip fade duration (`skip_fade_secs` into `[min_slew,
+    /// max_dur]`). Mirrors [`Self::pause_fade_dur`]; saturating parse so a
+    /// pathological float never panics.
+    fn skip_fade_dur(&self) -> Duration {
+        let raw = Duration::try_from_secs_f64(self.fade_cfg.skip_fade_secs)
+            .unwrap_or_else(|_| Duration::from_millis(self.fade_cfg.min_slew_ms));
+        self.clamp_fade_dur(raw)
+    }
+
+    /// Build a DELIBERATE (not sub-JND) fade spec from `from_db` to `target`,
+    /// clamping the duration UP to the deliberate-safe minimum (never a hard cut) -
+    /// the SAME `eff_dur` math [`Self::start_fade_spec`] applies to a `clamp_dur_up`
+    /// intent. Used for BOTH halves of a skip: the dip to silence and the
+    /// pre-built ResumeIn back to the baseline.
+    fn build_deliberate_spec(
+        &self,
+        from_db: f64,
+        target: FadeTarget,
+        dur: Duration,
+    ) -> Result<FadeSpec, FadeError> {
+        let tick = Duration::from_millis(self.fade_cfg.tick_ms);
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        let min_slew = Duration::from_millis(self.fade_cfg.min_slew_ms);
+        let step_interval = tick.max(min_slew);
+        let eff_dur = dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor));
+        let bounds = startle_bounds(&self.fade_cfg, false);
+        FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)
+    }
+
+    /// Route a USER Next/Previous. Fades (dip-through-silence) ONLY when actually
+    /// PLAYING with a current track; otherwise (paused / stopped / no-current) it
+    /// falls through to the plain [`Self::play_index`] path unchanged. The
+    /// autonomous EOF advance does NOT come here - it stays gapless.
+    async fn user_skip(&self, idx: usize) -> Result<(), String> {
+        let has_current = self.state.lock().unwrap().current.is_some();
+        if self.reported_play_state() == PlayState::Playing && has_current {
+            self.skip_with_fade(idx).await
+        } else {
+            self.play_index(idx).await
+        }
+    }
+
+    /// The skip-fade composition: pre-resolve the target, pre-build the ResumeIn
+    /// half, flip the reported current to the target (`pending_skip`) IMMEDIATELY,
+    /// then install a deliberate dip-to-silence whose [`Terminal::SkipLoad`] loads
+    /// the target from silence and hands off to the ResumeIn follow-on - all
+    /// through the ONE active [`FadeSlot`]. A rejected/unresolvable spec degrades
+    /// to a plain [`Self::play_index`] so a skip never gets stuck.
+    async fn skip_with_fade(&self, idx: usize) -> Result<(), String> {
+        // (a) Pre-resolve the target's play args (sync). A resolution failure
+        // degrades to the plain path rather than dipping into a dead end.
+        let item = {
+            let st = self.state.lock().unwrap();
+            st.queue.get(idx).cloned()
+        };
+        let Some(item) = item else { return Err("Bad song index".into()) };
+        let play = match self.resolve_play(&item) {
+            Ok(p) => p,
+            Err(_) => return self.play_index(idx).await,
+        };
+
+        // (b) Baseline + the resume target dB.
+        let baseline = self.state.lock().unwrap().target_volume;
+        let resume_db = mpv_volume_to_db(baseline as f64);
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        let dur = self.skip_fade_dur();
+
+        // (d) Pre-build the ResumeIn spec (synth_floor -> baseline), deliberate,
+        // clamp-up: the dip forces genuine silence, so the follow-on always rises
+        // from the floor. Built here (from a fixed from_db) so the dip terminal
+        // does no handler-side work under the slot lock. A build failure degrades
+        // to the plain path.
+        let resume_spec =
+            match self.build_deliberate_spec(synth_floor, FadeTarget::Db(resume_db), dur) {
+                Ok(s) => s,
+                Err(_) => return self.play_index(idx).await,
+            };
+
+        // (c) Report the TARGET immediately during the dip (WITHOUT mutating
+        // `current`): status/MPRIS/currentsong collapse the dip window to the
+        // target at once.
+        self.state.lock().unwrap().pending_skip = Some(idx);
+        self.notify_change();
+
+        // (e) Install the deliberate dip-out to silence -> Terminal::SkipLoad.
+        match self.install_skip_dip(dur, idx, play, resume_spec, baseline).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "skip dip rejected; plain play");
+                self.state.lock().unwrap().pending_skip = None;
+                self.play_index(idx).await
+            }
+        }
+    }
+
+    /// Install the skip dip via the SAME [`FadeSlot::supersede`] body
+    /// [`Self::start_fade_spec`] uses: build a DELIBERATE dip-to-silence from the
+    /// live gain paired with a [`Terminal::SkipLoad`], and (once validated) abort
+    /// the in-flight fade and spawn it under the slot lock. Install-and-return, so
+    /// a second skip can supersede the dip before its terminal loads.
+    async fn install_skip_dip(
+        &self,
+        dur: Duration,
+        idx: usize,
+        play: ResolvedPlay,
+        resume_spec: FadeSpec,
+        resume_vol: u8,
+    ) -> Result<(), FadeError> {
+        let tick = Duration::from_millis(self.fade_cfg.tick_ms);
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        let min_slew = Duration::from_millis(self.fade_cfg.min_slew_ms);
+        let cfg = self.fade_cfg.clone();
+        let state_read = self.state.clone();
+        let state_task = self.state.clone();
+        let changed = self.changed.clone();
+        let sink = self.player.clone();
+        let slot_for_task = self.fade.clone();
+
+        self.fade
+            .supersede(
+                move || {
+                    // Read the live gain AFTER the outgoing fade is aborted+joined
+                    // (validate-before-abort keeps this untouched on rejection).
+                    let from_db = state_read.lock().unwrap().live_gain_db;
+                    let target = FadeTarget::Silence;
+                    let step_interval = tick.max(min_slew);
+                    let eff_dur =
+                        dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor));
+                    let bounds = startle_bounds(&cfg, false);
+                    let spec =
+                        FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)?;
+                    let terminal = Terminal::SkipLoad { idx, play, resume_spec, resume_vol };
+                    Ok((spec, terminal))
+                },
+                move |(spec, terminal)| {
+                    let epoch = {
+                        let mut st = state_task.lock().unwrap();
+                        st.fade_epoch += 1;
+                        st.fading = true;
+                        st.fade_epoch
+                    };
+                    let join = tokio::spawn(fade_task(
+                        sink, spec, state_task, changed, epoch, terminal, slot_for_task,
+                        synth_floor,
+                    ));
+                    let abort = join.abort_handle();
+                    (abort, join)
+                },
+            )
+            .await
     }
 
     /// Resolve and start playing the queue item at `idx`. Returns an ACK-style
@@ -2350,7 +2653,6 @@ impl HypodjHandler {
         // Latch the entry's stable identity so every downstream player event
         // (TimePos/StateChanged/Eof) is attributed to THIS entry even after an
         // off-spine next/prev/delete repoints the current index.
-        let qid = Some(QueueId(item.id));
         if resync_volume {
             // A fresh-play gesture supersedes any in-flight fade (e.g. a PauseOut
             // ramp from a pause-then-next gesture, or a plain fade-out): atomically
@@ -2377,24 +2679,13 @@ impl HypodjHandler {
             let baseline = self.state.lock().unwrap().target_volume;
             let _ = self.player.set_volume(baseline).await;
         }
-        match &item.entry {
-            QueueEntry::Song(song) => {
-                let url = self
-                    .client
-                    .stream_url(&song.id)
-                    .map_err(|e| e.to_string())?;
-                self.player
-                    .play_url(Some(song.id.clone()), qid, url.as_str())
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            QueueEntry::Stream { url, .. } => {
-                self.player
-                    .play_url(None, qid, url)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
+        // Resolve the play args (sync stream_url) then load - the SAME resolution
+        // the skip dip pre-computes, factored into one place.
+        let play = self.resolve_play(&item)?;
+        self.player
+            .play_url(play.song_id, Some(play.qid), &play.url)
+            .await
+            .map_err(|e| e.to_string())?;
         {
             let mut st = self.state.lock().unwrap();
             st.current = Some(idx);
@@ -2573,7 +2864,11 @@ impl MpdHandler for HypodjHandler {
                         // fade and never desyncs from the envelope.
                         st.reported_volume(),
                         st.queue.len(),
-                        st.current,
+                        // The pending-skip-aware reported current: during an
+                        // in-flight user skip this is the TARGET, so song/songid/
+                        // duration report the target immediately (mirrors the
+                        // pending-pause state override).
+                        st.reported_current(),
                         st.playlist_version,
                         st.random,
                         st.repeat,
@@ -2634,7 +2929,7 @@ impl MpdHandler for HypodjHandler {
 
             MpdCommand::CurrentSong => {
                 let st = self.state.lock().unwrap();
-                match st.current.and_then(|i| st.queue.get(i).map(|it| (i, it))) {
+                match st.reported_current().and_then(|i| st.queue.get(i).map(|it| (i, it))) {
                     Some((pos, item)) => MpdResponse::Pairs(song_pairs(item, pos)),
                     None => MpdResponse::ok(),
                 }
@@ -2710,9 +3005,11 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Wake(cmd) => self.handle_wake(cmd),
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
-                // random/repeat/consume are honored via plan_next.
+                // random/repeat/consume are honored via plan_next. The transition
+                // itself is startle-safe: user_skip dips through silence when
+                // playing, falling back to a plain load when paused/stopped.
                 match self.plan_next(false) {
-                    Some(idx) => match self.play_index(idx).await {
+                    Some(idx) => match self.user_skip(idx).await {
                         Ok(()) => MpdResponse::ok(),
                         Err(e) => ack(ACK_ERROR_NO_EXIST, "next", &e),
                     },
@@ -2722,10 +3019,12 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Previous => {
                 let prev = {
                     let st = self.state.lock().unwrap();
-                    st.current.and_then(|c| c.checked_sub(1))
+                    // From the REPORTED current (an in-flight skip target), so a
+                    // second Previous steps back from IT, not the old track.
+                    st.reported_current().and_then(|c| c.checked_sub(1))
                 };
                 match prev {
-                    Some(idx) => match self.play_index(idx).await {
+                    Some(idx) => match self.user_skip(idx).await {
                         Ok(()) => MpdResponse::ok(),
                         Err(e) => ack(ACK_ERROR_NO_EXIST, "previous", &e),
                     },
@@ -5478,5 +5777,211 @@ mod tests {
         assert_eq!(pair(&resp, "repeat"), Some("1"));
         assert_eq!(pair(&resp, "single"), Some("1"));
         assert_eq!(pair(&resp, "consume"), Some("1"));
+    }
+
+    // ── skip-fade (single-mpv dip-through-silence on a USER Next/Previous) ────
+
+    // A user Next while PLAYING dips to silence, loads the target FROM silence in
+    // the SkipLoad terminal, then a follow-on ResumeIn ramps back to the baseline -
+    // all through the ONE fade slot. The target is reported current IMMEDIATELY
+    // (pending_skip), and the OLD track keeps playing audibly through the dip.
+    #[tokio::test(start_paused = true)]
+    async fn user_next_dips_loads_target_then_resumes() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        h.handle(MpdCommand::Next).await;
+        // A dip is installed (not an abrupt cut) and mpv still plays the OLD track.
+        assert!(h.fade_active().await, "next installs a dip fade");
+        assert_eq!(h.player.state(), PlayState::Playing, "old track not cut");
+        // status/currentsong report the TARGET (idx 1) immediately via pending_skip,
+        // WITHOUT current having moved yet.
+        assert_eq!(pair(&h.handle(MpdCommand::Status).await, "song"), Some("1"));
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "current not moved yet");
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
+
+        // Drive the dip to its SkipLoad terminal: target committed, pending cleared,
+        // a follow-on ResumeIn fade is active, mpv Playing the new track.
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "target committed");
+        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+        assert!(h.fade_active().await, "a follow-on ResumeIn fade is active");
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Drive the follow-on ResumeIn to completion: back at the baseline, audible.
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0, "ramped back up");
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+    }
+
+    // A rapid SECOND skip during the dip SUPERSEDES the first: the first SkipLoad
+    // terminal is aborted BEFORE it loads, so ONLY the second target is ever loaded.
+    #[tokio::test(start_paused = true)]
+    async fn double_skip_loads_only_second_target() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await; // dip to idx1
+        pump(20, 1).await; // dip in flight
+        h.handle(MpdCommand::Next).await; // dip to idx2, supersedes the first
+
+        // Drive the (second) dip then its follow-on to completion.
+        h.wait_for_fade().await;
+        h.wait_for_fade().await;
+
+        assert_eq!(h.state.lock().unwrap().current, Some(2), "only the 2nd target");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Drain the player events: track 1's queue_id (QueueId(1)) was NEVER loaded
+        // (its SkipLoad was aborted before the load), only 0 (initial) and 2.
+        let mut loaded: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        while let Ok(ev) = events.try_recv() {
+            if let PlayerEvent::StateChanged(PlayState::Playing, _, Some(qid)) = ev {
+                loaded.insert(qid.0);
+            }
+        }
+        assert!(!loaded.contains(&1), "the 1st skip target must never load: {loaded:?}");
+        assert!(loaded.contains(&2), "the 2nd skip target loads: {loaded:?}");
+    }
+
+    // A skip while PAUSED is a plain play (no dip): the deck is not playing, so
+    // there is nothing to dip through - it advances and plays at the baseline.
+    #[tokio::test(start_paused = true)]
+    async fn skip_while_paused_is_plain_play() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+
+        h.handle(MpdCommand::Next).await;
+        // Plain play_index path: current advanced, audible at baseline immediately,
+        // no dip-to-silence and no follow-on skip fade.
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.player.state(), PlayState::Playing);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(!h.fade_active().await, "no dip on a paused skip");
+        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+    }
+
+    // An autonomous EOF advance stays GAPLESS: it must NOT skip-fade (no dip, the
+    // envelope/volume is untouched across the track boundary).
+    #[tokio::test(start_paused = true)]
+    async fn eof_advance_stays_gapless() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.advance_on_eof().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert!(!h.fade_active().await, "eof advance never dips");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+    }
+
+    // A setvol DURING the dip cleanly cancels it: the target is NEVER loaded, the
+    // manual volume wins, pending_skip is cleared, and the OLD track keeps playing.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_during_skip_dip_cancels_cleanly() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await; // dip to idx1
+        pump(20, 1).await;
+        h.handle(MpdCommand::SetVol(30)).await;
+
+        assert!(!h.fade_active().await, "setvol cancels the dip");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 30);
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
+        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+        assert_eq!(h.player.state(), PlayState::Playing, "old track still playing");
+    }
+
+    // A stop DURING the dip cleanly cancels it: the target is NEVER loaded, the
+    // deck stops, pending_skip is cleared, and the baseline is restored.
+    #[tokio::test(start_paused = true)]
+    async fn stop_during_skip_dip() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await; // dip to idx1
+        pump(20, 1).await;
+        h.handle(MpdCommand::Stop).await;
+
+        assert_eq!(h.player.state(), PlayState::Stopped);
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
+        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100, "baseline restored");
+    }
+
+    // A natural EOF that lands INSIDE the skip-dip window must NOT auto-advance: the
+    // skip owns the next load. Otherwise advance_on_eof would load an unrelated
+    // track (current+1) that collides with the pending Terminal::SkipLoad, which
+    // still fires and loads the skip target a second time (spurious load + double
+    // load glitch). The skip terminal is the sole authority for the next load.
+    #[tokio::test(start_paused = true)]
+    async fn eof_during_skip_dip_does_not_double_advance() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await; // dip: current 0, pending_skip Some(1)
+        pump(20, 1).await; // dip in flight
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
+
+        // The OLD track (idx0) reaches its natural EOF mid-dip: must be a no-op, NOT
+        // an advance to idx2 (current+1). current + pending_skip stay put.
+        h.advance_on_eof().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "eof did not advance mid-skip");
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "skip intent intact");
+
+        // The dip's SkipLoad terminal is still the sole authority for the load: it
+        // commits the target (idx1), never idx2.
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "skip target loaded, not eof's idx2");
+        assert_eq!(h.state.lock().unwrap().pending_skip, None);
+    }
+
+    // A pause DURING the dip supersedes it (SkipLoad never runs, target never
+    // loads), so pending_skip must be cleared: the reported current reverts to the
+    // OLD track mpv is actually paused on, never stuck on the never-loaded target.
+    #[tokio::test(start_paused = true)]
+    async fn pause_during_skip_dip_clears_pending_skip() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await; // dip: current 0, pending_skip Some(1)
+        pump(20, 1).await;
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1));
+
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        // The pause aborted the dip before it loaded the target: reported current
+        // reverts to the still-loaded idx0, not the never-loaded idx1.
+        assert_eq!(h.state.lock().unwrap().pending_skip, None, "skip intent cleared on pause");
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
+        assert_eq!(pair(&h.handle(MpdCommand::Status).await, "song"), Some("0"));
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+        // The desync does not survive a resume: still on idx0.
+        assert_eq!(h.state.lock().unwrap().current, Some(0));
+        assert_eq!(h.state.lock().unwrap().pending_skip, None);
     }
 }

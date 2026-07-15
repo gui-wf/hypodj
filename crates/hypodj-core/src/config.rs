@@ -128,6 +128,14 @@ pub struct FadeConfig {
     /// Normalized into `[min_slew_s, max_dur_secs]`.
     #[serde(default = "d_pause_fade_s")]
     pub pause_fade_secs: f64,
+    /// Duration of the startle-safe USER-skip dip fade, SECONDS (a float, like
+    /// `pause_fade_secs`). On a USER Next/Previous while playing, the transport
+    /// runs a short DELIBERATE dip to silence, loads the target from silence, then
+    /// ramps back to the baseline. Kept SHORT (default ~0.35s) so a skip feels
+    /// responsive; the fade primitive still extends it as far as deliberate
+    /// startle safety requires. Normalized into `[min_slew_s, max_dur_secs]`.
+    #[serde(default = "d_skip_fade_s")]
+    pub skip_fade_secs: f64,
 }
 
 // Research-backed defaults (memory 01kxhjqr). Exposed as `pub const` so the fade
@@ -145,6 +153,7 @@ pub const DEFAULT_MAX_DUR_SECS: u64 = 1800;
 pub const DEFAULT_SHUTDOWN_FADE_SECS: u64 = 6;
 pub const DEFAULT_RESTART_FADE_SECS: u64 = 5;
 pub const DEFAULT_PAUSE_FADE_SECS: f64 = 0.5;
+pub const DEFAULT_SKIP_FADE_SECS: f64 = 0.35;
 
 /// Positive minimum for `step_size_db`. A `0` (or negative) step would divide by
 /// zero in [`crate::fade::FadeSpec::new`]'s sub-JND path (`range / step_size` ->
@@ -172,6 +181,7 @@ fn d_max_dur_s() -> u64 { DEFAULT_MAX_DUR_SECS }
 fn d_shutdown_fade_s() -> u64 { DEFAULT_SHUTDOWN_FADE_SECS }
 fn d_restart_fade_s() -> u64 { DEFAULT_RESTART_FADE_SECS }
 fn d_pause_fade_s() -> f64 { DEFAULT_PAUSE_FADE_SECS }
+fn d_skip_fade_s() -> f64 { DEFAULT_SKIP_FADE_SECS }
 
 impl FadeConfig {
     /// Clamp every knob into its safe range at LOAD time, logging any correction,
@@ -311,6 +321,11 @@ impl FadeConfig {
         }
         let pause_lo = self.min_slew_ms as f64 / 1000.0;
         self.pause_fade_secs = self.pause_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
+        // The skip-dip fade is the same FLOAT-second shape as the pause fade.
+        if !self.skip_fade_secs.is_finite() {
+            self.skip_fade_secs = DEFAULT_SKIP_FADE_SECS;
+        }
+        self.skip_fade_secs = self.skip_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
     }
 }
 
@@ -330,6 +345,7 @@ impl Default for FadeConfig {
             shutdown_fade_secs: DEFAULT_SHUTDOWN_FADE_SECS,
             restart_fade_secs: DEFAULT_RESTART_FADE_SECS,
             pause_fade_secs: DEFAULT_PAUSE_FADE_SECS,
+            skip_fade_secs: DEFAULT_SKIP_FADE_SECS,
         }
     }
 }
