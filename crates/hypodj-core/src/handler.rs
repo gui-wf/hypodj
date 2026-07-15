@@ -1347,11 +1347,14 @@ impl HypodjHandler {
             current,
             now: Instant::now(),
             now_civil: chrono::Utc::now(),
-            // ADAPTATION: no tz knob in config yet, so a UTC fixed offset. The echo
-            // always shows the fully-resolved absolute civil time, so a meridian
-            // mistake is still caught at confirm; a configurable IANA zone is a P4
-            // refinement.
-            tz: chrono::FixedOffset::east_opt(0).unwrap(),
+            // An alarm is a LOCAL-time promise: `nl "wake me at 7"` means 07:00 in
+            // the SYSTEM zone, same as the direct `wake at 7` command (which uses
+            // chrono::Local in resolve_next_civil). Use the current local UTC offset
+            // so both NL and direct surfaces resolve the same local instant and the
+            // echo prints local time. A full IANA zone (DST transitions between now
+            // and the wake) is a P4 refinement; the current offset is exact for the
+            // civil->UTC reduction at translate time.
+            tz: *chrono::Local::now().offset(),
             queue_len: snap.entries.len(),
         }
     }

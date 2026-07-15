@@ -78,6 +78,12 @@ pub struct Executor<C: Clock> {
     ticks: Option<broadcast::Receiver<DjEvent>>,
     immediate: Option<mpsc::UnboundedReceiver<PlanId>>,
     last_version: u64,
+    /// Durable playback-paused flag: set on a `StateChanged(Paused)` edge, cleared
+    /// on `StateChanged(Playing)`. A TimeRemaining timer must NOT be (re-)armed while
+    /// paused, and a Tick arriving DURING a pause (e.g. a seek-while-paused emits a
+    /// TimePos -> Tick) carries no pause marker of its own - so the paused state must
+    /// be remembered across events, not re-derived from the current event alone.
+    paused: bool,
 }
 
 impl<C: Clock> Executor<C> {
@@ -99,6 +105,7 @@ impl<C: Clock> Executor<C> {
             ticks: Some(ticks),
             immediate: Some(immediate),
             last_version: 0,
+            paused: false,
         };
         tokio::spawn(ex.run())
     }
@@ -172,7 +179,7 @@ impl<C: Clock> Executor<C> {
 
     /// A lossy `Tick` (or mirrored edge): maintain the lifecycle of every
     /// TimeRemaining plan (arm/re-arm/disarm) - see [`Self::maintain_remaining`].
-    fn on_tick(&self, ev: &DjEvent) {
+    fn on_tick(&mut self, ev: &DjEvent) {
         self.maintain_remaining(ev);
     }
 
@@ -186,10 +193,20 @@ impl<C: Clock> Executor<C> {
     ///     deadline moved - re-arm to the new deadline.
     /// All timer sends are sync (no `.await` under the std Mutex); the RAII guard
     /// rides in [`PendingPlan`].
-    fn maintain_remaining(&self, ev: &DjEvent) {
+    fn maintain_remaining(&mut self, ev: &DjEvent) {
+        // Update the DURABLE paused flag from a state-change edge. A bare Tick
+        // carries no pause marker, so a seek-while-paused (which emits a TimePos ->
+        // Tick, not a StateChanged) must read the remembered state, never re-derive
+        // "paused" from the current event alone - otherwise it would re-arm a timer
+        // that then fires on a paused track at the wrong wall-time.
+        match ev.kind {
+            DjEventKind::StateChanged(PlayState::Paused, _) => self.paused = true,
+            DjEventKind::StateChanged(PlayState::Playing, _) => self.paused = false,
+            _ => {}
+        }
         let snap = self.handler.queue_snapshot();
         let cur = snap.current.as_ref().map(|c| c.queue_id);
-        let paused = matches!(ev.kind, DjEventKind::StateChanged(PlayState::Paused, _));
+        let paused = self.paused;
         let pending = self.handler.plan_pending_handle();
         let mut g = pending.lock().unwrap();
         for pp in g.iter_mut() {
@@ -268,21 +285,27 @@ impl<C: Clock> Executor<C> {
 
     /// Run a fired batch OFF the recv loop, so a slow/hanging action (an `Enqueue`
     /// does Subsonic network calls) can NEVER wedge the executor: the loop keeps
-    /// draining the trigger + tick streams while this runs. The batch is a single
-    /// DETACHED task that runs its actions in ascending-PlanId order (stable end
-    /// state), each in its OWN spawned+joined task so a panicking or erroring action
-    /// is log-and-continue and isolates the rest of the batch. Fades still go
-    /// through the single [`HypodjHandler::start_fade_spec`] slot (one envelope).
+    /// draining the trigger + tick streams while this runs.
+    ///
+    /// Each action is spawned as its OWN fully DETACHED task (not awaited in
+    /// sequence), so a single HANGING action - a network read that never returns -
+    /// can never starve a co-triggered action (a fade fired on the SAME edge still
+    /// runs immediately). Per-action panic isolation is preserved: each detached task
+    /// spawns `run_action` and awaits ONLY its own join handle, logging a panic
+    /// without touching its siblings. ORDER-INDEPENDENCE is by design: the actions
+    /// are isolated (fades still serialize through the single
+    /// [`HypodjHandler::start_fade_spec`] slot / one envelope), so the end state does
+    /// not depend on completion order.
     fn execute_batch(&self, fired: Vec<(PlanId, Action)>) {
-        let h = self.handler.clone();
-        tokio::spawn(async move {
-            for (id, action) in fired {
-                let jh = tokio::spawn(run_action(h.clone(), id, action));
+        for (id, action) in fired {
+            let h = self.handler.clone();
+            tokio::spawn(async move {
+                let jh = tokio::spawn(run_action(h, id, action));
                 if let Err(e) = jh.await {
-                    tracing::error!(plan = id.0, error = %e, "plan action task panicked; batch continues");
+                    tracing::error!(plan = id.0, error = %e, "plan action task panicked");
                 }
-            }
-        });
+            });
+        }
     }
 }
 
@@ -679,10 +702,12 @@ mod tests {
         assert!(!rig.handler.fade_active_for_test().await, "no phantom fire after cancel");
     }
 
-    // deterministic order: two plans (Fade then Stop) on one TrackStart execute in
-    // ascending PlanId; Stop (higher id) lands last, so the end state is stopped.
+    // co-triggered selection: two plans on one TrackStart are BOTH selected and
+    // removed at the single registry lock (ascending PlanId), then executed as
+    // isolated detached tasks. Completion order is not guaranteed (F2), so this
+    // asserts the SELECTION (both drained from the list), not which action wins.
     #[tokio::test(start_paused = true)]
-    async fn deterministic_order_fade_then_stop() {
+    async fn co_triggered_plans_both_selected() {
         let Some(rig) = Rig::new(&[("s0", Some(200), Some("A")), ("s1", Some(200), Some("A"))]).await
         else {
             eprintln!("skip: no CA certs");
@@ -710,9 +735,51 @@ mod tests {
 
         rig.push(DjEventKind::TrackStart(tref(1)));
         settle().await;
-        // Stop ran last (ascending id), cancelling the fade: stable end state.
-        assert!(!rig.handler.fade_active_for_test().await, "Stop (higher id) applied last");
-        assert!(rig.handler.plan_list().is_empty());
+        // Both once plans were selected + removed at the shared lock; end-state
+        // ordering between the isolated actions is intentionally unconstrained.
+        assert!(rig.handler.plan_list().is_empty(), "both co-triggered plans selected + removed");
+    }
+
+    // F3: a SEEK-WHILE-PAUSED must NOT arm/fire a TimeRemaining timer. Pause first,
+    // then a bare Tick (a paused seek emits a TimePos -> Tick, NOT a StateChanged):
+    // the DURABLE paused flag must keep the timer disarmed so it never fires on the
+    // paused track at the wrong wall-time.
+    #[tokio::test(start_paused = true)]
+    async fn time_remaining_paused_seek_tick_does_not_arm() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        rig.handler
+            .plan_add(RawPlan {
+                version: 1,
+                trigger: RawTrigger::TimeRemaining { track: TrackSel::Current, secs: 30.0 },
+                action: Action::Fade(FadeIntentIr::Out { secs: 10.0 }),
+                once: true,
+                origin: "mpd".into(),
+            })
+            .unwrap();
+        let tick = |rem: u64| DjEventKind::Tick {
+            time_pos: Duration::from_secs(200 - rem),
+            time_remaining: Some(Duration::from_secs(rem)),
+        };
+
+        // Pause BEFORE any arming Tick: the durable paused flag is now set.
+        let _ = rig.tick_tx.send(rig.event(DjEventKind::StateChanged(PlayState::Paused, None)));
+        settle().await;
+
+        // A bare Tick (the seek-while-paused sample) must NOT arm - it carries no
+        // pause marker itself, so only the remembered paused state prevents arming.
+        let _ = rig.tick_tx.send(rig.event(tick(100)));
+        settle().await;
+
+        // Advance well past the deadline the Tick would have implied: no fire.
+        tokio::time::advance(Duration::from_secs(200)).await;
+        settle().await;
+        assert!(
+            !rig.handler.fade_active_for_test().await,
+            "a paused seek Tick never armed a TimeRemaining timer"
+        );
     }
 
     // crash isolation: a plan whose execute ERRORS (Similar selector, no
@@ -789,7 +856,10 @@ mod tests {
         settle().await;
         assert!(!rig.handler.fade_active_for_test().await, "no fire while paused");
 
-        // Resume with a fresh Tick (still 100s remaining): re-arm, then cross it.
+        // Resume: a real resume emits a Playing edge (clearing the durable paused
+        // flag), THEN a fresh Tick (still 100s remaining) re-arms; then cross it.
+        let _ = rig.tick_tx.send(rig.event(DjEventKind::StateChanged(PlayState::Playing, None)));
+        settle().await;
         let _ = rig.tick_tx.send(rig.event(tick(100)));
         settle().await;
         tokio::time::advance(Duration::from_secs(80)).await;

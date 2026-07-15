@@ -270,10 +270,10 @@ mod tests {
         // lowercasing must NOT garble the selector or slice mid-codepoint (panic).
         // The genre is still resolved correctly from the ORIGINAL text.
         match &tr("wake me at 7 \u{0130} with jazz", &c).unwrap()[0].action {
-            Action::Enqueue { selector, .. } => {
+            Action::Wake { selector: Some(selector), .. } => {
                 assert_eq!(format!("{selector:?}"), format!("{:?}", Selector::Genre("jazz".into())));
             }
-            other => panic!("expected Enqueue, got {other:?}"),
+            other => panic!("expected Wake with a selector, got {other:?}"),
         }
     }
 
@@ -282,13 +282,34 @@ mod tests {
         let c = ctx(Some("s1"), 5);
         // "with jazz" (in the genre lexicon) -> Genre; via a wake so "with" is set.
         match &tr("wake me at 7 with jazz", &c).unwrap()[0].action {
-            Action::Enqueue { selector: Selector::Genre(g), .. } => assert_eq!(g, "jazz"),
-            other => panic!("expected Genre, got {other:?}"),
+            Action::Wake { selector: Some(Selector::Genre(g)), .. } => assert_eq!(g, "jazz"),
+            other => panic!("expected Wake(Genre), got {other:?}"),
         }
         // "with Bon Iver" (not a genre) -> Query, preserving the original case.
         match &tr("wake me at 7 with Bon Iver", &c).unwrap()[0].action {
-            Action::Enqueue { selector: Selector::Query(q), .. } => assert_eq!(q, "Bon Iver"),
-            other => panic!("expected Query, got {other:?}"),
+            Action::Wake { selector: Some(Selector::Query(q)), .. } => assert_eq!(q, "Bon Iver"),
+            other => panic!("expected Wake(Query), got {other:?}"),
+        }
+    }
+
+    // F6: a trailing politeness filler ("please" / "thanks" / "thank you") must not
+    // defeat the closed-genre match - "with jazz please" is the genre "jazz", not the
+    // free-text Query "jazz please".
+    #[test]
+    fn corpus_with_selector_trims_trailing_filler() {
+        let c = ctx(Some("s1"), 5);
+        for u in [
+            "wake me at 7 with jazz please",
+            "wake me at 7 with jazz please.",
+            "wake me at 7 with jazz thanks",
+            "wake me at 7 with jazz thank you",
+        ] {
+            match &tr(u, &c).unwrap()[0].action {
+                Action::Wake { selector: Some(Selector::Genre(g)), .. } => {
+                    assert_eq!(g, "jazz", "{u}")
+                }
+                other => panic!("expected Wake(Genre jazz) for {u:?}, got {other:?}"),
+            }
         }
     }
 
@@ -317,22 +338,46 @@ mod tests {
         );
     }
 
+    // F5: nl wake emits ONE Action::Wake (enqueue -> start-from-silence -> play ->
+    // ramp), so it actually STARTS playback from a stopped deck - not a silent
+    // Enqueue + Fade(In) pair (append-only + volume-only) that never begins playing.
     #[test]
-    fn corpus_wake_is_two_plans_sharing_one_instant() {
+    fn corpus_wake_is_one_wake_plan() {
         let c = ctx(Some("s1"), 5);
         let plans = tr("wake me at 7 with jazz", &c).unwrap();
-        assert_eq!(plans.len(), 2, "wake is an ordered pair");
-        // Both share ONE resolved WallClock instant.
-        let (a1, a2) = match (&plans[0].trigger, &plans[1].trigger) {
-            (RawTrigger::WallClock { at: a }, RawTrigger::WallClock { at: b }) => (*a, *b),
-            other => panic!("expected two WallClock triggers, got {other:?}"),
-        };
-        assert_eq!(a1, a2, "same deadline");
+        assert_eq!(plans.len(), 1, "wake is a single atomic Wake plan");
         // now_civil is 05:30 UTC; "7" (morning) is 07:00 UTC today (tz = UTC).
-        assert_eq!(a1, Utc.with_ymd_and_hms(2026, 7, 15, 7, 0, 0).unwrap());
-        // Enqueue BEFORE Fade(In) (insertion order).
-        assert!(matches!(plans[0].action, Action::Enqueue { .. }));
-        assert!(matches!(plans[1].action, Action::Fade(FadeIntentIr::In { .. })));
+        match plans[0].trigger {
+            RawTrigger::WallClock { at } => {
+                assert_eq!(at, Utc.with_ymd_and_hms(2026, 7, 15, 7, 0, 0).unwrap())
+            }
+            ref other => panic!("expected a WallClock trigger, got {other:?}"),
+        }
+        match &plans[0].action {
+            Action::Wake { selector: Some(Selector::Genre(g)), count } => {
+                assert_eq!(g, "jazz");
+                assert_eq!(*count, rules::DEFAULT_ENQUEUE_COUNT);
+            }
+            other => panic!("expected Wake(Genre jazz), got {other:?}"),
+        }
+    }
+
+    // F1: "wake me at 7" is a LOCAL-time promise resolved against ctx.tz (the system
+    // local zone the handler now supplies), not UTC. With a +01:00 local zone, "at 7"
+    // local is 06:00 UTC - proving the resolution honors the local offset.
+    #[test]
+    fn corpus_wake_resolves_local_zone() {
+        // 05:30 UTC = 06:30 local at +01:00; "at 7" (07:00 local) is still ahead today.
+        let mut c = ctx(Some("s1"), 5);
+        c.tz = FixedOffset::east_opt(3600).unwrap(); // +01:00
+        let plans = tr("wake me at 7 with jazz", &c).unwrap();
+        match plans[0].trigger {
+            RawTrigger::WallClock { at } => {
+                // 07:00 at +01:00 -> 06:00 UTC (a UTC-only resolver would give 07:00Z).
+                assert_eq!(at, Utc.with_ymd_and_hms(2026, 7, 15, 6, 0, 0).unwrap())
+            }
+            ref other => panic!("expected a WallClock trigger, got {other:?}"),
+        }
     }
 
     #[test]

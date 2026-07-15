@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use hypodj_core::plan::{Action, PosBase, RawPlan, RawTrigger, TrackSel};
+use hypodj_core::plan::{Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel};
 
 /// The trigger subset the model may emit: RawTrigger MINUS WallClock and
 /// Immediate. No `DateTime` target, no synthetic add-time edge on the model
@@ -40,13 +40,93 @@ impl From<LlmTrigger> for RawTrigger {
     }
 }
 
+/// The fade directions the model may emit: `Out`/`In` ONLY. The deliberate-cue
+/// (`To`), wind-down (`ToFloor`) and alarm-wake (`WakeTo`) intents are OFF the model
+/// surface - a model must never drive those side-effecting ramps. Each carries a
+/// NAMED `secs` field so it round-trips through serde (an internally-tagged variant
+/// with a struct body, not a primitive newtype).
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(tag = "dir", rename_all = "snake_case")]
+pub enum LlmFade {
+    Out { secs: f64 },
+    In { secs: f64 },
+}
+
+impl From<LlmFade> for FadeIntentIr {
+    fn from(f: LlmFade) -> Self {
+        match f {
+            LlmFade::Out { secs } => FadeIntentIr::Out { secs },
+            LlmFade::In { secs } => FadeIntentIr::In { secs },
+        }
+    }
+}
+
+/// The content selectors the model may emit for an `Enqueue`: free-text `query`,
+/// a closed-lexicon `genre`, or `radio`. The identity-bearing selectors
+/// (`Exact`/`Similar`/`Calmer`, which carry a `SongId`) stay off the model surface -
+/// the model never touches a library id. Each string payload rides in a NAMED field
+/// (`q` / `name`) so serde round-trips it (an internally-tagged newtype wrapping a
+/// bare `String` will NOT (de)serialize).
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(tag = "select", rename_all = "snake_case")]
+pub enum LlmSelector {
+    Query { q: String },
+    Genre { name: String },
+    Radio,
+}
+
+impl From<LlmSelector> for Selector {
+    fn from(s: LlmSelector) -> Self {
+        match s {
+            LlmSelector::Query { q } => Selector::Query(q),
+            LlmSelector::Genre { name } => Selector::Genre(name),
+            LlmSelector::Radio => Selector::Radio,
+        }
+    }
+}
+
+/// The action subset the model may emit - the DOCUMENTED trust surface, mirroring
+/// only the GBNF-advertised kinds. It is a dedicated type (NOT the full
+/// [`Action`]), so the parser can NEVER accept an off-surface action (`Wake`, or a
+/// `WakeTo`/`ToFloor` fade) even if a backend ignores the grammar. `SetVolume`
+/// carries a NAMED `level` field so it round-trips (an internally-tagged newtype
+/// wrapping a bare `u8` will NOT deserialize).
+#[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(tag = "act", rename_all = "snake_case")]
+pub enum LlmAction {
+    Fade(LlmFade),
+    Stop,
+    Pause,
+    SetVolume { level: u8 },
+    Enqueue { selector: LlmSelector, count: u32 },
+}
+
+impl From<LlmAction> for Action {
+    fn from(a: LlmAction) -> Self {
+        match a {
+            LlmAction::Fade(f) => Action::Fade(f.into()),
+            LlmAction::Stop => Action::Stop,
+            LlmAction::Pause => Action::Pause,
+            LlmAction::SetVolume { level } => Action::SetVolume(level),
+            LlmAction::Enqueue { selector, count } => {
+                Action::Enqueue { selector: selector.into(), count }
+            }
+        }
+    }
+}
+
 /// The restricted plan the model may emit (the constrained-decode target). Note
 /// `origin` is ABSENT from the surface: the adapter stamps it, never the model.
+/// `action` is the dedicated [`LlmAction`] surface, so an off-surface action can
+/// never deserialize even if a backend ignores the GBNF (F7).
 #[derive(Clone, Debug, Deserialize)]
 #[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
 pub struct LlmRawPlan {
     pub trigger: LlmTrigger,
-    pub action: Action,
+    pub action: LlmAction,
     #[serde(default)]
     pub once: bool,
 }
@@ -58,7 +138,7 @@ impl From<LlmRawPlan> for RawPlan {
         RawPlan {
             version: 1,
             trigger: p.trigger.into(),
-            action: p.action,
+            action: p.action.into(),
             once: p.once,
             origin: String::new(),
         }
@@ -125,3 +205,112 @@ mod backend {
 
 #[cfg(feature = "llm")]
 pub use backend::{LlmBackend, LlmTranslator};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hypodj_core::plan::{Action, FadeIntentIr, Selector};
+
+    // F4: EVERY action the GBNF advertises must round-trip through parse_llm_output.
+    // enqueue(query/genre/radio) + set_volume were previously REJECTED (serde cannot
+    // (de)serialize an internally-tagged newtype wrapping a bare String/u8); the
+    // named-field surface fixes that.
+    #[test]
+    fn parse_round_trips_every_action_kind() {
+        // fade out
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"span_elapsed","secs":300.0},"action":{"act":"fade","dir":"out","secs":10.0}}"#,
+        )
+        .unwrap();
+        assert!(matches!(p.action, Action::Fade(FadeIntentIr::Out { .. })));
+
+        // fade in
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"span_elapsed","secs":300.0},"action":{"act":"fade","dir":"in","secs":10.0}}"#,
+        )
+        .unwrap();
+        assert!(matches!(p.action, Action::Fade(FadeIntentIr::In { .. })));
+
+        // stop / pause
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"stop"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(p.action, Action::Stop));
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"pause"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(p.action, Action::Pause));
+
+        // set_volume(level) - previously un-parseable.
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"set_volume","level":42}}"#,
+        )
+        .unwrap();
+        assert!(matches!(p.action, Action::SetVolume(42)));
+
+        // enqueue(query) - previously un-parseable.
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"query","q":"bon iver"},"count":5}}"#,
+        )
+        .unwrap();
+        match p.action {
+            Action::Enqueue { selector: Selector::Query(q), count } => {
+                assert_eq!(q, "bon iver");
+                assert_eq!(count, 5);
+            }
+            other => panic!("expected enqueue(query), got {other:?}"),
+        }
+
+        // enqueue(genre) - previously un-parseable.
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"genre","name":"jazz"},"count":3}}"#,
+        )
+        .unwrap();
+        match p.action {
+            Action::Enqueue { selector: Selector::Genre(g), count } => {
+                assert_eq!(g, "jazz");
+                assert_eq!(count, 3);
+            }
+            other => panic!("expected enqueue(genre), got {other:?}"),
+        }
+
+        // enqueue(radio)
+        let p = parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"radio"},"count":5}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            p.action,
+            Action::Enqueue { selector: Selector::Radio, .. }
+        ));
+    }
+
+    // F7: an OFF-surface action must be REJECTED even if a backend ignores the
+    // grammar. `wake`, and the `wake_to`/`to_floor` fade dirs, are not in LlmAction /
+    // LlmFade, so serde fails loud instead of arming an off-surface effect.
+    #[test]
+    fn parse_rejects_off_surface_actions() {
+        // Action::Wake is off-surface.
+        assert!(parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"wake","count":5}}"#,
+        )
+        .is_err());
+        // A wake_to fade is off-surface.
+        assert!(parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"fade","dir":"wake_to","target_db":-10.0,"vol":50,"secs":10.0}}"#,
+        )
+        .is_err());
+        // A to_floor fade is off-surface.
+        assert!(parse_llm_output(
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"fade","dir":"to_floor","secs":10.0}}"#,
+        )
+        .is_err());
+        // A wall_clock trigger is off the model surface too.
+        assert!(parse_llm_output(
+            r#"{"trigger":{"kind":"wall_clock","at":"2026-01-01T00:00:00Z"},"action":{"act":"stop"}}"#,
+        )
+        .is_err());
+    }
+}

@@ -297,25 +297,22 @@ fn leading_count(tv: &[&str]) -> Option<u32> {
 
 // ── wake ──────────────────────────────────────────────────────────────────────
 
-/// "wake me at 7 with jazz" -> TWO plans sharing ONE resolved WallClock instant,
-/// in registry-insertion order: [1] Enqueue{genre|query}, [2] Fade(In). Same
-/// deadline -> ascending PlanId (insertion) fire order.
+/// "wake me at 7 with jazz" -> ONE [`Action::Wake`] at the resolved WallClock
+/// instant. A single atomic Wake (enqueue -> start-from-silence -> play -> ramp IN)
+/// is what actually STARTS playback from a stopped / wound-down deck; a plain
+/// Enqueue + Fade(In) pair is append-only + volume-only and would be a silent no-op
+/// from silence. Matches the direct `wake` command (`HypodjHandler::wake_set`).
 fn wake(tv: &[&str], low: &str, text: &str, ctx: &NlContext) -> Result<Vec<RawPlan>, NlError> {
     let at_pos = tv.iter().position(|t| *t == "at").ok_or(NlError::NotUnderstood)?;
     let (at, _) = parse_time(tv, at_pos + 1, low, ctx)
         .ok_or_else(|| NlError::Ambiguous("could not read the wake time".into()))?;
-    let selector = with_selector(text).unwrap_or(Selector::Radio);
-    let enqueue = plan(
+    // Optional "with <X>" selector; None means wake into the existing queue.
+    let selector = with_selector(text);
+    Ok(vec![plan(
         RawTrigger::WallClock { at },
-        Action::Enqueue { selector, count: DEFAULT_ENQUEUE_COUNT },
+        Action::Wake { selector, count: DEFAULT_ENQUEUE_COUNT },
         true,
-    );
-    let fade_in = plan(
-        RawTrigger::WallClock { at },
-        Action::Fade(FadeIntentIr::In { secs: DEFAULT_FADE_SECS }),
-        true,
-    );
-    Ok(vec![enqueue, fade_in])
+    )])
 }
 
 /// The "with <X>" selector class: Genre only for the closed lexicon, else Query
@@ -332,8 +329,10 @@ fn with_selector(text: &str) -> Option<Selector> {
         .windows(needle.len())
         .position(|w| w.eq_ignore_ascii_case(needle))?;
     let raw = text[idx + needle.len()..].trim();
-    // Trim a trailing "please" / punctuation.
-    let raw = raw.trim_end_matches(['.', '!', '?']).trim();
+    // Trim trailing punctuation AND a small set of politeness filler words
+    // ("please", "thanks", "thank you") so "with jazz please" resolves the closed
+    // genre "jazz", not the free-text Query "jazz please".
+    let raw = strip_trailing_filler(raw);
     if raw.is_empty() {
         return None;
     }
@@ -342,6 +341,35 @@ fn with_selector(text: &str) -> Option<Selector> {
         Some(Selector::Genre(raw.to_string()))
     } else {
         Some(Selector::Query(raw.to_string()))
+    }
+}
+
+/// Strip trailing punctuation and politeness filler ("please", "thanks", "thank
+/// you") from a selector phrase, iterating so "with jazz please." reduces to
+/// "jazz". Borrows from the input (no allocation); case-insensitive match on a
+/// whole trailing word (never a mid-word suffix).
+fn strip_trailing_filler(s: &str) -> &str {
+    const FILLER: &[&str] = &["thank you", "thanks", "please"];
+    let mut cur = s.trim().trim_end_matches(['.', '!', '?', ',']).trim();
+    loop {
+        let mut stripped = false;
+        for f in FILLER {
+            if cur.len() > f.len() {
+                let head = &cur[..cur.len() - f.len()];
+                let tail = &cur[cur.len() - f.len()..];
+                // Whole-word boundary: the filler must be preceded by a space so
+                // "increase" is never truncated by the "please"... (it is not a
+                // suffix here, but the space guard keeps the match honest).
+                if tail.eq_ignore_ascii_case(f) && head.ends_with(' ') {
+                    cur = head.trim_end().trim_end_matches(['.', '!', '?', ',']).trim_end();
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            return cur;
+        }
     }
 }
 
