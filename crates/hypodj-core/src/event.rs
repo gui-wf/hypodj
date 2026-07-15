@@ -95,8 +95,11 @@ pub struct DjEvent {
     /// monotonic base as the timers and the fade driver (never mixed with media
     /// seconds).
     pub now: Instant,
-    /// Monotonic per-stream sequence. A gap in `seq` means a missed event, which
-    /// is cheaper to detect than relying on a broadcast `Lagged`.
+    /// Global monotonic publish counter (one shared sequence across ALL streams).
+    /// Use it for loss detection ONLY on the lossy broadcast: a gap there means a
+    /// dropped event. Do NOT use it that way on the lossless trigger stream - that
+    /// stream is lossless by construction and deliberately omits broadcast-only
+    /// kinds (`Tick`, `Resync`), so its `seq` values are non-contiguous by design.
     pub seq: u64,
     /// The queue "playlist version" at publish time. Always present, so the
     /// `watch` snapshot is a genuine level-triggered source.

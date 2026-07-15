@@ -818,6 +818,30 @@ mod tests {
         assert!(end < start, "End before Start: {seen:?}");
     }
 
+    // EDGE DERIVATION (A-b): Eof on the LAST entry exhausts the queue, so the
+    // trailing Stopped is a REAL halt and MUST surface as StateChanged(Stopped) -
+    // it is NOT swallowed as a gapless-advance gap. Guards the "advanced only when
+    // the cursor moved to a different id" fix (is_some() alone would wrongly
+    // swallow it on a failed/exhausted advance).
+    #[tokio::test]
+    async fn exhausted_advance_surfaces_real_stop() {
+        let Some((handler, rt, player)) = rig(&[("s0", Some(100), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let mut triggers = rt.subscribe_triggers();
+        handler.play_for_test(0).await;
+        let _ = triggers.recv().await.unwrap(); // TrackStart(s0)
+        player.test_emit_eof().await.unwrap();
+        let end = triggers.recv().await.unwrap();
+        assert!(kind_is_track_end(&end.kind), "expected TrackEnd, got {end:?}");
+        let stop = triggers.recv().await.unwrap();
+        assert!(
+            is_stopped_state(&stop.kind),
+            "exhausted queue must surface a REAL StateChanged(Stopped), got {stop:?}"
+        );
+    }
+
     // EDGE DERIVATION (A-c): an OFF-spine next (loadfile replace, no Eof) emits
     // TrackEnd(outgoing) BEFORE TrackStart(new) - a skip is never a bare Start.
     #[tokio::test]

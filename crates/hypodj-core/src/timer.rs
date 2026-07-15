@@ -54,7 +54,7 @@ impl TimerHandle {
         let _ = self.cmd_tx.send(TimerCmd::Arm { id, deadline });
         let guard = TimerGuard {
             id,
-            tx: self.cmd_tx.clone(),
+            tx: Some(self.cmd_tx.clone()),
         };
         (id, guard)
     }
@@ -70,7 +70,9 @@ impl TimerHandle {
 /// arm cannot fire a phantom [`crate::event::DjEventKind::WallClock`]).
 pub struct TimerGuard {
     id: TimerId,
-    tx: mpsc::UnboundedSender<TimerCmd>,
+    // Option so disarm_on_drop can drop the sender clone and suppress the cancel
+    // WITHOUT mem::forget (which would leak the sender and pin the source task).
+    tx: Option<mpsc::UnboundedSender<TimerCmd>>,
 }
 
 impl TimerGuard {
@@ -82,16 +84,19 @@ impl TimerGuard {
     /// Consume the guard WITHOUT cancelling (the caller takes over lifetime via
     /// an explicit [`TimerHandle::cancel`]). Rarely needed; the RAII default is
     /// the safe path.
-    pub fn disarm_on_drop(self) -> TimerId {
-        let id = self.id;
-        std::mem::forget(self);
-        id
+    pub fn disarm_on_drop(mut self) -> TimerId {
+        // Drop the sender clone (releasing it) and suppress the cancel: normal Drop
+        // then runs with tx = None and sends nothing. No leak, no double action.
+        self.tx = None;
+        self.id
     }
 }
 
 impl Drop for TimerGuard {
     fn drop(&mut self) {
-        let _ = self.tx.send(TimerCmd::Cancel { id: self.id });
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(TimerCmd::Cancel { id: self.id });
+        }
     }
 }
 
