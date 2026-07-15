@@ -195,10 +195,11 @@ impl TuiState {
             // `<`/`>` arrive as Char with SHIFT; the char value already encodes it.
             KeyCode::Char('<') => Some(Intent::Command("previous".into())),
             KeyCode::Char('>') => Some(Intent::Command("next".into())),
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('9') => {
+            // 0 = louder, 9 = quieter (the requested 0/9 up/down layout).
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('0') => {
                 self.volume_intent(VOL_STEP)
             }
-            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('0') => {
+            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('9') => {
                 self.volume_intent(-VOL_STEP)
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -474,12 +475,13 @@ mod tests {
     fn keys_9_and_0_step_volume() {
         let mut s = TuiState::new();
         s.now.volume = Some(70);
-        assert_eq!(s.handle_key(ch('9')), Some(Intent::Command("setvol 75".into())));
-        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("setvol 65".into())));
+        // 0 = louder (up), 9 = quieter (down).
+        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("setvol 75".into())));
+        assert_eq!(s.handle_key(ch('9')), Some(Intent::Command("setvol 65".into())));
         // Unknown volume -> no-op.
         s.now.volume = None;
-        assert_eq!(s.handle_key(ch('9')), None);
         assert_eq!(s.handle_key(ch('0')), None);
+        assert_eq!(s.handle_key(ch('9')), None);
     }
 
     #[test]
