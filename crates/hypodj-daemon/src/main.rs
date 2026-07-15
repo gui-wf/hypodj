@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         }
         _ => AudioOut::Null,
     };
-    let (player, mut player_events) = MpvPlayer::spawn(audio);
+    let (player, player_events) = MpvPlayer::spawn(audio);
 
     let handler = Arc::new(HypodjHandler::with_fade_config(
         client.clone(),
@@ -97,41 +97,23 @@ async fn main() -> anyhow::Result<()> {
         cfg.fade.clone(),
     ));
 
-    // The background scrobbler (feature 1) shares the SAME client. It is fed
-    // every player event alongside queue-advance.
+    // The background scrobbler (feature 1) shares the SAME client. The director
+    // spine feeds it every player event alongside the inline queue-advance.
     let scrobbler = Arc::new(hypodj_core::scrobble::Scrobbler::new(client.clone()));
 
-    // Single event loop, two consumers: route EVERY event to the scrobbler, and
-    // additionally advance the queue on EOF. (The loop previously matched only
-    // Eof and discarded TimePos/StateChanged - the scrobbler needs those.)
-    {
-        let handler = handler.clone();
-        let scrobbler = scrobbler.clone();
-        let client = client.clone();
-        tokio::spawn(async move {
-            use hypodj_core::player::{PlayState, PlayerEvent};
-            while let Some(ev) = player_events.recv().await {
-                scrobbler.on_event(&ev);
-                match &ev {
-                    // On a NEW song starting, resolve its duration so the 50%
-                    // scrobble threshold can engage (off the hot path is fine;
-                    // this loop is not the player thread).
-                    PlayerEvent::StateChanged(PlayState::Playing, Some(id)) => {
-                        let scrobbler = scrobbler.clone();
-                        let client = client.clone();
-                        let id = id.clone();
-                        tokio::spawn(async move {
-                            if let Ok(song) = client.song(&id).await {
-                                scrobbler.set_duration(&id, song.duration_secs);
-                            }
-                        });
-                    }
-                    PlayerEvent::Eof(_) => handler.advance_on_eof().await,
-                    _ => {}
-                }
-            }
-        });
-    }
+    // P1 event/trigger substrate. `director::run` consumes the LOSSLESS player
+    // event channel as its single spine consumer (scrobble + advance run inline
+    // on it), and re-publishes the strictly-downstream DjEvent stream + the
+    // level-triggered QueueSnapshot watch + the wall-clock timer source. The
+    // returned runtime is held for the whole daemon lifetime; the P2 executor
+    // will subscribe to its lossless edge triggers.
+    let mut runtime = hypodj_core::director::run(
+        hypodj_core::clock::TokioClock,
+        handler.clone(),
+        scrobbler.clone(),
+        client.clone(),
+        player_events,
+    );
 
     // MPRIS (org.mpris.MediaPlayer2.hypodj) on the session bus: desktops get
     // now-playing + cover art + controls. Registered under the `.hypodj` bus name
@@ -162,6 +144,18 @@ async fn main() -> anyhow::Result<()> {
     let bind: SocketAddr = cfg.mpd.bind.parse()?;
     let server = MpdServer::new(bind);
     tracing::info!(%bind, "starting MPD server");
-    server.serve(handler).await?;
+    // Serve MPD, but also watch the director spine: if it exits (player channel
+    // closed) or panics, wind the daemon down loudly so systemd restarts cleanly
+    // rather than leaving a silent event-less zombie.
+    tokio::select! {
+        r = server.serve(handler) => r?,
+        joined = runtime.join() => match joined {
+            Ok(()) => tracing::error!("director spine exited (player gone); shutting down"),
+            Err(e) => {
+                tracing::error!(error = %e, "director spine panicked; aborting for a clean restart");
+                std::process::abort();
+            }
+        },
+    }
     Ok(())
 }

@@ -28,6 +28,7 @@
 //! Phase-1 `MpvPlayer` slots in behind the SAME [`PlayerHandle`] by swapping the
 //! actor body for the mpv thread; nothing above it changes.
 
+use crate::event::QueueId;
 use crate::model::SongId;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -53,15 +54,27 @@ pub enum PlayerError {
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     /// Current playback position, seconds. Emitted periodically while playing.
-    TimePos(f64),
+    ///
+    /// `queue_id` is the LATCHED identity of the entry the actor is currently
+    /// playing (stamped at load time, not derived from any mutable index). The
+    /// enrichment join uses it to attribute a buffered position to the right
+    /// entry even after an off-spine `next`/`prev`/`delete` repointed the current
+    /// index. `None` only if nothing is latched.
+    TimePos { pos: f64, queue_id: Option<QueueId> },
     /// The current track finished (natural end). Triggers queue-advance +
-    /// scrobble submission.
-    Eof(SongId),
+    /// scrobble submission. `song` is `None` for a raw stream (never scrobbled);
+    /// `queue_id` is the latched entry identity, present for anything we play -
+    /// so a mid-queue STREAM end still advances (emits `Eof { song: None,
+    /// queue_id: Some(..) }`) instead of silently halting.
+    Eof {
+        song: Option<SongId>,
+        queue_id: Option<QueueId>,
+    },
     /// Play state changed (e.g. paused, stopped). Carries the id of the song the
     /// state applies to so the scrobbler is self-describing: it can start a
     /// now-playing on a NEW Playing id and attribute later `TimePos` to that
-    /// latched id (TimePos itself is id-less). `None` on Stop (no current song).
-    StateChanged(PlayState, Option<SongId>),
+    /// latched id. `song`/`queue_id` are `None` on Stop (no current entry).
+    StateChanged(PlayState, Option<SongId>, Option<QueueId>),
 }
 
 /// Commands sent INTO the player actor. Each carries a `oneshot` for its reply,
@@ -76,9 +89,17 @@ enum PlayerCommand {
         /// The song id to attribute playback to, or `None` for a raw stream
         /// (internet radio) that must never be scrobbled.
         song: Option<SongId>,
+        /// The stable queue-entry identity to LATCH so every subsequent event
+        /// (TimePos/StateChanged/Eof) is attributed to this exact entry.
+        queue_id: Option<QueueId>,
         url: String,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
+    /// TEST-ONLY: make the actor emit a natural `Eof` for the latched entry
+    /// (mirrors an mpv `EndFile(Eof)`), so a director test can drive a queue
+    /// boundary headlessly without a real mpv end-of-stream.
+    #[cfg(test)]
+    TestEof,
     Pause(oneshot::Sender<Result<(), PlayerError>>),
     Resume(oneshot::Sender<Result<(), PlayerError>>),
     Stop(oneshot::Sender<Result<(), PlayerError>>),
@@ -142,13 +163,32 @@ impl PlayerHandle {
     /// Load a resolved stream URL and begin playback. `song` is `Some(id)` for a
     /// library track (scrobbled) or `None` for a raw internet-radio stream
     /// (never scrobbled - the player emits no id-bearing now-playing/eof for it).
-    pub async fn play_url(&self, song: Option<SongId>, url: &str) -> Result<(), PlayerError> {
+    pub async fn play_url(
+        &self,
+        song: Option<SongId>,
+        queue_id: Option<QueueId>,
+        url: &str,
+    ) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::PlayUrl {
             song,
+            queue_id,
             url: url.to_string(),
             reply,
         })
         .await
+    }
+
+    /// TEST-ONLY: drive a natural end-of-file for the latched entry.
+    #[cfg(test)]
+    pub(crate) async fn test_emit_eof(&self) -> Result<(), PlayerError> {
+        let (tx, rx) = oneshot::channel::<()>();
+        // TestEof carries no reply; use a throwaway to keep `request` shape simple.
+        drop(tx);
+        drop(rx);
+        self.cmd_tx
+            .send(PlayerCommand::TestEof)
+            .await
+            .map_err(|_| PlayerError::Gone)
     }
 
     pub async fn pause(&self) -> Result<(), PlayerError> {
@@ -231,41 +271,57 @@ impl NullPlayer {
 
         tokio::spawn(async move {
             let mut current: Option<SongId> = None;
+            let mut current_qid: Option<QueueId> = None;
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    PlayerCommand::PlayUrl { song, url: _, reply } => {
+                    PlayerCommand::PlayUrl { song, queue_id, url: _, reply } => {
                         current = song.clone();
+                        current_qid = queue_id;
                         let _ = state_tx.send(PlayState::Playing);
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(PlayState::Playing, song))
-                            .await;
+                        // Reply BEFORE the (bounded) event send so a full event
+                        // channel can never wedge the caller's play_url().await
+                        // (the deadlock-avoidance discipline; mirrors the mpv actor).
                         let _ = reply.send(Ok(()));
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Playing, song, queue_id))
+                            .await;
                     }
                     PlayerCommand::Pause(reply) => {
                         let _ = state_tx.send(PlayState::Paused);
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(PlayState::Paused, current.clone()))
-                            .await;
                         let _ = reply.send(Ok(()));
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(
+                                PlayState::Paused,
+                                current.clone(),
+                                current_qid,
+                            ))
+                            .await;
                     }
                     PlayerCommand::Resume(reply) => {
                         let _ = state_tx.send(PlayState::Playing);
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(PlayState::Playing, current.clone()))
-                            .await;
                         let _ = reply.send(Ok(()));
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(
+                                PlayState::Playing,
+                                current.clone(),
+                                current_qid,
+                            ))
+                            .await;
                     }
                     PlayerCommand::Stop(reply) => {
                         current = None;
+                        current_qid = None;
                         let _ = state_tx.send(PlayState::Stopped);
-                        let _ = evt_tx
-                            .send(PlayerEvent::StateChanged(PlayState::Stopped, None))
-                            .await;
                         let _ = reply.send(Ok(()));
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Stopped, None, None))
+                            .await;
                     }
                     PlayerCommand::Seek { secs, reply } => {
-                        let _ = evt_tx.send(PlayerEvent::TimePos(secs)).await;
                         let _ = reply.send(Ok(()));
+                        let _ = evt_tx
+                            .send(PlayerEvent::TimePos { pos: secs, queue_id: current_qid })
+                            .await;
                     }
                     PlayerCommand::SetVolume { vol: _, reply } => {
                         let _ = reply.send(Ok(()));
@@ -273,11 +329,29 @@ impl NullPlayer {
                     PlayerCommand::SetVolumeF64 { vol: _, reply } => {
                         let _ = reply.send(Ok(()));
                     }
+                    #[cfg(test)]
+                    PlayerCommand::TestEof => {
+                        // Mirror the mpv EndFile(Eof) shape: emit Eof for the
+                        // latched entry, then the trailing Stopped. `song` is None
+                        // for a raw stream; `queue_id` present for anything played.
+                        let song = current.take();
+                        let qid = current_qid.take();
+                        let _ = state_tx.send(PlayState::Stopped);
+                        if qid.is_some() {
+                            let _ = evt_tx
+                                .send(PlayerEvent::Eof { song, queue_id: qid })
+                                .await;
+                        }
+                        let _ = evt_tx
+                            .send(PlayerEvent::StateChanged(PlayState::Stopped, None, None))
+                            .await;
+                    }
                 }
             }
-            // Channel closed: nothing more to do. `current` kept only to model
-            // what the real actor tracks.
+            // Channel closed: nothing more to do. `current`/`current_qid` kept
+            // only to model what the real actor tracks.
             let _ = current;
+            let _ = current_qid;
         });
 
         (PlayerHandle { cmd_tx, state_rx }, evt_rx)
@@ -425,12 +499,13 @@ fn mpv_actor(
     let _ = ectx.observe_property("eof-reached", Format::Flag, 1);
 
     let mut current: Option<SongId> = None;
+    let mut current_qid: Option<QueueId> = None;
 
     loop {
         // 1. Drain any pending commands without blocking.
         match cmd_rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, cmd) {
+                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, cmd) {
                     // Stop requested with shutdown intent is not modeled;
                     // channel close is the only exit. Continue.
                 }
@@ -446,7 +521,14 @@ fn mpv_actor(
         match ectx.wait_event(0.1) {
             Some(Ok(Event::PropertyChange { name: "time-pos", change, .. })) => {
                 if let libmpv2::events::PropertyData::Double(t) = change {
-                    let _ = evt_tx.blocking_send(PlayerEvent::TimePos(t));
+                    // try_send (drop-on-Full): a stale position is harmless to
+                    // lose, and blocking here on a full event ring would wedge the
+                    // actor (and thus advance) while the spine is busy. Eof /
+                    // StateChanged keep the guaranteed blocking_send (low-rate).
+                    let _ = evt_tx.try_send(PlayerEvent::TimePos {
+                        pos: t,
+                        queue_id: current_qid,
+                    });
                 }
             }
             Some(Ok(Event::EndFile(reason))) => {
@@ -476,16 +558,24 @@ fn mpv_actor(
                 // failures.)
                 match end_reason(reason) {
                     EndReason::Eof | EndReason::Error => {
-                        // A library track carries a SongId -> emit Eof (drives
-                        // queue-advance + scrobble). A raw stream has no id -> just
-                        // report Stopped, never scrobble it.
+                        // Emit Eof for the LATCHED entry so the queue advances.
+                        // A library track carries a SongId (drives scrobble); a raw
+                        // stream carries `song: None` but still `queue_id: Some`, so
+                        // a mid-queue stream end advances and yields a real TrackEnd
+                        // instead of silently halting. Eof is only emitted when
+                        // something was actually latched (queue_id present).
                         let song = current.take();
+                        let qid = current_qid.take();
                         let _ = state_tx.send(PlayState::Stopped);
-                        if let Some(song) = song {
-                            let _ = evt_tx.blocking_send(PlayerEvent::Eof(song));
+                        if qid.is_some() {
+                            let _ = evt_tx
+                                .blocking_send(PlayerEvent::Eof { song, queue_id: qid });
                         }
-                        let _ = evt_tx
-                            .blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
+                        let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
+                            PlayState::Stopped,
+                            None,
+                            None,
+                        ));
                     }
                     // Stop/Quit/Redirect/Other: do NOTHING. Critically do NOT take
                     // `current` (handle_cmd already repointed it), which preserves
@@ -510,10 +600,11 @@ fn handle_cmd(
     state_tx: &watch::Sender<PlayState>,
     evt_tx: &mpsc::Sender<PlayerEvent>,
     current: &mut Option<SongId>,
+    current_qid: &mut Option<QueueId>,
     cmd: PlayerCommand,
 ) -> bool {
     match cmd {
-        PlayerCommand::PlayUrl { song, url, reply } => {
+        PlayerCommand::PlayUrl { song, queue_id, url, reply } => {
             let res = mpv
                 .command("loadfile", &[&quote(&url), "replace"])
                 .and_then(|_| mpv.set_property("pause", false))
@@ -521,11 +612,19 @@ fn handle_cmd(
             match &res {
                 Ok(()) => {
                     *current = song.clone();
+                    *current_qid = queue_id;
                     let _ = state_tx.send(PlayState::Playing);
+                    // Reply BEFORE the StateChanged blocking_send: the spine's
+                    // play_url().await must complete and return to draining before
+                    // the state edge is pushed, or a full event ring would wedge
+                    // advance (deadlock-avoidance).
+                    let _ = reply.send(res);
                     let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
                         PlayState::Playing,
                         song,
+                        queue_id,
                     ));
+                    return false;
                 }
                 Err(e) => tracing::error!(error = %e, "mpv loadfile failed"),
             }
@@ -540,6 +639,7 @@ fn handle_cmd(
                 let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
                     PlayState::Paused,
                     current.clone(),
+                    *current_qid,
                 ));
             }
             let _ = reply.send(res);
@@ -553,6 +653,7 @@ fn handle_cmd(
                 let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
                     PlayState::Playing,
                     current.clone(),
+                    *current_qid,
                 ));
             }
             let _ = reply.send(res);
@@ -562,8 +663,9 @@ fn handle_cmd(
                 .command("stop", &[])
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             *current = None;
+            *current_qid = None;
             let _ = state_tx.send(PlayState::Stopped);
-            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None));
+            let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
             let _ = reply.send(res);
         }
         PlayerCommand::Seek { secs, reply } => {
@@ -571,7 +673,10 @@ fn handle_cmd(
                 .command("seek", &[&secs.to_string(), "absolute"])
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             if res.is_ok() {
-                let _ = evt_tx.blocking_send(PlayerEvent::TimePos(secs));
+                let _ = evt_tx.blocking_send(PlayerEvent::TimePos {
+                    pos: secs,
+                    queue_id: *current_qid,
+                });
             }
             let _ = reply.send(res);
         }
@@ -590,6 +695,10 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             let _ = reply.send(res);
         }
+        // The mpv actor never receives TestEof (only NullPlayer does), but the
+        // command enum carries it in test builds so this arm keeps the match total.
+        #[cfg(test)]
+        PlayerCommand::TestEof => {}
     }
     false
 }
@@ -616,7 +725,7 @@ mod tests {
         assert_eq!(player.state(), PlayState::Stopped);
 
         player
-            .play_url(Some(SongId("42".into())), "http://example/stream")
+            .play_url(Some(SongId("42".into())), Some(QueueId(0)), "http://example/stream")
             .await
             .unwrap();
         assert_eq!(player.state(), PlayState::Playing);
@@ -715,7 +824,7 @@ mod tests {
         let (player, _events) = NullPlayer::spawn();
         let other = player.clone();
         player
-            .play_url(Some(SongId("1".into())), "http://x")
+            .play_url(Some(SongId("1".into())), Some(QueueId(1)), "http://x")
             .await
             .unwrap();
         assert_eq!(other.state(), PlayState::Playing);

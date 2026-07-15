@@ -14,6 +14,8 @@
 pub mod cache;
 pub mod clock;
 pub mod config;
+pub mod director;
+pub mod event;
 pub mod fade;
 pub mod handler;
 pub mod model;
@@ -22,3 +24,4 @@ pub mod mpris;
 pub mod player;
 pub mod scrobble;
 pub mod subsonic;
+pub mod timer;
