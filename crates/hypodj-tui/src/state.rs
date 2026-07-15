@@ -11,9 +11,6 @@ use hypodj_client::model::{NowPlaying, QueueItem};
 use hypodj_client::nl::not_understood_hint;
 use hypodj_client::route::{route, Action};
 
-/// Volume step for +/-/9/0 keys.
-const VOL_STEP: i32 = 5;
-
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
 const SCROLLOFF: usize = 3;
 
@@ -195,12 +192,15 @@ impl TuiState {
             // `<`/`>` arrive as Char with SHIFT; the char value already encodes it.
             KeyCode::Char('<') => Some(Intent::Command("previous".into())),
             KeyCode::Char('>') => Some(Intent::Command("next".into())),
-            // 0 = louder, 9 = quieter (the requested 0/9 up/down layout).
+            // Volume is a physical-potentiometer KNOB: each press is one equal-
+            // loudness (dB) detent, computed server-side. 0/+/= turn it up, 9/-/_
+            // down; turning all the way down is the off-click that pauses, and
+            // turning up from there resumes. 0 = louder, 9 = quieter.
             KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('0') => {
-                self.volume_intent(VOL_STEP)
+                Some(Intent::Command("knob up".into()))
             }
             KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('9') => {
-                self.volume_intent(-VOL_STEP)
+                Some(Intent::Command("knob down".into()))
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
@@ -262,17 +262,6 @@ impl TuiState {
             }
             None => None,
         }
-    }
-
-    /// Volume step from the current known volume, clamped 0..=100. No-op (None) when
-    /// the volume is unknown (absent or -1).
-    fn volume_intent(&self, delta: i32) -> Option<Intent> {
-        let cur = self.now.volume?;
-        if cur < 0 {
-            return None;
-        }
-        let next = (cur + delta).clamp(0, 100);
-        Some(Intent::Command(format!("setvol {next}")))
     }
 
     /// Move the queue selection with clamping (no wrap).
@@ -472,16 +461,18 @@ mod tests {
     }
 
     #[test]
-    fn keys_9_and_0_step_volume() {
+    fn keys_9_and_0_turn_the_knob() {
         let mut s = TuiState::new();
-        s.now.volume = Some(70);
-        // 0 = louder (up), 9 = quieter (down).
-        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("setvol 75".into())));
-        assert_eq!(s.handle_key(ch('9')), Some(Intent::Command("setvol 65".into())));
-        // Unknown volume -> no-op.
+        // The knob is a server-side relative control: the keys emit `knob up|down`
+        // regardless of the current (client-side, possibly stale) volume, and the
+        // server owns the dB step + the off-click pause. 0/+/= up, 9/-/_ down.
+        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("knob up".into())));
+        assert_eq!(s.handle_key(ch('9')), Some(Intent::Command("knob down".into())));
+        assert_eq!(s.handle_key(ch('+')), Some(Intent::Command("knob up".into())));
+        assert_eq!(s.handle_key(ch('-')), Some(Intent::Command("knob down".into())));
+        // No dependence on knowing the current volume.
         s.now.volume = None;
-        assert_eq!(s.handle_key(ch('0')), None);
-        assert_eq!(s.handle_key(ch('9')), None);
+        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("knob up".into())));
     }
 
     #[test]
@@ -502,23 +493,6 @@ mod tests {
         // Empty queue / zero height -> 0.
         assert_eq!(scroll_offset(0, 0, 10, 5), 0);
         assert_eq!(scroll_offset(3, 100, 0, 5), 0);
-    }
-
-    #[test]
-    fn volume_step_clamped_and_noop_when_unknown() {
-        let mut s = TuiState::new();
-        s.now.volume = Some(70);
-        assert_eq!(s.handle_key(ch('+')), Some(Intent::Command("setvol 75".into())));
-        assert_eq!(s.handle_key(ch('-')), Some(Intent::Command("setvol 65".into())));
-        s.now.volume = Some(98);
-        assert_eq!(s.handle_key(ch('+')), Some(Intent::Command("setvol 100".into())));
-        s.now.volume = Some(2);
-        assert_eq!(s.handle_key(ch('-')), Some(Intent::Command("setvol 0".into())));
-        // Unknown volume -> no-op.
-        s.now.volume = None;
-        assert_eq!(s.handle_key(ch('+')), None);
-        s.now.volume = Some(-1);
-        assert_eq!(s.handle_key(ch('-')), None);
     }
 
     #[test]

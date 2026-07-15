@@ -94,6 +94,10 @@ pub enum MpdCommand {
     SetVol(u8),
     /// `getvol` - current volume.
     GetVol,
+    /// `knob up|down` - one equal-loudness (dB) potentiometer detent. A jukebox-only
+    /// relative control: down past the audible floor is the off-click that pauses,
+    /// up from paused resumes. See [`KnobDir`].
+    Knob(KnobDir),
     /// `random <0|1>` - toggle shuffled playback order.
     Random(bool),
     /// `repeat <0|1>` - toggle looping the queue at its end.
@@ -216,6 +220,16 @@ pub enum MpdCommand {
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
+}
+
+/// Which way the physical-potentiometer knob turns. One press = one equal-loudness
+/// detent; the server owns the dB math and the off-click pause decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnobDir {
+    /// Louder by one detent (or resume, if paused).
+    Up,
+    /// Quieter by one detent (or the off-click pause, if already at the floor).
+    Down,
 }
 
 /// A parsed `sleep` subcommand (the convenience sleep-timer surface).
@@ -894,6 +908,15 @@ pub fn parse(line: &str) -> MpdCommand {
             None => MpdCommand::Unsupported(line.to_string()),
         },
         "getvol" => MpdCommand::GetVol,
+        // hypodj-native physical-potentiometer knob: one equal-loudness (dB) detent
+        // up or down. Distinct from absolute `setvol` (which MPRIS/GNOME/ncmpcpp hit
+        // and which must NEVER auto-pause) - only the jukebox clients send `knob`,
+        // and stepping down past the audible floor is the off-click that pauses.
+        "knob" => match arg(0).as_deref() {
+            Some("up") => MpdCommand::Knob(KnobDir::Up),
+            Some("down") => MpdCommand::Knob(KnobDir::Down),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         // random/repeat/single/consume: `<flag> 1` on, `<flag> 0` off. `single`
         // additionally accepts ncmpcpp's `oneshot` (mapped to on). A missing/bad
         // arg is a no-op-safe Unsupported ACK rather than a silent wrong toggle.
@@ -1168,6 +1191,15 @@ mod parse_tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_knob_up_down() {
+        assert!(matches!(parse("knob up"), MpdCommand::Knob(KnobDir::Up)));
+        assert!(matches!(parse("knob down"), MpdCommand::Knob(KnobDir::Down)));
+        // A missing or unknown direction fails loud (ACK), never a silent wrong turn.
+        assert!(matches!(parse("knob"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("knob sideways"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

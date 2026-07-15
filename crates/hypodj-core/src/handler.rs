@@ -50,8 +50,8 @@ use crate::subsonic::SubsonicError;
 use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
 use crate::mpd::{
-    FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, SleepCmd, StickerCmd,
-    WakeCmd, WakeWhen, WinddownCmd,
+    FadeArgs, FadeKind, KnobDir, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, SleepCmd,
+    StickerCmd, WakeCmd, WakeWhen, WinddownCmd,
 };
 use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
@@ -443,6 +443,11 @@ pub enum FadeIntent {
     /// Deliberate cue to an explicit perceptual level, committing `vol` as the new
     /// baseline on completion. Used by `fade to <vol>` and `fade to floor`.
     To { target_db: f64, vol: u8 },
+    /// One physical-potentiometer knob detent to an explicit perceptual level,
+    /// committing `vol` as the baseline. Like [`FadeIntent::To`] but `clamp_dur_up`
+    /// so a short single-step request always LANDS (never rejected as too-short) -
+    /// the knob's "every press moves" guarantee. Works up OR down from any level.
+    Knob { target_db: f64, vol: u8 },
     /// Wake ramp-in on smooth-restart: a SUB-JND ramp UP to the user's SAVED
     /// perceptual level (`target_db`), committing `vol` as the restored baseline.
     /// Distinct from [`FadeIntent::In`] (which targets the comfort ceiling / vol
@@ -494,6 +499,11 @@ impl FadeIntent {
             }
             FadeIntent::To { target_db, vol } => {
                 (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol), false)
+            }
+            // One knob detent: deliberate, commits the new baseline, clamp_dur_up so
+            // a short 3 dB step always lands rather than rejecting as StepTooLarge.
+            FadeIntent::Knob { target_db, vol } => {
+                (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol), true)
             }
             // Wake ramp: sub-JND ramp to the SAVED level, committing it as the
             // restored baseline. from_db is the synth floor (silence) at restore,
@@ -829,6 +839,13 @@ const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// old track ducks to ~1/8 loudness, the new track loads there and rises back to
 /// the baseline). Closer to 0 = shallower + faster; deeper = slower.
 const SKIP_DIP_DB: f64 = -18.0;
+
+/// One physical-potentiometer knob detent, in dB. 3 dB is a clear, EQUAL-loudness
+/// "one notch" everywhere on the range (a ~just-noticeable-strong step), curing the
+/// linear `setvol +/-5` unevenness (which is ~+18 dB near the bottom but ~+0.4 dB
+/// near the top). It equals `fade::DELIBERATE_STEP_CAP_DB`, so one detent is exactly
+/// one legal deliberate fade step - no multi-step startle, no sub-JND dithering.
+const KNOB_STEP_DB: f64 = crate::fade::DELIBERATE_STEP_CAP_DB;
 
 /// PURE re-rank for the `Calmer` selector. Given a `seed`, a candidate `pool`, and
 /// the desired `want`, sort candidates ASCENDING by energy (via the injected
@@ -1867,6 +1884,72 @@ impl HypodjHandler {
             // a no-op OK, no fade, no spurious notify.
             _ => Ok(()),
         }
+    }
+
+    /// One physical-potentiometer detent, up or down (the `knob` command). The
+    /// server owns all the dB math and the off-click pause decision; the client only
+    /// signals direction.
+    ///
+    /// Each detent is a fixed [`KNOB_STEP_DB`] (3 dB) equal-loudness step on a grid
+    /// anchored at 0 dB, read from the LIVE gain (so rapid presses climb/descend
+    /// monotonically, superseding any in-flight knob fade rather than stalling on a
+    /// not-yet-committed baseline). The bottom of the usable knob is the configured
+    /// `floor_level_db`; a down-step that would cross below it is the OFF-CLICK,
+    /// which reuses the EXACT `set_pause` pause path (one pause mechanism). A knob-up
+    /// while paused resumes. Because each down-step commits its rung as the baseline,
+    /// `target_volume` already sits at the bottom detent when you off-click, so the
+    /// resume ramp climbs back from the bottom - faithful to a real pot.
+    async fn knob(&self, dir: KnobDir) -> Result<(), PlayerError> {
+        let floor = self.fade_cfg.floor_level_db;
+        // Use the EFFECTIVE play state, not the bare `pending_pause` flag: once a
+        // pause fade settles the deck is `player`-Paused with pending_pause already
+        // cleared, and a knob-up then must still RESUME (not step volume). This
+        // covers both the mid-fade window (pending_pause) and the settled pause.
+        let paused = self.reported_play_state() == PlayState::Paused;
+        // Brief lock, dropped BEFORE any await (never hold State across .await).
+        let live_db = self.state.lock().unwrap().live_gain_db;
+        // Quantize to the 3 dB grid so float error never accumulates across presses.
+        let rung = (live_db / KNOB_STEP_DB).round() * KNOB_STEP_DB;
+        match (dir, paused) {
+            // Up while paused -> resume (climbs from the bottom detent baseline).
+            (KnobDir::Up, true) => self.set_pause(Some(false)).await,
+            // Down while already paused -> idempotent no-op (already off).
+            (KnobDir::Down, true) => Ok(()),
+            (KnobDir::Up, false) => {
+                let target = (rung + KNOB_STEP_DB).min(0.0);
+                if target <= live_db {
+                    return Ok(()); // at the ceiling: no-op
+                }
+                self.knob_step_to(target).await
+            }
+            (KnobDir::Down, false) => {
+                let target = rung - KNOB_STEP_DB;
+                if target < floor {
+                    // Off-click: below the lowest audible detent -> pause.
+                    self.set_pause(Some(true)).await
+                } else {
+                    self.knob_step_to(target).await
+                }
+            }
+        }
+    }
+
+    /// Drive one knob detent to `target_db` as a single deliberate slewed fade
+    /// through the one FadeSlot, committing the new baseline. Supersedes any
+    /// in-flight knob fade (validate-before-abort, epoch-guarded), so a key-mash
+    /// resolves to one smooth monotonic ramp. A later absolute `setvol` supersedes
+    /// this in turn (manual-wins).
+    async fn knob_step_to(&self, target_db: f64) -> Result<(), PlayerError> {
+        let vol = db_to_mpv_volume(target_db).round().clamp(0.0, 100.0) as u8;
+        let dur = self.pause_fade_dur();
+        let _ = self
+            .start_fade_spec(FadeRequest {
+                intent: FadeIntent::Knob { target_db, vol },
+                dur,
+            })
+            .await;
+        self.notify_change();
+        Ok(())
     }
 
     /// Run the sub-JND fade to silence, then pause (via [`Terminal::Pause`]). The
@@ -3096,6 +3179,10 @@ impl MpdHandler for HypodjHandler {
                     .await;
                 let _ = self.player.set_volume(v).await;
                 self.notify_change();
+                MpdResponse::ok()
+            }
+            MpdCommand::Knob(dir) => {
+                let _ = self.knob(dir).await;
                 MpdResponse::ok()
             }
             MpdCommand::GetVol => {
@@ -5191,6 +5278,80 @@ mod tests {
         // Ramp restored the pre-pause baseline.
         assert_eq!(h.state.lock().unwrap().target_volume, 100);
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+    }
+
+    // The knob steps in EQUAL PERCEPTUAL dB, not linearly: one `knob down` from full
+    // (0 dB, vol 100) lands on the -3 dB detent = mpv vol 89, NOT the linear vol 95.
+    // This is the cure for "frustrating small increments between volume values".
+    #[tokio::test(start_paused = true)]
+    async fn knob_down_steps_one_perceptual_detent() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.wait_for_fade().await;
+        // -3 dB detent: db_to_mpv_volume(-3) = 100*10^(-3/60) ~= 89, committed as
+        // the new baseline. A linear step of 5 would have given 95.
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 89, "one 3 dB detent");
+        assert_eq!(h.state.lock().unwrap().target_volume, 89);
+        assert!(!h.state.lock().unwrap().pending_pause, "a normal step never pauses");
+
+        // Successive detents ACCUMULATE and stay monotonic (turning the knob down
+        // keeps descending, not plateauing): 89 -> 79 -> 71.
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 79, "-6 dB detent");
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 71, "-9 dB detent");
+
+        // Up one detent climbs back (grid: -9 -> -6 dB, vol 79).
+        h.handle(MpdCommand::Knob(KnobDir::Up)).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 79, "climbs back one detent");
+    }
+
+    // The bottom of the knob is a real off-click: a `knob down` from the lowest
+    // audible detent (at/below floor_level_db) PAUSES via the exact same pause path
+    // as the `p` key. Position at the floor deterministically with `setvol` (which
+    // commits live_gain_db) rather than descending 15 detents through the fade slot.
+    #[tokio::test(start_paused = true)]
+    async fn knob_down_at_floor_off_clicks_to_pause() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // vol 18 ~= -44.7 dB, i.e. the lowest audible detent (floor is -45 dB). The
+        // next detent down crosses the floor - the off-click.
+        h.handle(MpdCommand::SetVol(18)).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
+
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        // Off-click installs the pause fade (pending_pause set immediately).
+        assert!(h.state.lock().unwrap().pending_pause, "off-click uses the pause path");
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "knob past the floor pauses");
+    }
+
+    // A knob-up while paused RESUMES - the same set_pause resume path as any other
+    // Play, so there is exactly ONE pause mechanism.
+    #[tokio::test(start_paused = true)]
+    async fn knob_up_while_paused_resumes() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // Pause via the p-key path, settle to silence.
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Paused);
+
+        // Knob up resumes (unpause immediately, then ramp back up).
+        h.handle(MpdCommand::Knob(KnobDir::Up)).await;
+        assert_eq!(h.player.state(), PlayState::Playing, "knob up resumes from paused");
+        h.wait_for_fade().await;
+        assert!(!h.state.lock().unwrap().pending_pause, "resumed, no longer pending-pause");
     }
 
     // Issue 2 (MPRIS): after a pause the reported play state is Paused AND the shared
