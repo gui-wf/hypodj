@@ -33,6 +33,15 @@ libmpv2 = "4.1"
 # MPRIS (org.mpris.MediaPlayer2) D-Bus surface for desktop now-playing +
 # controls. Pure-Rust (zbus, no new system lib). 0.8 pins zbus 4.4.
 mpris-server = "0.8"
+# LOAD-BEARING: mpris-server pulls zbus 4.4 with its DEFAULT async-io executor,
+# which runs the MPRIS method handlers on a NON-tokio thread. Those handlers call
+# set_pause/seek/volume, which spawn the startle-safe fade via tokio::spawn - and
+# spawning from the async-io executor thread PANICS ("no reactor running"), so a
+# GNOME Pause/Play never replies (D-Bus times out) and the panic kills the zbus
+# executor (later clicks do nothing). Adding zbus with the tokio feature unifies
+# the single zbus instance onto the tokio reactor, so the MPRIS connection and its
+# handlers run inside the tokio runtime and the fade spawns cleanly.
+zbus = { version = "4.4", features = ["tokio"] }
 
 [dev-dependencies]
 # Deserialize the exact camelCase wire JSON in the wire->model mapping tests,
