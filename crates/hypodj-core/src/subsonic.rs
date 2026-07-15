@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 
 use crate::config::ServerConfig;
-use crate::model::{Album, AlbumId, Artist, ArtistId, Genre, Song, SongId};
+use crate::model::{Album, AlbumId, Artist, ArtistId, Favorite, Genre, Song, SongId};
 use opensubsonic::{AlbumListType, data};
 use url::Url;
 
@@ -237,16 +237,30 @@ impl SubsonicClient {
 
     // ── star / rating (feature 3) ──────────────────────────────────────────
 
-    pub async fn star_song(&self, id: &SongId) -> Result<(), SubsonicError> {
+    /// Star a favorite (song / album / artist). The [`Favorite`] variant selects
+    /// the single wire star slice (id / albumId / artistId), so a song can never
+    /// cross into the album bucket.
+    ///
+    /// GRACEFUL DEGRADATION: a plain-Subsonic backend that ignores albumId /
+    /// artistId will silently no-op an album/artist star (support is not cheaply
+    /// detectable - same honesty note as `probe_extensions`). A song star is core
+    /// Subsonic and always takes effect.
+    pub async fn star(&self, f: &Favorite) -> Result<(), SubsonicError> {
+        tracing::debug!(uri = %f.uri(), "star");
+        let (ids, album_ids, artist_ids) = star_slices(f);
         self.inner
-            .star(&[&id.0], &[], &[])
+            .star(&ids, &album_ids, &artist_ids)
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
 
-    pub async fn unstar_song(&self, id: &SongId) -> Result<(), SubsonicError> {
+    /// Unstar a favorite (song / album / artist). Mirrors [`star`](Self::star):
+    /// the variant selects the wire slice. Same plain-Subsonic degradation note.
+    pub async fn unstar(&self, f: &Favorite) -> Result<(), SubsonicError> {
+        tracing::debug!(uri = %f.uri(), "unstar");
+        let (ids, album_ids, artist_ids) = star_slices(f);
         self.inner
-            .unstar(&[&id.0], &[], &[])
+            .unstar(&ids, &album_ids, &artist_ids)
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
@@ -260,16 +274,31 @@ impl SubsonicClient {
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
 
-    /// The user's starred songs (ID3). Decomposed to `Vec<Song>` at the boundary
-    /// (the wire `Starred2Content.song` is `Vec<Child>`). NEVER cached - it must
-    /// reflect the latest star state.
-    pub async fn starred_songs(&self) -> Result<Vec<Song>, SubsonicError> {
+    /// The user's full starred set (songs + albums + artists), from a SINGLE
+    /// getStarred2 round-trip so the three buckets can never tear against each
+    /// other. Decomposed to our model at the boundary via the shared mappers.
+    /// NEVER cached - it must reflect the latest star state.
+    ///
+    /// A plain-Subsonic server that ignores album/artist starring returns a
+    /// getStarred2 with those keys absent; `Starred2Content`'s `#[serde(default)]`
+    /// yields empty vecs (no error), so `albums`/`artists` degrade to empty.
+    pub async fn starred(&self) -> Result<Starred, SubsonicError> {
         let starred = self
             .inner
             .get_starred2(None)
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))?;
-        Ok(starred.song.into_iter().map(map_song).collect())
+        Ok(Starred {
+            songs: starred.song.into_iter().map(map_song).collect(),
+            albums: starred.album.into_iter().map(map_album).collect(),
+            artists: starred.artist.into_iter().map(map_artist).collect(),
+        })
+    }
+
+    /// The user's starred songs (ID3). Thin wrapper over [`starred`](Self::starred)
+    /// so existing songs-only callers are untouched. NEVER cached.
+    pub async fn starred_songs(&self) -> Result<Vec<Song>, SubsonicError> {
+        Ok(self.starred().await?.songs)
     }
 
     // ── radio / similar / top (feature 4) ──────────────────────────────────
@@ -406,6 +435,27 @@ pub struct SearchHits {
     pub artists: Vec<Artist>,
     pub albums: Vec<Album>,
     pub songs: Vec<Song>,
+}
+
+/// The user's full starred set, decomposed from the single wire
+/// `Starred2Content` aggregate (songs + albums + artists) so the aggregate never
+/// leaks past this boundary. Mirrors [`SearchHits`].
+pub struct Starred {
+    pub songs: Vec<Song>,
+    pub albums: Vec<Album>,
+    pub artists: Vec<Artist>,
+}
+
+/// Route a [`Favorite`] to the three id slices the wire star/unstar call takes
+/// (`id`, `albumId`, `artistId`). Exactly one slice is ever non-empty, so the
+/// entity kind can never cross buckets. Kept as a free fn so the pure routing is
+/// unit-testable without a network client.
+fn star_slices(f: &Favorite) -> (Vec<&str>, Vec<&str>, Vec<&str>) {
+    match f {
+        Favorite::Song(id) => (vec![id.0.as_str()], vec![], vec![]),
+        Favorite::Album(id) => (vec![], vec![id.0.as_str()], vec![]),
+        Favorite::Artist(id) => (vec![], vec![], vec![id.0.as_str()]),
+    }
 }
 
 // ── wire -> model mapping ──────────────────────────────────────────────────
@@ -744,6 +794,74 @@ mod tests {
             .query_pairs()
             .any(|(k, v)| k == "c" && v == "hypodj-custom");
         assert!(has_c, "c= param must carry configured client_name; got {url}");
+    }
+
+    #[test]
+    fn star_slices_populate_exactly_one_bucket_per_kind() {
+        // Offline proxy for the network-only star()/unstar() send: assert the
+        // Favorite variant selects exactly the right one of (id, albumId,
+        // artistId), so a song can never cross into the album/artist bucket.
+        let song = Favorite::Song(SongId("so-1".into()));
+        let (s, a, r) = star_slices(&song);
+        assert_eq!(s, vec!["so-1"]);
+        assert!(a.is_empty() && r.is_empty());
+
+        let album = Favorite::Album(AlbumId("al-1".into()));
+        let (s, a, r) = star_slices(&album);
+        assert_eq!(a, vec!["al-1"]);
+        assert!(s.is_empty() && r.is_empty());
+
+        let artist = Favorite::Artist(ArtistId("ar-1".into()));
+        let (s, a, r) = star_slices(&artist);
+        assert_eq!(r, vec!["ar-1"]);
+        assert!(s.is_empty() && a.is_empty());
+    }
+
+    #[test]
+    fn starred_maps_all_three_buckets_from_camelcase_wire() {
+        // An EXACT getStarred2 payload with populated artist+album+song arrays
+        // deserialized through the real Starred2Content, then mapped. A future
+        // crate field rename breaks deserialization here, not silently in prod.
+        let wire: opensubsonic::Starred2Content = serde_json::from_str(
+            r#"{
+                "artist": [{ "id": "ar-1", "name": "Kalabrese", "starred": "2024-01-01T00:00:00Z" }],
+                "album": [{ "id": "al-1", "name": "Rumpel", "artist": "Kalabrese", "songCount": 8 }],
+                "song": [{ "id": "so-1", "title": "Independent Us", "isDir": false,
+                           "starred": "2024-05-01T00:00:00Z" }]
+            }"#,
+        )
+        .unwrap();
+        let starred = Starred {
+            songs: wire.song.into_iter().map(map_song).collect(),
+            albums: wire.album.into_iter().map(map_album).collect(),
+            artists: wire.artist.into_iter().map(map_artist).collect(),
+        };
+        assert_eq!(starred.songs.len(), 1);
+        assert_eq!(starred.songs[0].id, SongId("so-1".into()));
+        assert!(starred.songs[0].starred);
+        assert_eq!(starred.albums.len(), 1);
+        assert_eq!(starred.albums[0].id, AlbumId("al-1".into()));
+        assert_eq!(starred.artists.len(), 1);
+        assert_eq!(starred.artists[0].id, ArtistId("ar-1".into()));
+        assert!(starred.artists[0].starred);
+    }
+
+    #[test]
+    fn starred_degrades_to_empty_album_artist_on_plain_subsonic() {
+        // A plain-Subsonic getStarred2 with ONLY the song array: #[serde(default)]
+        // yields empty album+artist vecs, no error.
+        let wire: opensubsonic::Starred2Content = serde_json::from_str(
+            r#"{ "song": [{ "id": "so-1", "title": "X", "isDir": false }] }"#,
+        )
+        .unwrap();
+        let starred = Starred {
+            songs: wire.song.into_iter().map(map_song).collect(),
+            albums: wire.album.into_iter().map(map_album).collect(),
+            artists: wire.artist.into_iter().map(map_artist).collect(),
+        };
+        assert_eq!(starred.songs.len(), 1);
+        assert!(starred.albums.is_empty());
+        assert!(starred.artists.is_empty());
     }
 
     #[test]

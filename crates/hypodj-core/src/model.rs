@@ -18,8 +18,52 @@ pub struct SongId(pub String);
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlbumId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ArtistId(pub String);
+
+/// A single favoritable entity. This is the ONE authority for the favorite uri
+/// scheme (`song/<id>` | `album/<id>` | `artist/<id>`), the routing of a star
+/// gesture to the right Subsonic wire slice, and (future P4) a serializable
+/// listening-intelligence signal.
+///
+/// The uri PREFIX carries the entity kind, so a `playlistadd Starred <uri>` can
+/// never mis-target the wrong bucket: `song/` stars a song, `album/` an album,
+/// `artist/` an artist, and anything else parses to `None` (a loud ACK, not a
+/// silent no-op).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub enum Favorite {
+    Song(SongId),
+    Album(AlbumId),
+    Artist(ArtistId),
+}
+
+impl Favorite {
+    /// The browse/gesture uri for this favorite (`song/<id>` etc.). Inverse of
+    /// [`Favorite::from_uri`].
+    pub fn uri(&self) -> String {
+        match self {
+            Favorite::Song(id) => format!("song/{}", id.0),
+            Favorite::Album(id) => format!("album/{}", id.0),
+            Favorite::Artist(id) => format!("artist/{}", id.0),
+        }
+    }
+
+    /// Parse a favorite uri. The single parse site for star routing: the prefix
+    /// is the sole routing authority. An unknown or prefixless uri yields `None`.
+    pub fn from_uri(uri: &str) -> Option<Favorite> {
+        if let Some(id) = uri.strip_prefix("song/") {
+            Some(Favorite::Song(SongId(id.to_string())))
+        } else if let Some(id) = uri.strip_prefix("album/") {
+            Some(Favorite::Album(AlbumId(id.to_string())))
+        } else if let Some(id) = uri.strip_prefix("artist/") {
+            Some(Favorite::Artist(ArtistId(id.to_string())))
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Artist {
@@ -122,4 +166,45 @@ pub struct Genre {
     pub name: String,
     pub song_count: u32,
     pub album_count: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn favorite_from_uri_routes_each_kind_by_prefix() {
+        assert_eq!(
+            Favorite::from_uri("song/so-1"),
+            Some(Favorite::Song(SongId("so-1".into())))
+        );
+        assert_eq!(
+            Favorite::from_uri("album/al-1"),
+            Some(Favorite::Album(AlbumId("al-1".into())))
+        );
+        assert_eq!(
+            Favorite::from_uri("artist/ar-1"),
+            Some(Favorite::Artist(ArtistId("ar-1".into())))
+        );
+    }
+
+    #[test]
+    fn favorite_from_uri_rejects_unknown_and_prefixless() {
+        // Unknown prefix, bare id, and empty all yield None -> a loud ACK in the
+        // playlistadd Starred arm, never a mis-targeted bucket.
+        assert_eq!(Favorite::from_uri("genre/x"), None);
+        assert_eq!(Favorite::from_uri("al-1"), None);
+        assert_eq!(Favorite::from_uri(""), None);
+    }
+
+    #[test]
+    fn favorite_uri_round_trips_for_all_variants() {
+        for f in [
+            Favorite::Song(SongId("so-1".into())),
+            Favorite::Album(AlbumId("al-1".into())),
+            Favorite::Artist(ArtistId("ar-1".into())),
+        ] {
+            assert_eq!(Favorite::from_uri(&f.uri()), Some(f));
+        }
+    }
 }
