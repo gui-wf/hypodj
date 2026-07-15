@@ -25,6 +25,15 @@ use crate::model::{Album, AlbumId, Artist, ArtistId, Favorite, Genre, Song, Song
 use opensubsonic::{AlbumListType, data};
 use url::Url;
 
+/// The OpenSubsonic extension name that advertises the sonic-similarity endpoints
+/// (`getSonicSimilarTracks` / `findSonicPath`). Navidrome (>= 0.62) advertises
+/// this in `getOpenSubsonicExtensions`; [`SubsonicClient::supports`] gates the
+/// sonic call on it. The exact advertised string MUST be confirmed against a live
+/// Navidrome (see the P4 live-probe test) - a wrong guess is non-fatal because
+/// [`SubsonicClient::similar`] falls through to `getSimilarSongs2` on any error or
+/// empty result.
+const SONIC_SIMILARITY_EXT: &str = "sonicSimilarity";
+
 /// Errors surfaced from the Subsonic layer. We flatten the upstream error into
 /// a message so callers don't depend on the upstream error enum.
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +103,15 @@ impl SubsonicClient {
                 tracing::debug!(error = %e, "getOpenSubsonicExtensions unavailable; core-only");
             }
         }
+    }
+
+    /// Whether the server advertised the named OpenSubsonic extension. The FIRST
+    /// real consumer of the [`probe_extensions`](Self::probe_extensions) hook: a
+    /// plain-Subsonic backend (empty set) returns `false` for everything, so a
+    /// gated optional path degrades cleanly. Used by [`similar`](Self::similar) to
+    /// gate the sonic-similarity endpoint.
+    pub fn supports(&self, ext: &str) -> bool {
+        self.supported_exts.contains(ext)
     }
 
     /// Liveness + credential check. Vertical-slice step 2.
@@ -315,6 +333,53 @@ impl SubsonicClient {
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))?;
         Ok(songs.into_iter().map(map_song).collect())
+    }
+
+    /// Songs sonically similar to a seed, via the OpenSubsonic `sonicSimilarity`
+    /// extension (`getSonicSimilarTracks`, Navidrome >= 0.62). Each wire
+    /// [`data::SonicMatch`] is a [`data::Child`] (`entry`) plus a `similarity`
+    /// score; we map `entry` through the shared [`map_song`] and DROP the score in
+    /// v1 (it is a future ANN re-rank input, not needed for enqueue ordering).
+    ///
+    /// This is a raw wire wrapper - it does NOT gate on the extension; the caller
+    /// ([`similar`](Self::similar)) does. On a server lacking the endpoint this
+    /// surfaces the transport error to the caller, which falls through.
+    pub async fn sonic_similar_tracks(
+        &self,
+        id: &SongId,
+        count: Option<i32>,
+    ) -> Result<Vec<Song>, SubsonicError> {
+        let matches = self
+            .inner
+            .get_sonic_similar_tracks(&id.0, count)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(matches.into_iter().map(|m| map_song(m.entry)).collect())
+    }
+
+    /// The gated similar-tracks orchestrator (P4). If the server advertised the
+    /// `sonicSimilarity` extension, try [`sonic_similar_tracks`](Self::sonic_similar_tracks)
+    /// first; on an error OR an empty result, fall through to
+    /// [`similar_songs`](Self::similar_songs) (core-ish `getSimilarSongs2`).
+    ///
+    /// Returns whatever the fallback yields, which MAY be empty - the genre/random
+    /// fallback for an empty pool is the SELECTOR's job in the handler, keeping this
+    /// a thin wire wrapper. This NEVER returns an error for a plain-Subsonic backend
+    /// that simply lacks the sonic endpoint; only a real transport failure of the
+    /// `getSimilarSongs2` fallback surfaces as an error.
+    pub async fn similar(
+        &self,
+        id: &SongId,
+        count: Option<i32>,
+    ) -> Result<Vec<Song>, SubsonicError> {
+        if self.supports(SONIC_SIMILARITY_EXT) {
+            if let Ok(songs) = self.sonic_similar_tracks(id, count).await {
+                if !songs.is_empty() {
+                    return Ok(songs);
+                }
+            }
+        }
+        self.similar_songs(id, count).await
     }
 
     /// Top songs for an artist. NOTE: `get_top_songs` takes an artist NAME, not
@@ -862,6 +927,50 @@ mod tests {
         assert_eq!(starred.songs.len(), 1);
         assert!(starred.albums.is_empty());
         assert!(starred.artists.is_empty());
+    }
+
+    #[test]
+    fn map_sonic_match_entry_through_map_song_preserves_fields() {
+        // A getSonicSimilarTracks row is a Child flattened alongside a similarity
+        // score. Deserialize the EXACT wire shape through the real SonicMatch, then
+        // map `entry` via map_song - the same boundary sonic_similar_tracks uses.
+        // The score is dropped in v1; id/title/genre/year must survive.
+        let wire: data::SonicMatch = serde_json::from_str(
+            r#"{ "id": "so-42", "title": "Similar One", "isDir": false,
+                 "genre": "Techno", "year": 2021, "similarity": 0.87 }"#,
+        )
+        .unwrap();
+        assert!((wire.similarity - 0.87).abs() < 1e-9);
+        let s = map_song(wire.entry);
+        assert_eq!(s.id, SongId("so-42".into()));
+        assert_eq!(s.title, "Similar One");
+        assert_eq!(s.genre.as_deref(), Some("Techno"));
+        assert_eq!(s.year, Some(2021));
+    }
+
+    #[test]
+    fn supports_is_true_only_for_probed_ext_and_false_on_empty_set() {
+        // Offline construction of the extension set (no network): a plain-Subsonic
+        // backend has an empty set, so supports() is false for everything; a probed
+        // set returns true only for names actually present.
+        let cfg = ServerConfig {
+            url: "https://music.example.com".into(),
+            username: "alice".into(),
+            password: "s3cr3t".into(),
+            client_name: "hypodj".into(),
+        };
+        let mut client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => c,
+            _ => {
+                eprintln!("skipping: no CA certs (sandbox); connect() not exercisable here");
+                return;
+            }
+        };
+        assert!(!client.supports(SONIC_SIMILARITY_EXT));
+        assert!(!client.supports("anything"));
+        client.supported_exts.insert(SONIC_SIMILARITY_EXT.to_string());
+        assert!(client.supports(SONIC_SIMILARITY_EXT));
+        assert!(!client.supports("playbackReport"));
     }
 
     #[test]

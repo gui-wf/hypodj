@@ -20,6 +20,7 @@ pub mod event;
 pub mod executor;
 pub mod fade;
 pub mod handler;
+pub mod intelligence;
 pub mod model;
 pub mod mpd;
 pub mod mpris;
