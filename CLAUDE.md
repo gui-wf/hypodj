@@ -2,53 +2,73 @@
 
 A single Rust daemon that speaks the **MPD text protocol** to clients (ncmpcpp,
 mpc) and is itself an **OpenSubsonic client + mpv audio player**. It replaced the
-mopidy + mopidy-subidy stack. See `README.md` for the full story, feature status,
-and Nix usage - this file is only what you need to work in the repo.
+mopidy + mopidy-subidy stack. This is a Cargo workspace: the daemon plus thin
+MPD/TCP client tools. See `README.md` for the full story, feature status, and Nix
+usage - this file is only what you need to work in the repo.
+
+## Workspace
+
+- `crates/hypodj-core` - the library: config, model, subsonic, player, mpd
+  handler, cache, scrobble, fade, clock, plan/executor, event/director, resume.
+  Most work happens here.
+- `crates/hypodj-daemon` - the `hypodj` daemon binary + the `probe` / `play_probe`
+  bins.
+- `crates/hypodj-nl` - optional natural-language to validated Plan IR translator
+  (deterministic rules + a `feature = "llm"` local-model backend). The DEFAULT
+  build is model-free.
+- `crates/hypodj-cli` - the `hjq` jukebox CLI (pure MPD/TCP, does NOT link libmpv).
+
+A shared `hypodj-client` lib and a `dj-gui` TUI are in progress. Binary renames
+are planned: `hjq` -> `dj`, the TUI -> `dj-gui` (product name HypoDJ). Build or
+test one crate with `-p <crate>`.
 
 ## Build, test, run
 
-Cargo is not on `PATH` on its own; the toolchain, linker, and libmpv come from
-the flake devshell. Always build/test inside it:
+Cargo is not on `PATH`; the toolchain, linker, and libmpv come from the flake
+devshell. Always build/test inside it:
 
 ```
-nix develop --command cargo build -p hypodj-core
-nix develop --command cargo test  -p hypodj-core --lib
-nix develop --command cargo build -p hypodj-daemon
+nix develop --command cargo build -j4 --workspace
+nix develop --command cargo test  -j4 --workspace
 ```
 
-- The devshell caps jobs (`CARGO_BUILD_JOBS`); never exceed 4 cores on this
-  machine. Dev profile is `opt-level = 0`.
-- One `#[ignore]` test needs a real libmpv runtime: run it manually with
-  `cargo test -- --ignored`.
-- "Test against a real server, not mocks." The `probe` / `play_probe` binaries
-  and live Navidrome checks are the sanctioned proof for feature paths; unit
-  tests cover parsing/mapping/logic. Deterministic time-based code (fades,
-  timers, the executor) is tested under a **fake clock** (`clock.rs`,
-  `tokio::test(start_paused)`), never wall-clock.
+- `CARGO_BUILD_JOBS=4`; never exceed 4 cores on this machine (Framework 13 AMD).
+  Dev profile is `opt-level = 0`.
+- The one `#[ignore]` test, `player::tests::live_mpv_fractional_volume_round_trip`
+  in `crates/hypodj-core/src/player.rs`, needs a real libmpv runtime: run it
+  manually with `cargo test -p hypodj-core -- --ignored`.
+- Prove feature paths against a REAL server - the `probe` / `play_probe` daemon
+  bins vs live Navidrome are the sanctioned proof, not mocks; unit tests cover
+  parsing / mapping / logic.
+- **Time-based code is always fake-clocked.** Fades, timers, and the executor use
+  `clock.rs` and `#[tokio::test(start_paused)]`, NEVER wall-clock (flaky). Apply
+  the pattern to any new time-dependent logic before writing it.
 
-## Deploy
+## Deploy (human-gated - an agent cannot finish it)
 
-hypodj is packaged in `~/os-configurations` as the `hypodj` flake input
-(`github:FamiliarTools/hypodj`). To ship a merged change:
+hypodj is the `hypodj` flake input (`github:FamiliarTools/hypodj`) in
+`~/os-configurations`. An agent does step 1 and the build; the **switch is the
+user's** - agents cannot `sudo` (the sandbox sets no-new-privileges).
 
-1. push `master`, then in `~/os-configurations`: `nix flake update hypodj`
+1. push `master`, then in `~/os-configurations`: `nix flake update hypodj` and
+   commit the bump scoped (`git commit -- flake.lock`), leaving unrelated lock
+   churn unstaged.
 2. `nixos-rebuild build --flake .#bubble-gum --cores 4 --max-jobs 1`
-3. the **user** runs `sudo nixos-rebuild switch ...` (agents cannot `sudo`:
-   the sandbox sets "no new privileges")
+3. **[user]** `sudo nixos-rebuild switch --flake .#bubble-gum ...`
 
-The live daemon binds `127.0.0.1:6600`. Commit the `flake.lock` hypodj bump
-scoped (`git commit -- flake.lock`), leaving unrelated lock churn unstaged.
+The live daemon binds `127.0.0.1:6600`. NOTE: the running build can lag `master`
+by several merges (the user switches manually) - match the deployed
+`crates/.../handler.rs` to a commit before diagnosing a "regression".
 
 ## Architecture
 
-The direction (see `README.md` "Current direction" + the roadmap) is a
-**deterministic capability core** (player + queue + Subsonic select) with a typed
-**Plan-IR trigger/executor** layered over it; an optional natural-language
-translator only ever emits a *validated* Plan IR; embeddings are for content
-selection only. Layout: `crates/hypodj-core` (config, model, subsonic, player,
-mpd/handler, cache, scrobble, fade, clock) + `crates/hypodj-daemon` (the `hypodj`
-binary + probes). Nothing outside `subsonic.rs` touches the `opensubsonic` wire
-types - a one-file blast radius.
+A **deterministic capability core** (player + queue + Subsonic select) with a
+typed **Plan-IR trigger/executor** over it (P2), an optional NL translator that
+only ever emits a *validated* Plan IR (P3), and content-selection embeddings
+(P4) - all merged, plus the human features (sleep/wind-down/wake, smooth-restart,
+startle-safe pause/resume/skip, first-class favorites). `subsonic.rs` is the ONLY
+file that touches `opensubsonic` wire types - a one-file blast radius. The client
+tools are thin over the MPD protocol + the `nl` command and never link libmpv.
 
 ## Invariants (foundational - do not violate)
 

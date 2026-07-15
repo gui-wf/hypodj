@@ -80,6 +80,27 @@ wake-ramp-in on restart), startle-safe pause/resume, and a first-class favorites
 model (songs / albums / artists). Post-parity MPD additions: `findadd`/`searchadd`,
 `count`, filtered `list <tag> <filter>`, composer/performer tags, and `fade`.
 
+## Clients (human-native, natural-language-first)
+
+hypodj is the server; driving it is meant to be human-native and
+natural-language-first - say what you want in plain words, as simple or complex as
+it gets, and the technical complexity is handled server-side. Any MPD client
+(ncmpcpp, mpc) works, and hypodj ships thin clients over the MPD protocol + the
+`nl` command:
+
+- **`hjq`** (renaming to `dj`) - a jukebox CLI. Bare `hjq` prints a now-playing
+  card; `hjq next` / `hjq pause` / `hjq vol 40` are quick verbs; anything else is
+  natural language routed through `nl` with an echo-before-arm confirm, e.g.
+  `hjq "play something calmer"` or `hjq "fade the 3rd track"`.
+- **`dj-gui`** (product name HypoDJ, in progress) - an interactive terminal
+  jukebox: now-playing + queue + a command line that takes verbs and natural
+  language, the same NL-first surface as the CLI.
+- A GNOME Shell search provider (planned) so typing "next song" or "play
+  something calmer" into Activities runs the command.
+
+The clients are pure MPD/TCP (no libmpv) and model-free by default; natural
+language is translated server-side and always validated + echoed before it arms.
+
 ## Phase 3 feature status (honest)
 
 The 9 Python-parity features are ported and reachable through the live MPD serve
@@ -347,8 +368,11 @@ speakers (it stays a headless MPD server by default).
 ## Layout
 
 ```
-crates/hypodj-core/     library: config, model, subsonic, player, mpd
+crates/hypodj-core/     library: config, model, subsonic, player, mpd,
+                        plan/executor, event/director, fade, clock, resume
 crates/hypodj-daemon/   binaries: `hypodj` (daemon) + `probe` (slice prover)
+crates/hypodj-nl/       optional NL -> validated Plan IR (rules + feature-gated model)
+crates/hypodj-cli/      `hjq` jukebox CLI (renaming `dj`; pure MPD/TCP, no libmpv)
 flake.nix               packages.default, devShell, nixos/home-manager modules
 nix/package.nix         buildRustPackage (daemon bin, libmpv wrapped)
 nix/hypodj-module.nix   ONE shared services.hypodj module (nixos + home-manager)
