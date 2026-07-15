@@ -276,22 +276,24 @@ impl PlayerInterface for HypodjMpris {
         Ok(())
     }
     async fn pause(&self) -> fdo::Result<()> {
-        let _ = self.player.pause().await;
+        // Route through the handler (NOT the player directly) so the startle-safe
+        // pause fade runs AND the change signal fires - the latter is what makes the
+        // GNOME widget re-read PlaybackStatus and flip the button to a play symbol.
+        let _ = self.handler.set_pause(Some(true)).await;
         Ok(())
     }
     async fn play_pause(&self) -> fdo::Result<()> {
-        let _ = match self.player.state() {
-            PlayState::Playing => self.player.pause().await,
-            _ => self.player.resume().await,
-        };
+        let _ = self.handler.set_pause(None).await;
         Ok(())
     }
     async fn stop(&self) -> fdo::Result<()> {
-        let _ = self.player.stop().await;
+        // Route through the handler so the stop also fires the change signal (the
+        // desktop widget refresh), same reason as pause().
+        self.handler.stop_playback().await;
         Ok(())
     }
     async fn play(&self) -> fdo::Result<()> {
-        let _ = self.player.resume().await;
+        let _ = self.handler.set_pause(Some(false)).await;
         Ok(())
     }
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
