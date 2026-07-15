@@ -138,11 +138,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
             };
-            let mut s = format!("add {count} {sel} to the END of the queue (append-only)");
-            if matches!(selector, Selector::Similar(_) | Selector::Calmer(_)) {
-                s.push_str(" [NOTE: similar/calmer is not yet supported at execute - it will no-op today]");
-            }
-            s
+            format!("add {count} {sel} to the END of the queue (append-only)")
         }
         Action::Fade(FadeIntentIr::ToFloor { secs: s }) => {
             format!("wind DOWN to the quiet floor over {}", human_dur(*s))

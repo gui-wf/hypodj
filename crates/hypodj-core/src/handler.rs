@@ -39,6 +39,7 @@ use crate::fade::{
     run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
+use crate::intelligence::{FeatureStore, MetadataStore};
 use crate::model::{AlbumId, ArtistId, Favorite, Genre, QueueEntry, Song, SongId};
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
@@ -545,6 +546,15 @@ pub struct HypodjHandler {
     /// snapshot and the periodic checkpoint read it with a single atomic load, so
     /// they never query mpv during a SIGTERM race.
     last_elapsed_ms: Arc<AtomicU64>,
+
+    // ── P4 content-intelligence ──────────────────────────────────────────────
+    /// The per-song feature source backing the `Calmer` (and future energy-ramp)
+    /// selectors. Defaults to [`MetadataStore`] (pure genre/year heuristics). This
+    /// is the durable seam: an Essentia-backed store returning real embeddings can
+    /// swap in behind the same trait WITHOUT touching selector or wire code. Used
+    /// READ-ONLY via pure `features(...)` calls - no lock, never held across an
+    /// `.await`.
+    store: Arc<dyn FeatureStore>,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -560,6 +570,42 @@ struct PendingNl {
 
 /// How long an echoed `nl` token stays confirmable (single-use + TTL-bounded).
 const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
+
+/// PURE re-rank for the `Calmer` selector. Given a `seed`, a candidate `pool`, and
+/// the desired `want`, sort candidates ASCENDING by energy (via the injected
+/// [`FeatureStore`]), keep those strictly calmer than the seed, and if that leaves
+/// fewer than `want`, top up from the remaining lowest-energy candidates. Truncate
+/// to `want`. Deterministic given fixed inputs (a stable sort over a total energy
+/// key, with `SongId` as the tiebreak so equal-energy ties never reorder
+/// nondeterministically). No network, no clock, no lock - unit-testable in
+/// isolation with a fabricated pool and a fake store.
+fn calmer_rerank(
+    store: &dyn FeatureStore,
+    seed: &Song,
+    mut pool: Vec<Song>,
+    want: usize,
+) -> Vec<Song> {
+    let energy = |s: &Song| store.features(s).map(|f| f.energy).unwrap_or(0.5);
+    let seed_e = energy(seed);
+    // Ascending by energy; break ties by id so the order is fully deterministic.
+    pool.sort_by(|a, b| {
+        energy(a)
+            .partial_cmp(&energy(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.0.cmp(&b.id.0))
+    });
+    // The strictly-calmer-than-seed set is the ascending prefix of length
+    // `calmer_count`. When it already meets `want`, the first `want` are all
+    // calmer than the seed. When it falls short, the remaining lowest-energy
+    // candidates (the next slice of the SAME ascending pool) top it up. In both
+    // cases the answer is exactly the first `want` of the ascending pool, so a
+    // single truncate covers keep-calmer AND top-up. `calmer_count` is computed
+    // only to log the honest split (how many were genuinely calmer).
+    let calmer_count = pool.iter().filter(|s| energy(s) < seed_e).count();
+    tracing::debug!(calmer_count, pool = pool.len(), want, "calmer re-rank");
+    pool.truncate(want);
+    pool
+}
 
 impl HypodjHandler {
     /// Construct with the default `[fade]` tunables (research-backed constants).
@@ -598,6 +644,7 @@ impl HypodjHandler {
             nl_token_hasher: RandomState::new(),
             state_path: Mutex::new(None),
             last_elapsed_ms: Arc::new(AtomicU64::new(0)),
+            store: Arc::new(MetadataStore),
         }
     }
 
@@ -838,7 +885,7 @@ impl HypodjHandler {
     /// schedules it at now+dur. Single-instance.
     ///
     /// P4 SEAM: energy-aware calmer-track SELECTION (routing through
-    /// [`Selector::Calmer`], loud-unsupported at [`Self::plan_enqueue`]) is out of
+    /// [`Selector::Calmer`], now resolved at [`Self::plan_enqueue`]) is out of
     /// scope here. This v1 does not enqueue - it is a pure volume wind-down.
     pub fn winddown_set(&self, dur: Option<Duration>) -> Result<PlanId, PlanError> {
         let trigger = match dur {
@@ -990,8 +1037,11 @@ impl HypodjHandler {
     }
 
     /// Resolve a plan [`Selector`] to concrete songs and APPEND them (append-only,
-    /// count-clamped). Unimplemented selectors return a loud not-yet. Used by the
-    /// executor's `Enqueue` action; touches the network, never a test path.
+    /// count-clamped). `Similar`/`Calmer` (P4) resolve via the gated similar-tracks
+    /// call and degrade gracefully (similar -> seed genre -> random, never an error
+    /// on a plain-Subsonic backend); `Calmer` additionally re-ranks the pool by the
+    /// injected [`FeatureStore`] energy. Used by the executor's `Enqueue` action;
+    /// touches the network, never a test path.
     pub async fn plan_enqueue(&self, selector: &Selector, count: u32) -> Result<usize, String> {
         let want = count as usize;
         let songs: Vec<Song> = match selector {
@@ -1019,8 +1069,54 @@ impl HypodjHandler {
                 }
                 out
             }
-            Selector::Similar(_) | Selector::Calmer(_) => {
-                return Err("similar/calmer selection needs embeddings (P4); not yet".into());
+            Selector::Similar(id) => {
+                // Similar tracks (sonic if the backend advertises it, else
+                // getSimilarSongs2), degrading gracefully all the way down to a
+                // genre pick and then random - NEVER an error on a plain-Subsonic
+                // backend that lacks the endpoint.
+                let seed = self.client.song(id).await.map_err(|e| e.to_string())?;
+                let mut songs = self.client.similar(id, Some(want as i32)).await.unwrap_or_default();
+                if songs.is_empty() {
+                    if let Some(g) = &seed.genre {
+                        songs = self.client.songs_by_genre(g).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                if songs.is_empty() {
+                    songs = self
+                        .client
+                        .random_songs(Some(want as i32))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                // "More like this" must not re-enqueue the seed itself.
+                songs.retain(|s| &s.id != id);
+                songs.truncate(want);
+                songs
+            }
+            Selector::Calmer(id) => {
+                // Over-fetch the candidate pool (2x) so the calmer half can still
+                // fill `count`; same graceful genre/random fallback as Similar.
+                let seed = self.client.song(id).await.map_err(|e| e.to_string())?;
+                let mut pool = self
+                    .client
+                    .similar(id, Some((want * 2) as i32))
+                    .await
+                    .unwrap_or_default();
+                if pool.is_empty() {
+                    if let Some(g) = &seed.genre {
+                        pool = self.client.songs_by_genre(g).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                if pool.is_empty() {
+                    pool = self
+                        .client
+                        .random_songs(Some((want * 2) as i32))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                // "Something calmer" must not re-enqueue the seed itself.
+                pool.retain(|s| &s.id != id);
+                calmer_rerank(self.store.as_ref(), &seed, pool, want)
             }
         };
         let n = songs.len();
@@ -4212,6 +4308,55 @@ mod tests {
             composer: None,
             performer: None,
         }
+    }
+
+    // A fake FeatureStore that reads a per-song energy off a lookup table (keyed by
+    // song id), so calmer_rerank can be exercised with NO network/model/metadata.
+    struct FakeStore(std::collections::HashMap<String, f32>);
+    impl crate::intelligence::FeatureStore for FakeStore {
+        fn features(&self, song: &Song) -> Option<crate::intelligence::TrackFeatures> {
+            self.0.get(&song.id.0).map(|&e| crate::intelligence::TrackFeatures {
+                energy: e,
+                valence: 0.5,
+                embedding: None,
+            })
+        }
+    }
+
+    // Calmer re-rank (PURE, fabricated pool + fake store): seed energy 0.7,
+    // candidates {0.2,0.5,0.6,0.9} -> keep {0.2,0.5,0.6} ascending, truncated to 3.
+    #[test]
+    fn calmer_rerank_keeps_calmer_ascending() {
+        let mut e = std::collections::HashMap::new();
+        e.insert("seed".to_string(), 0.7);
+        e.insert("a".to_string(), 0.2);
+        e.insert("b".to_string(), 0.5);
+        e.insert("c".to_string(), 0.6);
+        e.insert("d".to_string(), 0.9);
+        let store = FakeStore(e);
+        let seed = mk_song("seed");
+        let pool = vec![mk_song("d"), mk_song("b"), mk_song("a"), mk_song("c")];
+        let out = calmer_rerank(&store, &seed, pool, 3);
+        let ids: Vec<&str> = out.iter().map(|s| s.id.0.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"], "calmer ascending, 0.9 dropped");
+    }
+
+    // When NOTHING is calmer than the seed, top-up returns the lowest-energy
+    // candidates instead of an empty result (never ramp/enqueue nothing).
+    #[test]
+    fn calmer_rerank_tops_up_when_none_calmer() {
+        let mut e = std::collections::HashMap::new();
+        e.insert("seed".to_string(), 0.1); // everything is louder than the seed
+        e.insert("a".to_string(), 0.4);
+        e.insert("b".to_string(), 0.3);
+        e.insert("c".to_string(), 0.9);
+        let store = FakeStore(e);
+        let seed = mk_song("seed");
+        let pool = vec![mk_song("c"), mk_song("a"), mk_song("b")];
+        let out = calmer_rerank(&store, &seed, pool, 2);
+        let ids: Vec<&str> = out.iter().map(|s| s.id.0.as_str()).collect();
+        // Lowest-energy two, ascending: b(0.3), a(0.4).
+        assert_eq!(ids, vec!["b", "a"]);
     }
 
     // FadeIntent::WakeTo resolves to the SAVED perceptual level (not vol 100),

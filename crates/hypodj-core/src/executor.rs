@@ -1138,8 +1138,10 @@ mod tests {
     }
 
     // WAKE: an enqueue failure ABORTS the ramp - never ramp silence over an empty
-    // queue. Selector::Calmer is loud-unsupported (P4), so plan_enqueue errors
-    // deterministically (no network) and wake_now returns Err before any ramp.
+    // queue. Selector::Calmer must resolve its seed via client.song(id); against
+    // the rig's non-live client that fetch errors, so plan_enqueue returns Err and
+    // wake_now aborts before any ramp (the graceful genre/random fallback only runs
+    // once the seed is known, so a seed-fetch transport failure still fails loud).
     #[tokio::test(start_paused = true)]
     async fn wake_enqueue_failure_aborts_ramp() {
         let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
