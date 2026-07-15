@@ -34,6 +34,10 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
+use crate::plan::{
+    Action, FadeIntentIr, PlanId, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+};
+
 /// Advertised MPD protocol version in the greeting.
 ///
 /// IMPORTANT contract: the greeting version tells the client which syntax and
@@ -175,6 +179,11 @@ pub enum MpdCommand {
     /// [`FadeArgs`]. NOT a standard MPD command; a hypodj extension.
     Fade(FadeArgs),
 
+    /// `plan add|list|cancel|replace ...` - the P2 deterministic plan IR
+    /// ([`crate::plan`]). NOT a standard MPD command; a hypodj extension. See
+    /// [`PlanCmd`] and [`parse_plan`].
+    Plan(PlanCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
@@ -208,6 +217,196 @@ pub enum FadeKind {
 pub struct FadeArgs {
     pub kind: FadeKind,
     pub dur: Option<Duration>,
+}
+
+/// A parsed `plan` subcommand (the P2 registry surface). See [`parse_plan`].
+#[derive(Debug, Clone)]
+pub enum PlanCmd {
+    Add(RawPlan),
+    List,
+    Cancel(PlanId),
+    Replace(PlanId, RawPlan),
+}
+
+/// Parse a `plan` request into a [`PlanCmd`]. Grammar (a small keyword DSL that
+/// targets the same bounded IR an LLM emits):
+///   - `plan list`
+///   - `plan cancel <id>`
+///   - `plan add trigger <TRIGGER> action <ACTION> [once] [origin <s>]`
+///   - `plan replace <id> trigger <TRIGGER> action <ACTION> [once]`
+///
+/// TRIGGER: `immediate` | `track <n> base current|absolute` | `after` |
+///   `remaining <secs> [track ...]` | `album [track ...]` | `in <secs>` |
+///   `at <rfc3339>`.
+/// ACTION: `fade out|in <secs>` | `fade to <vol> <secs>` | `stop` | `pause` |
+///   `setvol <v>` | `enqueue query|genre <text> <count>` | `enqueue radio <count>`.
+/// A malformed request is [`MpdCommand::Unsupported`] (a fail-loud ACK), never a
+/// panic. The pure validate/arm (and its numeric clamps) happen in the handler.
+fn parse_plan(args: &[String], line: &str) -> MpdCommand {
+    let unsupported = || MpdCommand::Unsupported(line.to_string());
+    match args.first().map(|s| s.to_lowercase()).as_deref() {
+        Some("list") => MpdCommand::Plan(PlanCmd::List),
+        Some("cancel") => match args.get(1).and_then(|s| s.parse::<u64>().ok()) {
+            Some(n) => MpdCommand::Plan(PlanCmd::Cancel(PlanId(n))),
+            None => unsupported(),
+        },
+        Some("add") => match parse_raw_plan(&args[1..]) {
+            Some(r) => MpdCommand::Plan(PlanCmd::Add(r)),
+            None => unsupported(),
+        },
+        Some("replace") => {
+            let id = args.get(1).and_then(|s| s.parse::<u64>().ok());
+            match (id, parse_raw_plan(&args[2.min(args.len())..])) {
+                (Some(n), Some(r)) => MpdCommand::Plan(PlanCmd::Replace(PlanId(n), r)),
+                _ => unsupported(),
+            }
+        }
+        _ => unsupported(),
+    }
+}
+
+/// Parse the `trigger ... action ...` body of a `plan add`/`replace`.
+fn parse_raw_plan(toks: &[String]) -> Option<RawPlan> {
+    let action_pos = toks.iter().position(|t| t.eq_ignore_ascii_case("action"))?;
+    // Optional leading `trigger` keyword.
+    let t_start = if toks
+        .first()
+        .map(|t| t.eq_ignore_ascii_case("trigger"))
+        .unwrap_or(false)
+    {
+        1
+    } else {
+        0
+    };
+    let trig_toks = &toks[t_start..action_pos];
+    let mut act_toks: Vec<String> = toks[action_pos + 1..].to_vec();
+
+    // Strip trailing `once` / `origin <s>` modifiers off the action tokens.
+    let mut once = false;
+    let mut origin = String::new();
+    if let Some(pos) = act_toks.iter().position(|t| t.eq_ignore_ascii_case("origin")) {
+        origin = act_toks.get(pos + 1).cloned().unwrap_or_default();
+        act_toks.truncate(pos);
+    }
+    if act_toks.last().map(|t| t.eq_ignore_ascii_case("once")).unwrap_or(false) {
+        once = true;
+        act_toks.pop();
+    }
+
+    let trigger = parse_trigger(trig_toks)?;
+    let action = parse_plan_action(&act_toks)?;
+    Some(RawPlan {
+        version: 1,
+        trigger,
+        action,
+        once,
+        origin: if origin.is_empty() { "mpd".into() } else { origin },
+    })
+}
+
+fn parse_trigger(toks: &[String]) -> Option<RawTrigger> {
+    let kw = toks.first()?.to_lowercase();
+    match kw.as_str() {
+        "immediate" => Some(RawTrigger::Immediate),
+        "after" => Some(RawTrigger::TrackAfterCurrent),
+        "track" => {
+            let n = toks.get(1)?.parse::<usize>().ok()?;
+            // `base current|absolute`, defaulting to CurrentIsOne.
+            let base = match toks.iter().position(|t| t.eq_ignore_ascii_case("base")) {
+                Some(p) => match toks.get(p + 1).map(|s| s.to_lowercase()).as_deref() {
+                    Some("absolute") => PosBase::Absolute,
+                    _ => PosBase::CurrentIsOne,
+                },
+                None => PosBase::CurrentIsOne,
+            };
+            Some(RawTrigger::QueuePosition { n, base })
+        }
+        "remaining" => {
+            let secs = parse_secs(toks.get(1)?)?;
+            let track = parse_track_sel(&toks[2.min(toks.len())..]);
+            Some(RawTrigger::TimeRemaining { track, secs })
+        }
+        "album" => Some(RawTrigger::AlbumBoundary {
+            track: parse_track_sel(&toks[1..]),
+        }),
+        "in" => Some(RawTrigger::SpanElapsed {
+            secs: parse_secs(toks.get(1)?)?,
+        }),
+        "at" => {
+            let raw = toks.get(1)?;
+            let dt = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+            Some(RawTrigger::WallClock {
+                at: dt.with_timezone(&chrono::Utc),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse an optional `[track] current|rel <i>|id <u64>` selector (defaults to
+/// the current track when empty).
+fn parse_track_sel(toks: &[String]) -> TrackSel {
+    let toks = if toks
+        .first()
+        .map(|t| t.eq_ignore_ascii_case("track"))
+        .unwrap_or(false)
+    {
+        &toks[1..]
+    } else {
+        toks
+    };
+    match toks.first().map(|s| s.to_lowercase()).as_deref() {
+        Some("rel") => toks
+            .get(1)
+            .and_then(|s| s.parse::<i32>().ok())
+            .map(TrackSel::RelToCurrent)
+            .unwrap_or(TrackSel::Current),
+        Some("id") => toks
+            .get(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(TrackSel::QueueId)
+            .unwrap_or(TrackSel::Current),
+        _ => TrackSel::Current,
+    }
+}
+
+fn parse_plan_action(toks: &[String]) -> Option<Action> {
+    match toks.first()?.to_lowercase().as_str() {
+        "stop" => Some(Action::Stop),
+        "pause" => Some(Action::Pause),
+        "setvol" => Some(Action::SetVolume(toks.get(1)?.parse::<u8>().ok()?)),
+        "fade" => match toks.get(1)?.to_lowercase().as_str() {
+            "out" => Some(Action::Fade(FadeIntentIr::Out {
+                secs: parse_secs(toks.get(2)?)?,
+            })),
+            "in" => Some(Action::Fade(FadeIntentIr::In {
+                secs: parse_secs(toks.get(2)?)?,
+            })),
+            "to" => {
+                let vol = toks.get(2)?.parse::<u8>().ok()?;
+                let secs = parse_secs(toks.get(3)?)?;
+                // The target dB is derived from the requested 0..=100 volume (the
+                // same cubic-softvol seam the handler uses); validate clamps it.
+                Some(Action::Fade(FadeIntentIr::To {
+                    target_db: crate::player::mpv_volume_to_db(vol as f64),
+                    vol,
+                    secs,
+                }))
+            }
+            _ => None,
+        },
+        "enqueue" => {
+            let sel = match toks.get(1)?.to_lowercase().as_str() {
+                "radio" => (Selector::Radio, 2),
+                "query" => (Selector::Query(toks.get(2)?.clone()), 3),
+                "genre" => (Selector::Genre(toks.get(2)?.clone()), 3),
+                _ => return None,
+            };
+            let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+            Some(Action::Enqueue { selector: sel.0, count })
+        }
+        _ => None,
+    }
 }
 
 /// The parsed `sticker` subcommand. MPD's sticker verb is
@@ -461,6 +660,7 @@ pub fn parse(line: &str) -> MpdCommand {
             MpdCommand::List { tag, filter }
         }
         "fade" => parse_fade(&args, line),
+        "plan" => parse_plan(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -837,6 +1037,46 @@ mod parse_tests {
         assert!(matches!(parse("fade sideways"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("fade to"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("fade"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_plan_worked_example() {
+        // The corpus example: "plan add trigger track 3 base current action fade
+        // out 30s" -> a QueuePosition(3, CurrentIsOne) + Fade(Out, 30s), once off.
+        match parse("plan add trigger track 3 base current action fade out 30s") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(matches!(
+                    raw.trigger,
+                    RawTrigger::QueuePosition { n: 3, base: PosBase::CurrentIsOne }
+                ));
+                match raw.action {
+                    Action::Fade(FadeIntentIr::Out { secs }) => assert_eq!(secs, 30.0),
+                    other => panic!("got {other:?}"),
+                }
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_plan_list_cancel_and_once() {
+        assert!(matches!(parse("plan list"), MpdCommand::Plan(PlanCmd::List)));
+        match parse("plan cancel 7") {
+            MpdCommand::Plan(PlanCmd::Cancel(PlanId(7))) => {}
+            other => panic!("got {other:?}"),
+        }
+        // `once` at the tail marks the plan once:true.
+        match parse("plan add trigger after action stop once") {
+            MpdCommand::Plan(PlanCmd::Add(raw)) => {
+                assert!(raw.once);
+                assert!(matches!(raw.trigger, RawTrigger::TrackAfterCurrent));
+                assert!(matches!(raw.action, Action::Stop));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // A malformed plan is a fail-loud Unsupported, never a panic.
+        assert!(matches!(parse("plan add trigger track"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("plan frobnicate"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

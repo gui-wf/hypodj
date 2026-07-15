@@ -17,26 +17,33 @@
 //! album directories; drilling into an album lists its song files. `add song/X`
 //! / `addid song/X` queue a real track; `play` streams it via the player.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use opensubsonic::AlbumListType;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{mpsc, watch, Notify};
+use tokio::time::Instant;
 
 use crate::cache::TtlLru;
 use crate::clock::TokioClock;
 use crate::config::FadeConfig;
+use crate::executor::PendingPlan;
 use crate::fade::{
     run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
 use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
+use crate::plan::{
+    clamp_raw, validate, ArmedPlan, PlanBounds, PlanError, PlanId, RawPlan, Resolved, Selector,
+};
 use crate::subsonic::SubsonicError;
-use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, StickerCmd};
+use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, PlanCmd, StickerCmd};
 use crate::player::{db_to_mpv_volume, mpv_volume_to_db, PlayState, PlayerHandle};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
+use crate::timer::TimerHandle;
 
 /// One queue entry: a playable [`QueueEntry`] (Subsonic song OR raw stream) plus
 /// its MPD song id (a monotonically increasing integer, MPD's stable per-song
@@ -444,6 +451,24 @@ pub struct HypodjHandler {
     /// albumart in many small offset chunks; caching avoids re-fetching the whole
     /// image per chunk. Longer TTL (art rarely changes).
     cover_cache: TtlLru<String, Vec<u8>>,
+
+    // ── P2 plan registry ───────────────────────────────────────────────────
+    /// The armed-plan registry, SHARED with the [`crate::executor::Executor`]
+    /// task (which holds the same `Arc` via its handler clone). Every mutation is
+    /// a SHORT std-`Mutex` scope, NEVER held across an `.await` (the fade-slot
+    /// discipline). A deadline plan HOLDS its [`crate::timer::TimerGuard`] inside
+    /// its [`PendingPlan`], so `plan_cancel`/`plan_replace` disarm the timer by
+    /// dropping the entry (RAII), never a phantom `WallClock` fire.
+    plan_pending: Arc<Mutex<Vec<PendingPlan>>>,
+    /// Monotonic, NEVER-reused plan id source (mirrors the timer `next_id` idiom),
+    /// so a stale cancel/replace can never hit a recycled plan.
+    next_plan_id: AtomicU64,
+    /// The wall-clock timer source, registered once at executor startup. A
+    /// deadline plan arms an absolute timer here at add-time.
+    plan_timers: OnceLock<TimerHandle>,
+    /// A nudge channel: an [`Resolved::Immediate`] plan is executed at add-time by
+    /// the executor task, so `plan_add` (sync, no `.await`) hands off the id here.
+    plan_immediate: OnceLock<mpsc::UnboundedSender<PlanId>>,
 }
 
 impl HypodjHandler {
@@ -473,6 +498,10 @@ impl HypodjHandler {
             listings: TtlLru::new(256, Duration::from_secs(60)),
             dir_cache: TtlLru::new(256, Duration::from_secs(60)),
             cover_cache: TtlLru::new(64, Duration::from_secs(600)),
+            plan_pending: Arc::new(Mutex::new(Vec::new())),
+            next_plan_id: AtomicU64::new(0),
+            plan_timers: OnceLock::new(),
+            plan_immediate: OnceLock::new(),
         }
     }
 
@@ -486,6 +515,183 @@ impl HypodjHandler {
     /// resync source never lags the live queue (see [`Self::snapshot_tx`]).
     pub fn set_snapshot_sink(&self, tx: watch::Sender<QueueSnapshot>) {
         let _ = self.snapshot_tx.set(tx);
+    }
+
+    // ── P2 plan registry (PR10) ─────────────────────────────────────────────
+
+    /// Register the shared wall-clock timer source. Called once by the executor
+    /// wiring so `plan_add` can arm absolute deadlines for time-based plans.
+    pub fn set_plan_timers(&self, timers: TimerHandle) {
+        let _ = self.plan_timers.set(timers);
+    }
+
+    /// Register the executor's Immediate-plan nudge channel. Called once at
+    /// executor startup; `plan_add` sends an [`Resolved::Immediate`] plan's id here
+    /// so the executor task runs its (async) action at add-time.
+    pub fn set_plan_immediate_sink(&self, tx: mpsc::UnboundedSender<PlanId>) {
+        let _ = self.plan_immediate.set(tx);
+    }
+
+    /// The shared armed-plan registry handle (the executor holds the same `Arc`).
+    pub(crate) fn plan_pending_handle(&self) -> Arc<Mutex<Vec<PendingPlan>>> {
+        self.plan_pending.clone()
+    }
+
+    /// The numeric clamps derived from the live (normalized) fade config.
+    pub fn plan_bounds(&self) -> PlanBounds {
+        PlanBounds::from_fade_config(&self.fade_cfg)
+    }
+
+    /// Validate + arm a raw plan against the CURRENT queue, minting a fresh
+    /// [`PlanId`]. Fails loud with a [`PlanError`] (mapped 1:1 to an ACK) rather
+    /// than storing an unexecutable plan. The whole body is one short lock scope
+    /// with NO `.await` - the (async) Immediate action is handed to the executor.
+    pub fn plan_add(&self, raw: RawPlan) -> Result<PlanId, PlanError> {
+        let bounds = self.plan_bounds();
+        let clamped = clamp_raw(&raw, &bounds);
+        let snap = self.queue_snapshot();
+        let now = Instant::now();
+        let now_civil = chrono::Utc::now();
+        let resolved = validate(&clamped, &snap, now, now_civil, &bounds)?;
+
+        let id = PlanId(self.next_plan_id.fetch_add(1, Ordering::Relaxed));
+        // Arm an absolute timer for a deadline plan NOW (the deadline is already
+        // concrete). TimeRemaining is armed lazily by the executor on a live Tick.
+        let (timer_id, guard) = match &resolved {
+            Resolved::OnDeadline(deadline) => match self.plan_timers.get() {
+                Some(t) => {
+                    let (tid, g) = t.arm(*deadline);
+                    (Some(tid), Some(g))
+                }
+                None => (None, None),
+            },
+            _ => (None, None),
+        };
+
+        let armed = ArmedPlan {
+            id,
+            once: clamped.once,
+            raw: clamped,
+            resolved: resolved.clone(),
+            armed_at: now,
+            timer_id,
+        };
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .push(PendingPlan { armed, guard, remaining_deadline: None });
+
+        // An Immediate plan executes at add-time: nudge the executor (its action
+        // is async, so it cannot run inside this sync, lock-holding path).
+        if matches!(resolved, Resolved::Immediate) {
+            if let Some(tx) = self.plan_immediate.get() {
+                let _ = tx.send(id);
+            }
+        }
+        Ok(id)
+    }
+
+    /// List the armed plans (id + the raw, clamped plan) for `plan list`.
+    pub fn plan_list(&self) -> Vec<(PlanId, RawPlan)> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pp| (pp.armed.id, pp.armed.raw.clone()))
+            .collect()
+    }
+
+    /// Cancel one plan by id. Dropping its [`PendingPlan`] drops any held
+    /// [`crate::timer::TimerGuard`] (RAII disarm), so no phantom `WallClock` fires.
+    /// Returns `true` if a plan was removed.
+    pub fn plan_cancel(&self, id: PlanId) -> bool {
+        let mut g = self.plan_pending.lock().unwrap();
+        let before = g.len();
+        g.retain(|pp| pp.armed.id != id);
+        g.len() != before
+    }
+
+    /// Replace a plan: cancel `id` (RAII-disarming its timer) then arm `raw` as a
+    /// FRESH plan with a new never-reused id. A failed validate leaves the old
+    /// plan untouched (validate runs before the cancel).
+    pub fn plan_replace(&self, id: PlanId, raw: RawPlan) -> Result<PlanId, PlanError> {
+        // Validate the replacement FIRST; only cancel the old one once the new is
+        // known-good (mirrors the fade validate-before-abort discipline).
+        let new_id = self.plan_add(raw)?;
+        self.plan_cancel(id);
+        Ok(new_id)
+    }
+
+    /// Resolve a plan [`Selector`] to concrete songs and APPEND them (append-only,
+    /// count-clamped). Unimplemented selectors return a loud not-yet. Used by the
+    /// executor's `Enqueue` action; touches the network, never a test path.
+    pub async fn plan_enqueue(&self, selector: &Selector, count: u32) -> Result<usize, String> {
+        let want = count as usize;
+        let songs: Vec<Song> = match selector {
+            Selector::Query(q) => {
+                let hits = self.client.search3(q).await.map_err(|e| e.to_string())?;
+                hits.songs.into_iter().take(want).collect()
+            }
+            Selector::Genre(g) => self
+                .client
+                .songs_by_genre(g)
+                .await
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .take(want)
+                .collect(),
+            Selector::Radio => self
+                .client
+                .random_songs(Some(want as i32))
+                .await
+                .map_err(|e| e.to_string())?,
+            Selector::Exact(ids) => {
+                let mut out = Vec::new();
+                for id in ids.iter().take(want) {
+                    out.push(self.client.song(id).await.map_err(|e| e.to_string())?);
+                }
+                out
+            }
+            Selector::Similar(_) | Selector::Calmer(_) => {
+                return Err("similar/calmer selection needs embeddings (P4); not yet".into());
+            }
+        };
+        let n = songs.len();
+        for s in songs {
+            self.enqueue_song(s).await;
+        }
+        Ok(n)
+    }
+
+    /// Dispatch a parsed `plan` MPD command to the registry, mapping a
+    /// [`PlanError`] 1:1 to a fail-loud ACK. Sync (registry ops never `.await`).
+    fn handle_plan(&self, cmd: PlanCmd) -> MpdResponse {
+        match cmd {
+            PlanCmd::Add(raw) => match self.plan_add(raw) {
+                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
+            },
+            PlanCmd::List => {
+                let mut b = MpdResponse::pairs();
+                for (id, raw) in self.plan_list() {
+                    b = b
+                        .pair("plan_id", id.0.to_string())
+                        .pair("origin", raw.origin.clone());
+                }
+                b.build()
+            }
+            PlanCmd::Cancel(id) => {
+                if self.plan_cancel(id) {
+                    MpdResponse::ok()
+                } else {
+                    ack(ACK_ERROR_NO_EXIST, "plan", "no such plan")
+                }
+            }
+            PlanCmd::Replace(id, raw) => match self.plan_replace(id, raw) {
+                Ok(new_id) => MpdResponse::pairs().pair("plan_id", new_id.0.to_string()).build(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
+            },
+        }
     }
 
     fn notify_change(&self) {
@@ -623,6 +829,13 @@ impl HypodjHandler {
     /// TEST-ONLY: is a fade task currently installed in the slot?
     #[cfg(test)]
     async fn fade_active(&self) -> bool {
+        self.fade.inner.lock().await.is_some()
+    }
+
+    /// TEST-ONLY (crate): is a fade active? Exposed to the executor tests, which
+    /// assert a plan's fade action reached the single fade slot.
+    #[cfg(test)]
+    pub(crate) async fn fade_active_for_test(&self) -> bool {
         self.fade.inner.lock().await.is_some()
     }
 
@@ -1087,6 +1300,7 @@ impl MpdHandler for HypodjHandler {
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "fade", &e.to_string()),
                 }
             }
+            MpdCommand::Plan(cmd) => self.handle_plan(cmd),
             MpdCommand::Next => {
                 let next = {
                     let st = self.state.lock().unwrap();

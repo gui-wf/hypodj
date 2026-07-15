@@ -14,6 +14,10 @@ thiserror.workspace = true
 tracing.workspace = true
 opensubsonic.workspace = true
 url.workspace = true
+# Civil (wall-clock) time for P2 WallClock plan triggers. Only the pure math is
+# used (a DateTime<Utc> is reduced to a monotonic Duration delay in validate);
+# already a transitive dep, pinned here explicitly. serde for the plan IR.
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 # Real libmpv-backed player (Phase 1). The devshell ships mpv-unwrapped +
 # pkg-config, so libmpv2-sys links against it. Pinned to a known-good minor.
 libmpv2 = "4.1"
