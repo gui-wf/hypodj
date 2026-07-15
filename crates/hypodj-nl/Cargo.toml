@@ -1,0 +1,44 @@
+[package]
+name = "hypodj-nl"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# OFF by default: the deterministic rules fast-path, the NlContext plumbing, the
+# LlmRawPlan <-> RawPlan conversion, and the constrained-output parse are ALL
+# model-free and always compiled. Only the constrained-decode BACKEND (a local
+# model runtime) + the schema-derive (schemars, via build.rs) are gated here, so
+# `cargo build`/`test` with no feature pulls NO llama/candle/ort and needs no
+# model file or network.
+default = []
+# The model SEAM + JSON-Schema/GBNF derive + drift-guard + canned-output parse.
+# Pulls schemars only (NOT a model runtime), so it builds + tests with no model
+# and no C++ toolchain - the "seam/schema/parse are real and tested" bar.
+llm = ["dep:schemars", "hypodj-core/schema"]
+# The actual LOCAL constrained-decode runtime (llama.cpp GBNF). Deeper opt-in
+# because llama-cpp-sys compiles llama.cpp via bindgen (needs libclang + a C++
+# toolchain) and a model file - a deployment/ops artifact, not a default/CI build.
+llm-llama = ["llm", "dep:llama-cpp-2"]
+
+[dependencies]
+hypodj-core = { path = "../hypodj-core" }
+# Civil-time math for WallClock (wake) resolution: reuse the same chrono the core
+# IR carries. FixedOffset only; no new zone crate.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+thiserror.workspace = true
+serde = { workspace = true }
+# ALWAYS compiled: the LlmRawPlan subset deserializer + the constrained-output
+# parse are model-free (the design's "parse is always compiled, unit-testable
+# with a canned JSON string and no model"). serde_json is already in the lock.
+serde_json = "1"
+# Gated: the local constrained-decode runtime (llama.cpp GBNF) and the JSON-Schema
+# deriver. NON-default, so the trusted default build stays model-free.
+llama-cpp-2 = { version = "0.1", optional = true }
+schemars = { version = "0.8", optional = true }
+
+[dev-dependencies]
+hypodj-core = { path = "../hypodj-core" }
+tokio = { workspace = true, features = ["test-util"] }
+serde_json = "1"

@@ -139,6 +139,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("P2 plan executor started");
     }
 
+    // P3 OPTIONAL natural-language translator. Injected as a `dyn Translator` so
+    // hypodj-core stays model-free. With the `llm` feature off (default) or no
+    // model file present, the hybrid degrades to the deterministic Rules path +
+    // a loud NotUnderstood (the offline / optional north star). If this injection
+    // were skipped, `nl` would ACK NotAvailable.
+    {
+        use hypodj_core::nl::Translator;
+        let translator: Arc<dyn Translator> = Arc::new(hypodj_nl::HybridTranslator::rules_only());
+        handler.set_translator(translator);
+        tracing::info!("P3 NL translator injected (rules fast-path; model backend cfg-gated)");
+    }
+
     // MPRIS (org.mpris.MediaPlayer2.hypodj) on the session bus: desktops get
     // now-playing + cover art + controls. Registered under the `.hypodj` bus name
     // so it NEVER conflicts with a running mopidy's `.mopidy`. If mpris.enable is
