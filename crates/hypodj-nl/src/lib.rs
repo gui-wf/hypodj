@@ -174,6 +174,25 @@ mod tests {
     }
 
     #[test]
+    fn corpus_unsupported_time_unit_punts() {
+        // REGRESSION: an unsupported time unit ("days"/"weeks"/...) must NOT
+        // collapse to bare seconds and emit a confident WRONG plan (in 2 days
+        // -> pause in 2s). It must punt to NotUnderstood.
+        let c = ctx(Some("s1"), 5);
+        assert_eq!(tr("pause in 2 days", &c).unwrap_err(), NlError::NotUnderstood);
+        assert_eq!(tr("stop in 3 weeks", &c).unwrap_err(), NlError::NotUnderstood);
+        assert_eq!(tr("fade out in 5 days", &c).unwrap_err(), NlError::NotUnderstood);
+        // Supported units still parse correctly (guards against over-punting).
+        assert_eq!(
+            j(&tr("fade out in 20 minutes", &c).unwrap()[0]),
+            j(&raw(
+                RawTrigger::SpanElapsed { secs: 1200.0 },
+                Action::Fade(FadeIntentIr::Out { secs: 30.0 })
+            ))
+        );
+    }
+
+    #[test]
     fn corpus_stop_pause_and_boundary() {
         let c = ctx(Some("s1"), 5);
         assert_eq!(

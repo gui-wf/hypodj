@@ -365,6 +365,10 @@ fn parse_dur(toks: &[&str], i: usize) -> Option<(f64, usize)> {
     }
     match toks.get(i + 1).and_then(|u| unit_secs(u)) {
         Some(mult) => Some((n * mult, 2)),
+        // A recognized-but-unsupported time unit ("days", "weeks", ...) must NOT
+        // collapse to bare seconds - that would emit a confident wrong plan
+        // ("in 2 days" -> 2s). Punt so the request falls through to NotUnderstood.
+        None if toks.get(i + 1).is_some_and(|u| is_unsupported_time_unit(u)) => None,
         None => Some((n, 1)),
     }
 }
@@ -376,6 +380,20 @@ fn unit_secs(w: &str) -> Option<f64> {
         "hour" | "hours" | "hr" | "hrs" | "h" => Some(3600.0),
         _ => None,
     }
+}
+
+/// Time-unit words we deliberately do NOT support. A number followed by one of
+/// these is an out-of-range duration request, not a bare-seconds count, so
+/// `parse_dur` punts rather than silently dropping the unit.
+fn is_unsupported_time_unit(w: &str) -> bool {
+    matches!(
+        w,
+        "day" | "days"
+            | "week" | "weeks"
+            | "month" | "months"
+            | "year" | "years"
+            | "millisecond" | "milliseconds" | "ms"
+    )
 }
 
 /// Parse a clock time at `toks[i]` ("7", "7:30", "7pm", "7:30am") into the NEXT
