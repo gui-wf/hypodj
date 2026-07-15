@@ -87,6 +87,11 @@ mod tests {
             r#"{"trigger":{"kind":"album_boundary","track":{"sel":"current"}},"action":{"act":"stop"}}"#,
             r#"{"trigger":{"kind":"span_elapsed","secs":300.0},"action":{"act":"fade","dir":"out","secs":10.0}}"#,
             r#"{"trigger":{"kind":"time_remaining","track":{"sel":"current"},"secs":30.0},"action":{"act":"fade","dir":"out","secs":10.0}}"#,
+            // set_volume + every enqueue selector the GBNF advertises now round-trip.
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"set_volume","level":42}}"#,
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"query","q":"bon iver"},"count":5}}"#,
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"genre","name":"jazz"},"count":3}}"#,
+            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"radio"},"count":5}}"#,
         ];
         for json in corpus {
             assert!(parse_llm_output(json).is_ok(), "canned json must parse: {json}");
