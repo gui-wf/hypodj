@@ -8,14 +8,13 @@ The name is from the Roman **hypocaust** (Greek *hypo-*, "beneath" + *kaustos*,
 "burnt") - the furnace and flue chamber below a bath that heated the room above,
 tended out of sight. `hypodj` is the DJ underneath: it does the real work
 (browsing, streaming, playing your Navidrome library) hidden below, while your
-MPD client lounges in the warm room. It replaces the mopidy + mopidy-subidy
-Python stack with one Rust binary.
+MPD client lounges in the warm room.
 
-It is meant to replace the `mopidy` + `mopidy-subidy` Python stack entirely: no
-Python, no mopidy core, no MPRIS/GStreamer glue. ncmpcpp connects to hypodj
-exactly as it connects to mopidy today; hypodj translates MPD commands into
-OpenSubsonic REST calls (browse / search / star / scrobble) and drives a local
-audio engine that streams the resolved URLs.
+It replaced the `mopidy` + `mopidy-subidy` Python stack entirely - no Python, no
+mopidy core, no MPRIS/GStreamer glue. ncmpcpp connects to hypodj exactly as it
+connected to mopidy; hypodj translates MPD commands into OpenSubsonic REST calls
+(browse / search / star / scrobble) and drives a local audio engine that streams
+the resolved URLs.
 
 ## Vision (north star)
 
@@ -60,14 +59,28 @@ Subsonic library and plays the streams through mpv.
   libmpv wrapped), `nixosModules.default`, `homeManagerModules.default`, and an
   `overlays.default` - see [Usage](#usage). Password stays out of the store
   (systemd `LoadCredential` + a runtime-rendered config).
-- **Phase 4 - cut over. (remaining, deployment step)** Flip the bind to `6600`
-  and retire the mopidy + mopidy-subidy stack once you're ready to make hypodj
-  your daily driver.
+- **Phase 4 - cut over. DONE.** hypodj is the daily driver: the deployment binds
+  `127.0.0.1:6600` (via `services.hypodj.mpd.bind`) and mopidy + mopidy-subidy are
+  retired. Note the in-code `config.rs` default is still `6601`; production sets
+  `6600` explicitly.
+
+## Current direction: the smart-server roadmap
+
+Parity is done; the project is now growing hypodj from a protocol proxy into a
+music server that understands human intent. The design is a **deterministic
+capability core + a typed Plan-IR trigger/executor** over stable primitives, with
+an optional natural-language translator that only ever emits a *validated* plan,
+and embeddings reserved for content selection. Phases: **P0 fade primitive**
+(cancellable dB-domain volume envelope - done) -> **P1 event substrate** ->
+**P2 Plan IR + executor + DSL** -> **P3 natural-language front-end** ->
+**P4 mood/energy selection**. Post-parity MPD additions already landed:
+`findadd`/`searchadd`, `count`, filtered `list <tag> <filter>`, composer/performer
+tags, and a `fade` command.
 
 ## Phase 3 feature status (honest)
 
 The 9 Python-parity features are ported and reachable through the live MPD serve
-loop (bound to `6601` in dev; mopidy still owns `6600`):
+loop (the in-code default bind is `6601`; the live deployment binds `6600`):
 
 - **scrobble** - now-playing + threshold-gated completed-play submission, fired
   off the player event loop.
@@ -104,11 +117,11 @@ status/currentsong/plchanges on any `changed:` line, so its view still refreshes
 
 Everything below is built, compiles, and is tested (the full workspace passes
 `cargo test`; the feature paths are additionally live-verified against Navidrome
-via the probes and a real MPD client). The only remaining item is the Phase 4
-cut-over (bind `6600` + retire mopidy), a deployment step you take when ready.
+via the probes and a real MPD client). Parity and the cut-over are done; new work
+follows the smart-server roadmap above.
 
 - `config.rs` - TOML config; creds read from a file, never hardcoded. Default
-  MPD bind `127.0.0.1:6601` (mopidy owns 6600 until cut-over).
+  MPD bind `127.0.0.1:6601`; the live deployment overrides this to `6600`.
 - `model.rs` - internal domain types (`SongId`/`AlbumId`/`ArtistId` newtypes,
   `Artist`/`Album`/`Song`/`Genre`), decoupled from the `opensubsonic` wire types.
 - `subsonic.rs` - `SubsonicClient` over `opensubsonic::Client`: connect (token
@@ -143,7 +156,7 @@ The `probe` binary is the "test with a real server, not mocks" proof:
 
 ```
 nix develop
-# create a config with your server creds (see hypodj.toml.example)
+# create a config with your server creds (see subsonity.toml.example)
 cargo run -j2 --bin probe -- ./my-config.toml <song-id>
 ```
 
@@ -209,10 +222,9 @@ sanctioned fallback. Nothing was ever sent to the speakers.
   foundation (and `get_cover_art` returns owned `Bytes`, exactly what chunking
   needs).
 - **Advertised MPD version tracks the implemented surface.** The greeting version
-  (`ADVERTISED_MPD_VERSION`) is a conservative `0.21.0` until the binary +
-  filter syntax is implemented, so ncmpcpp is not invited to request
-  capabilities the server would then ACK on. Bump it in lockstep with those
-  features.
+  (`ADVERTISED_MPD_VERSION`) is `0.23.0` - it promises the binary (`albumart`/
+  `readpicture`) and modern filter-expression syntax the server actually backs.
+  Bump it in lockstep with the implemented surface, never ahead of it.
 - **TLS is rustls, not OpenSSL.** `opensubsonic 0.3` pulls `reqwest 0.13` with
   `default-features = false` + `rustls`. The devshell intentionally does NOT ship
   openssl - nothing would link it.
@@ -239,8 +251,8 @@ sanctioned fallback. Nothing was ever sent to the speakers.
 
 The flake ships a package plus a NixOS module and a Home-Manager module - ONE
 shared `services.hypodj` definition. Import the module for your system, point it
-at your OpenSubsonic/Navidrome server, and connect ncmpcpp to `127.0.0.1:6601`
-(mopidy keeps `6600`; hypodj never binds it).
+at your OpenSubsonic/Navidrome server, and connect ncmpcpp to the configured
+`mpd.bind` (the live deployment uses `127.0.0.1:6600`).
 
 The Navidrome password is read from `passwordFile` (or `passwordCommand`) at
 service start into a `0600` runtime config under `/run` - it is never written to
@@ -251,7 +263,7 @@ the store; the real password is substituted at start.
 
 ```nix
 {
-  inputs.hypodj.url = "github:you/hypodj";   # or path:/tmp/hypodj while local
+  inputs.hypodj.url = "github:FamiliarTools/hypodj";   # or path:/tmp/hypodj while local
 
   # in your host module (config is in scope here):
   imports = [ hypodj.nixosModules.default ];
@@ -285,7 +297,7 @@ as a runtime path and is never copied into the Nix store.
 
 ```nix
 {
-  inputs.hypodj.url = "github:you/hypodj";
+  inputs.hypodj.url = "github:FamiliarTools/hypodj";
 
   # add the overlay so pkgs.hypodj (the module's default package) resolves:
   nixpkgs.overlays = [ hypodj.overlays.default ];
