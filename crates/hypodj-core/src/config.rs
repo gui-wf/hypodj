@@ -3,7 +3,7 @@
 //! FOUNDATION: real, used by the vertical slice.
 
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -17,6 +17,44 @@ pub struct Config {
     /// with no `[fade]` block still yields a fully startle-safe primitive.
     #[serde(default)]
     pub fade: FadeConfig,
+    /// Smooth-restart (resume) tunables. Optional; when the state dir cannot be
+    /// resolved (neither this section's `state_dir` nor `$STATE_DIRECTORY` set),
+    /// resume is disabled and the daemon simply cold-starts.
+    #[serde(default)]
+    pub restart: RestartConfig,
+}
+
+/// `[restart]` config for the smooth-restart (sleep-fade-out on SIGTERM + resume
+/// state + wake-ramp-in) feature. All fields optional.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RestartConfig {
+    /// Where the resume state file (`resume.toml`) lives. When `None` the daemon
+    /// reads `$STATE_DIRECTORY` (set by systemd `StateDirectory=`) at startup;
+    /// if neither is present, resume is disabled (safe cold start). This is NEVER
+    /// the RuntimeDirectory (/run tmpfs is wiped on stop, defeating SIGKILL
+    /// resume) - it must be a persistent location.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// Coarse periodic checkpoint cadence, seconds (refreshes only elapsed while a
+    /// track is live). Edge events (track/state/queue changes) checkpoint
+    /// immediately regardless.
+    #[serde(default = "d_checkpoint_secs")]
+    pub checkpoint_secs: u64,
+}
+
+pub const DEFAULT_CHECKPOINT_SECS: u64 = 12;
+
+fn d_checkpoint_secs() -> u64 {
+    DEFAULT_CHECKPOINT_SECS
+}
+
+impl Default for RestartConfig {
+    fn default() -> Self {
+        Self {
+            state_dir: None,
+            checkpoint_secs: DEFAULT_CHECKPOINT_SECS,
+        }
+    }
 }
 
 /// Tunable knobs for the volume-envelope (fade) primitive. Defaults are the
@@ -66,6 +104,13 @@ pub struct FadeConfig {
     /// Absolute ceiling on any fade duration, seconds (clamps a runaway request).
     #[serde(default = "d_max_dur_s")]
     pub max_dur_secs: u64,
+    /// Duration of the DELIBERATE sleep-fade-out run on SIGTERM/SIGINT before the
+    /// daemon exits, seconds. This is a deliberate (not sub-JND) fade at the 3
+    /// dB/step cap, kept SHORT so it never slows a nixos-rebuild / service
+    /// restart; the wake-ramp on the next start uses `wake_ramp_secs`. Normalized
+    /// into `[min_slew_s, max_dur_secs]`.
+    #[serde(default = "d_shutdown_fade_s")]
+    pub shutdown_fade_secs: u64,
 }
 
 // Research-backed defaults (memory 01kxhjqr). Exposed as `pub const` so the fade
@@ -80,6 +125,7 @@ pub const DEFAULT_SLEEP_FADE_SECS: u64 = 480;
 pub const DEFAULT_WINDDOWN_FADE_SECS: u64 = 300;
 pub const DEFAULT_WAKE_RAMP_SECS: u64 = 480;
 pub const DEFAULT_MAX_DUR_SECS: u64 = 1800;
+pub const DEFAULT_SHUTDOWN_FADE_SECS: u64 = 6;
 
 /// Positive minimum for `step_size_db`. A `0` (or negative) step would divide by
 /// zero in [`crate::fade::FadeSpec::new`]'s sub-JND path (`range / step_size` ->
@@ -104,6 +150,7 @@ fn d_sleep_fade_s() -> u64 { DEFAULT_SLEEP_FADE_SECS }
 fn d_winddown_s() -> u64 { DEFAULT_WINDDOWN_FADE_SECS }
 fn d_wake_s() -> u64 { DEFAULT_WAKE_RAMP_SECS }
 fn d_max_dur_s() -> u64 { DEFAULT_MAX_DUR_SECS }
+fn d_shutdown_fade_s() -> u64 { DEFAULT_SHUTDOWN_FADE_SECS }
 
 impl FadeConfig {
     /// Clamp every knob into its safe range at LOAD time, logging any correction,
@@ -228,6 +275,7 @@ impl FadeConfig {
             &mut self.sleep_fade_secs,
             &mut self.winddown_fade_secs,
             &mut self.wake_ramp_secs,
+            &mut self.shutdown_fade_secs,
         ] {
             *d = (*d).clamp(min_s, self.max_dur_secs);
         }
@@ -247,6 +295,7 @@ impl Default for FadeConfig {
             winddown_fade_secs: DEFAULT_WINDDOWN_FADE_SECS,
             wake_ramp_secs: DEFAULT_WAKE_RAMP_SECS,
             max_dur_secs: DEFAULT_MAX_DUR_SECS,
+            shutdown_fade_secs: DEFAULT_SHUTDOWN_FADE_SECS,
         }
     }
 }

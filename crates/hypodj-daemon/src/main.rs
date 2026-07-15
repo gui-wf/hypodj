@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use hypodj_core::config::Config;
 use hypodj_core::handler::HypodjHandler;
@@ -177,14 +178,68 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("MPRIS disabled by config");
     }
 
+    // SMOOTH-RESTART wiring. Resolve the persistent state dir: an explicit
+    // [restart].state_dir wins, else systemd's $STATE_DIRECTORY (set by
+    // StateDirectory=), else resume is disabled (safe cold start). This is NEVER
+    // the RuntimeDirectory (/run tmpfs is wiped on stop, defeating SIGKILL
+    // resume).
+    let state_dir: Option<PathBuf> = cfg
+        .restart
+        .state_dir
+        .clone()
+        .or_else(|| {
+            std::env::var_os("STATE_DIRECTORY").and_then(|v| {
+                // STATE_DIRECTORY may be a colon-separated list; take the first.
+                let s = v.to_string_lossy();
+                let first = s.split(':').next().unwrap_or("");
+                if first.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(first))
+                }
+            })
+        });
+    let resume_enabled = state_dir.is_some();
+    if let Some(dir) = &state_dir {
+        let path = dir.join("resume.toml");
+        handler.set_state_path(path.clone());
+        // Restore from the last checkpoint BEFORE serving: a Playing snapshot wakes
+        // back into playback (queue rebuilt, seek, wake-ramp from silence); a
+        // Paused/Stopped snapshot restores the queue + baseline volume and stays
+        // stopped. A missing / corrupt / old file is a clean cold start (load()
+        // returns None, never panics).
+        if let Some(rs) = hypodj_core::resume::load(&path) {
+            tracing::info!("resume state found; restoring");
+            if let Err(e) = handler.restore(&rs).await {
+                tracing::warn!(error = %e, "resume restore failed; continuing cold");
+            }
+        }
+        // Best-effort checkpoint task: persists on state-EDGE events + a coarse
+        // periodic elapsed refresh, so even an ungraceful SIGKILL resumes from the
+        // last checkpoint.
+        tokio::spawn(checkpoint_loop(
+            handler.clone(),
+            runtime.events.subscribe(),
+            cfg.restart.checkpoint_secs.max(1),
+            player.clone(),
+        ));
+    }
+
     let bind: SocketAddr = cfg.mpd.bind.parse()?;
     let server = MpdServer::new(bind);
     tracing::info!(%bind, "starting MPD server");
-    // Serve MPD, but also watch the director spine: if it exits (player channel
-    // closed) or panics, wind the daemon down loudly so systemd restarts cleanly
-    // rather than leaving a silent event-less zombie.
+    // The internal shutdown-fade budget tracks the configured shutdown_fade_secs
+    // plus a small headroom for the up-front persist, so raising the fade knob
+    // does not silently make the budget reject the fade (immediate exit). The
+    // systemd TimeoutStopSec must stay comfortably ABOVE this (the nix module
+    // sizes it from the same knob + margin).
+    let shutdown_budget = Duration::from_secs(cfg.fade.shutdown_fade_secs.saturating_add(3));
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Serve MPD, but also watch the director spine (if it exits/panics, wind down
+    // loudly) AND the termination signals (SIGTERM/SIGINT): on a signal, persist
+    // resume state, fade out, then exit(0) - a graceful, click-free shutdown.
     tokio::select! {
-        r = server.serve(handler) => r?,
+        r = server.serve(handler.clone()) => r?,
         joined = runtime.join() => match joined {
             Ok(()) => tracing::error!("director spine exited (player gone); shutting down"),
             Err(e) => {
@@ -192,6 +247,101 @@ async fn main() -> anyhow::Result<()> {
                 std::process::abort();
             }
         },
+        _ = sigterm.recv() => graceful_shutdown(handler.clone(), resume_enabled, shutdown_budget).await,
+        _ = tokio::signal::ctrl_c() => graceful_shutdown(handler.clone(), resume_enabled, shutdown_budget).await,
     }
     Ok(())
+}
+
+/// The graceful shutdown path on SIGTERM/SIGINT. ORDERING: PERSIST FIRST (the
+/// snapshot is fully known the instant the signal arrives; an up-front atomic
+/// write is idempotent with the periodic checkpoint and survives a hung fade / a
+/// second SIGKILL), THEN run the bounded sleep-fade-out, THEN `exit(0)`. A SECOND
+/// signal or the timeout cuts straight to the exit (already persisted), and the
+/// inline fade's own `tokio::time::timeout` guarantees a stuck sink can never
+/// block the exit.
+async fn graceful_shutdown(handler: Arc<HypodjHandler>, resume_enabled: bool, budget: Duration) -> ! {
+    tracing::info!("shutdown signal received; persisting resume state then fading out");
+    if resume_enabled {
+        handler.checkpoint(handler.last_elapsed_secs()).await;
+    }
+    // A second signal (or the budget) cuts straight to exit.
+    let second = async {
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(_) => {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                }
+            };
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+    };
+    tokio::select! {
+        _ = handler.shutdown_fade(budget) => {}
+        _ = tokio::time::sleep(budget) => {}
+        _ = second => tracing::info!("second shutdown signal; exiting immediately"),
+    }
+    std::process::exit(0);
+}
+
+/// The best-effort resume checkpoint loop. Updates the lockless live-elapsed
+/// atomic on every high-rate `Tick`, and writes a full checkpoint on state EDGES
+/// (track start/end, play-state change, queue resync) plus a coarse periodic
+/// refresh while a track is live. NEVER queries mpv; the elapsed comes from the
+/// P1 tick stream, so a checkpoint is race-free against shutdown.
+async fn checkpoint_loop(
+    handler: Arc<HypodjHandler>,
+    mut ev: tokio::sync::broadcast::Receiver<hypodj_core::event::DjEvent>,
+    checkpoint_secs: u64,
+    player: hypodj_core::player::PlayerHandle,
+) {
+    use hypodj_core::event::DjEventKind;
+    use hypodj_core::player::PlayState;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(checkpoint_secs));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            r = ev.recv() => match r {
+                Ok(dj) => match dj.kind {
+                    DjEventKind::Tick { time_pos, .. } => {
+                        handler.note_elapsed_ms(time_pos.as_millis() as u64);
+                    }
+                    DjEventKind::TrackStart(_) => {
+                        handler.reset_elapsed();
+                        handler.checkpoint(handler.last_elapsed_secs()).await;
+                    }
+                    DjEventKind::TrackEnd(_) => {
+                        handler.checkpoint(handler.last_elapsed_secs()).await;
+                    }
+                    DjEventKind::StateChanged(st, _) => {
+                        if st == PlayState::Stopped {
+                            handler.reset_elapsed();
+                        }
+                        handler.checkpoint(handler.last_elapsed_secs()).await;
+                    }
+                    DjEventKind::Resync => {
+                        handler.checkpoint(handler.last_elapsed_secs()).await;
+                    }
+                    _ => {}
+                },
+                // A lagged lossy observer just resyncs on the next event; a closed
+                // channel means the director is gone, so the loop ends.
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
+            },
+            _ = interval.tick() => {
+                // Coarse periodic elapsed refresh, debounced: skip when no track is
+                // live (nothing changed worth persisting).
+                if player.state() == PlayState::Playing {
+                    handler.checkpoint(handler.last_elapsed_secs()).await;
+                }
+            }
+        }
+    }
 }
