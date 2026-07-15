@@ -22,8 +22,19 @@ path = "src/bin/probe.rs"
 name = "play-probe"
 path = "src/bin/play_probe.rs"
 
+[features]
+# Passthroughs for the OPTIONAL model path. Off by default, so a plain
+# `cargo build -p hypodj-daemon` pulls NO llama/candle/ort. `llm` is the seam +
+# schema (buildable anywhere); `llm-llama` adds the local llama.cpp runtime (needs
+# libclang + a model file - a deploy/ops artifact).
+llm = ["hypodj-nl/llm"]
+llm-llama = ["hypodj-nl/llm-llama"]
+
 [dependencies]
 hypodj-core = { path = "../hypodj-core" }
+# The NL translator, model-free by default (default-features = false); the `llm`
+# feature is re-exported above so the model backend is opt-in only.
+hypodj-nl = { path = "../hypodj-nl", default-features = false }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

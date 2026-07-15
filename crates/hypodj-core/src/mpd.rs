@@ -184,6 +184,12 @@ pub enum MpdCommand {
     /// [`PlanCmd`] and [`parse_plan`].
     Plan(PlanCmd),
 
+    /// `nl "<request>"` / `nl confirm <token>` / `nl cancel <token>` - the P3
+    /// OPTIONAL natural-language surface. Translate EMITS a validated plan echoed
+    /// for confirmation; confirm arms it via the P2 registry; cancel drops the
+    /// token. NOT a standard MPD command; a hypodj extension. See [`NlCmd`].
+    Nl(NlCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
@@ -226,6 +232,68 @@ pub enum PlanCmd {
     List,
     Cancel(PlanId),
     Replace(PlanId, RawPlan),
+}
+
+/// A parsed `nl` subcommand (the P3 natural-language surface). See [`parse_nl`].
+///
+/// `owner` is the per-connection identity: the confirm/cancel of a pending
+/// translation is scoped to the SAME connection that translated it, so one client
+/// can never arm another client's echoed-but-unconfirmed plan. It is stamped by
+/// the serve loop via [`stamp_nl_owner`] AFTER parsing (the wire text carries no
+/// owner); the parser leaves it 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NlCmd {
+    /// `nl "<request>"` - translate + echo (does NOT arm).
+    Translate { req: String, owner: u64 },
+    /// `nl confirm <token>` - arm the echoed plan(s) via the P2 registry.
+    Confirm { token: String, owner: u64 },
+    /// `nl cancel <token>` - drop a pending token.
+    Cancel { token: String, owner: u64 },
+}
+
+/// True when `s` has the shape of a minted `nl` token (`nl-<hex>`). Only a
+/// token-shaped single argument turns `nl confirm|cancel <x>` into the keyword
+/// subcommand; free text ("nl confirm the good vibes only") is a translate.
+fn is_nl_token(s: &str) -> bool {
+    match s.strip_prefix("nl-") {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
+/// Stamp the per-connection owner onto a parsed `nl` command. A no-op for any
+/// non-`nl` command. Called once by the serve loop after [`parse`].
+pub fn stamp_nl_owner(cmd: &mut MpdCommand, owner_key: u64) {
+    if let MpdCommand::Nl(nl) = cmd {
+        match nl {
+            NlCmd::Translate { owner, .. }
+            | NlCmd::Confirm { owner, .. }
+            | NlCmd::Cancel { owner, .. } => *owner = owner_key,
+        }
+    }
+}
+
+/// Parse an `nl` request. `nl confirm <token>` / `nl cancel <token>` are the two
+/// keyword forms, recognized ONLY when the shape matches exactly: the verb plus a
+/// single token-shaped argument (`nl-<hex>`). Anything else - including
+/// "nl confirm the good vibes only" - is a translate request (the joined argument
+/// text). An empty request is [`MpdCommand::Unsupported`] (fail loud, never a
+/// panic), matching [`parse_plan`]. `owner` is left 0 here; the serve loop stamps
+/// the real per-connection key via [`stamp_nl_owner`].
+fn parse_nl(args: &[String], line: &str) -> MpdCommand {
+    if args.is_empty() {
+        return MpdCommand::Unsupported(line.to_string());
+    }
+    let keyword_form = |kw: &str| {
+        args.len() == 2 && args[0].eq_ignore_ascii_case(kw) && is_nl_token(&args[1])
+    };
+    if keyword_form("confirm") {
+        return MpdCommand::Nl(NlCmd::Confirm { token: args[1].clone(), owner: 0 });
+    }
+    if keyword_form("cancel") {
+        return MpdCommand::Nl(NlCmd::Cancel { token: args[1].clone(), owner: 0 });
+    }
+    MpdCommand::Nl(NlCmd::Translate { req: args.join(" "), owner: 0 })
 }
 
 /// Parse a `plan` request into a [`PlanCmd`]. Grammar (a small keyword DSL that
@@ -661,6 +729,7 @@ pub fn parse(line: &str) -> MpdCommand {
         }
         "fade" => parse_fade(&args, line),
         "plan" => parse_plan(&args, line),
+        "nl" => parse_nl(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -713,6 +782,55 @@ mod parse_tests {
     fn unknown_command_is_unsupported_not_panic() {
         assert!(matches!(parse("frobnicate x y"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse(""), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn nl_confirm_only_on_a_token_shaped_argument() {
+        // The exact `nl confirm <token>` shape (one token-shaped arg) is a confirm.
+        match parse("nl confirm nl-1a2b3c") {
+            MpdCommand::Nl(NlCmd::Confirm { token, owner }) => {
+                assert_eq!(token, "nl-1a2b3c");
+                assert_eq!(owner, 0, "owner is unstamped until the serve loop");
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("nl cancel nl-deadbeef") {
+            MpdCommand::Nl(NlCmd::Cancel { token, .. }) => assert_eq!(token, "nl-deadbeef"),
+            other => panic!("got {other:?}"),
+        }
+        // "nl confirm <freetext>" is a TRANSLATE, not a confirm - the whole line
+        // (including "confirm") is the request text.
+        match parse("nl confirm the good vibes only") {
+            MpdCommand::Nl(NlCmd::Translate { req, .. }) => {
+                assert_eq!(req, "confirm the good vibes only");
+            }
+            other => panic!("expected a translate, got {other:?}"),
+        }
+        // A single NON-token arg after confirm is also a translate (not a confirm),
+        // since it is not token-shaped.
+        match parse("nl confirm please") {
+            MpdCommand::Nl(NlCmd::Translate { req, .. }) => assert_eq!(req, "confirm please"),
+            other => panic!("expected a translate, got {other:?}"),
+        }
+        // "nl cancel that one" is likewise a translate.
+        match parse("nl cancel that one") {
+            MpdCommand::Nl(NlCmd::Translate { req, .. }) => assert_eq!(req, "cancel that one"),
+            other => panic!("expected a translate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_nl_owner_sets_the_connection_key() {
+        let mut cmd = parse("nl confirm nl-abc");
+        stamp_nl_owner(&mut cmd, 0xDEAD);
+        match cmd {
+            MpdCommand::Nl(NlCmd::Confirm { owner, .. }) => assert_eq!(owner, 0xDEAD),
+            other => panic!("got {other:?}"),
+        }
+        // A non-nl command is untouched.
+        let mut other = parse("status");
+        stamp_nl_owner(&mut other, 0xBEEF);
+        assert!(matches!(other, MpdCommand::Status));
     }
 
     #[test]
@@ -1080,6 +1198,31 @@ mod parse_tests {
     }
 
     #[test]
+    fn parses_nl_commands() {
+        // A quoted request is one translate argument.
+        match parse(r#"nl "fade out in 20 minutes""#) {
+            MpdCommand::Nl(NlCmd::Translate { req, .. }) => {
+                assert_eq!(req, "fade out in 20 minutes")
+            }
+            other => panic!("got {other:?}"),
+        }
+        // An unquoted request joins the tokens.
+        match parse("nl fade out") {
+            MpdCommand::Nl(NlCmd::Translate { req, .. }) => assert_eq!(req, "fade out"),
+            other => panic!("got {other:?}"),
+        }
+        // Only a token-SHAPED (`nl-<hex>`) argument is a confirm/cancel.
+        assert!(matches!(parse("nl confirm nl-abc123"), MpdCommand::Nl(NlCmd::Confirm { token, .. }) if token == "nl-abc123"));
+        assert!(matches!(parse("nl cancel nl-abc123"), MpdCommand::Nl(NlCmd::Cancel { token, .. }) if token == "nl-abc123"));
+        // A non-token argument after confirm/cancel is a translate, not a confirm.
+        assert!(matches!(parse("nl confirm abc123"), MpdCommand::Nl(NlCmd::Translate { .. })));
+        // Bare `nl` is a fail-loud Unsupported; `nl confirm` (no token) is a
+        // translate of the literal word "confirm".
+        assert!(matches!(parse("nl"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("nl confirm"), MpdCommand::Nl(NlCmd::Translate { .. })));
+    }
+
+    #[test]
     fn ack_serialization_shape() {
         let mut buf = Vec::new();
         let ok = write_response(
@@ -1380,6 +1523,20 @@ where
         .await?;
     wr.flush().await?;
 
+    // A per-connection, unguessable owner key: an `nl` pending translation is
+    // confirmable ONLY from the connection that created it. Seeded from a fresh
+    // process-random `RandomState` (OS entropy) mixed with a monotonic counter +
+    // a wall instant, so it is neither sequential nor guessable across
+    // connections.
+    let owner_key: u64 = {
+        use std::hash::BuildHasher;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+        std::collections::hash_map::RandomState::new()
+            .hash_one((seq, std::time::SystemTime::now()))
+    };
+
     let mut line = String::new();
     loop {
         line.clear();
@@ -1408,7 +1565,8 @@ where
             let mut buf = Vec::new();
             let mut ok = true;
             for (idx, c) in cmds.iter().enumerate() {
-                let cmd = parse(c);
+                let mut cmd = parse(c);
+                stamp_nl_owner(&mut cmd, owner_key);
                 let resp = handler.handle(cmd).await;
                 if !write_response(&mut buf, &resp, list_ok, idx) {
                     ok = false;
@@ -1457,6 +1615,8 @@ where
             continue;
         }
 
+        let mut cmd = cmd;
+        stamp_nl_owner(&mut cmd, owner_key);
         let resp = handler.handle(cmd).await;
         let mut buf = Vec::new();
         if write_response(&mut buf, &resp, false, 0) {

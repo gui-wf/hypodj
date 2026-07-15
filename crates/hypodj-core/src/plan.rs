@@ -84,6 +84,7 @@ pub enum RawTrigger {
 
 /// How a [`RawTrigger::QueuePosition`] counts.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PosBase {
     /// `n == 1` is the CURRENT track ("counting current as 1st").
@@ -95,6 +96,7 @@ pub enum PosBase {
 /// A RAW track selector (raw input only). RENAMED from the spec's `TrackRef` to
 /// avoid colliding with [`crate::event::TrackRef`].
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "sel", rename_all = "snake_case")]
 pub enum TrackSel {
     /// The current track.
@@ -109,6 +111,7 @@ pub enum TrackSel {
 /// for fades (no arbitrary curve, no Ramp), so nothing here can express an op the
 /// startle-safe primitive would refuse.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "act", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Action {
@@ -124,6 +127,7 @@ pub enum Action {
 /// A local serde mirror of [`crate::handler::FadeIntent`], plus the duration the
 /// bare handler intent leaves implicit. `secs` is CLAMPED to `[min_dur, max_dur]`.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "dir", rename_all = "snake_case")]
 pub enum FadeIntentIr {
     /// Ramp to silence, then stop and restore the pre-fade baseline.
@@ -138,6 +142,7 @@ pub enum FadeIntentIr {
 /// return a loud not-yet at EXECUTE time (never silently drop); P4 swaps richer
 /// behavior behind the same enum.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "select", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Selector {

@@ -11,9 +11,11 @@
 /// `Serialize`/`Deserialize` so the P2 plan IR ([`crate::plan`]) can carry a
 /// concrete song id in a `Selector` (append-only enqueue) across the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SongId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AlbumId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

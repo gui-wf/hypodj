@@ -17,6 +17,9 @@
 //! album directories; drilling into an album lists its song files. `add song/X`
 //! / `addid song/X` queue a real track; `play` streams it via the player.
 
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,7 +43,9 @@ use crate::plan::{
     clamp_raw, validate, ArmedPlan, PlanBounds, PlanError, PlanId, RawPlan, Resolved, Selector,
 };
 use crate::subsonic::SubsonicError;
-use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, PlanCmd, StickerCmd};
+use crate::echo::describe_batch;
+use crate::nl::{NlContext, NlError, NlSource, Translator};
+use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, StickerCmd};
 use crate::player::{db_to_mpv_volume, mpv_volume_to_db, PlayState, PlayerHandle};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 use crate::timer::TimerHandle;
@@ -469,7 +474,42 @@ pub struct HypodjHandler {
     /// A nudge channel: an [`Resolved::Immediate`] plan is executed at add-time by
     /// the executor task, so `plan_add` (sync, no `.await`) hands off the id here.
     plan_immediate: OnceLock<mpsc::UnboundedSender<PlanId>>,
+
+    // ── P3 natural-language surface ─────────────────────────────────────────
+    /// The injected NL translator (rules + optional local model). `OnceLock`
+    /// because the daemon injects exactly one via [`Self::set_translator`], same
+    /// pattern as [`Self::set_plan_timers`]. Absent -> `nl` ACKs NotAvailable.
+    /// hypodj-core stays model-free: only a `dyn Translator` crosses this seam.
+    translator: OnceLock<Arc<dyn Translator>>,
+    /// Pending, echoed-but-unconfirmed translations, keyed by a single-use token.
+    /// Stores `Vec<RawPlan>` ONLY (never a translate-time Resolved): `nl confirm`
+    /// RE-VALIDATES + clamps against the CURRENT snapshot. Tokens are single-use +
+    /// TTL-bounded; every access prunes expired entries so the map cannot grow
+    /// unbounded or arm a stale intent. A short std-`Mutex` scope, never across an
+    /// `.await`.
+    nl_pending: Mutex<HashMap<String, PendingNl>>,
+    /// Monotonic counter feeding the token minter (uniqueness); NEVER the token
+    /// itself - the emitted token is the counter hashed under `nl_token_hasher`.
+    next_nl_token: AtomicU64,
+    /// The per-handler random hash seed (OS entropy at construction) that turns
+    /// the monotonic counter into an UNGUESSABLE, non-sequential token. Keeps the
+    /// token minter dependency-free (no rand crate) while staying unpredictable.
+    nl_token_hasher: RandomState,
 }
+
+/// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
+/// (so the human echo equals exactly what `nl confirm` arms); `created` bounds the
+/// TTL so a stale intent can never be confirmed. `owner` scopes the confirm/cancel
+/// to the connection that created it (no cross-connection arming).
+struct PendingNl {
+    plans: Vec<RawPlan>,
+    created: Instant,
+    source: NlSource,
+    owner: u64,
+}
+
+/// How long an echoed `nl` token stays confirmable (single-use + TTL-bounded).
+const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 impl HypodjHandler {
     /// Construct with the default `[fade]` tunables (research-backed constants).
@@ -502,6 +542,10 @@ impl HypodjHandler {
             next_plan_id: AtomicU64::new(0),
             plan_timers: OnceLock::new(),
             plan_immediate: OnceLock::new(),
+            translator: OnceLock::new(),
+            nl_pending: Mutex::new(HashMap::new()),
+            next_nl_token: AtomicU64::new(0),
+            nl_token_hasher: RandomState::new(),
         }
     }
 
@@ -547,48 +591,75 @@ impl HypodjHandler {
     /// than storing an unexecutable plan. The whole body is one short lock scope
     /// with NO `.await` - the (async) Immediate action is handed to the executor.
     pub fn plan_add(&self, raw: RawPlan) -> Result<PlanId, PlanError> {
+        let mut ids = self.plan_add_batch(vec![raw])?;
+        // Exactly one id for a single-plan batch.
+        Ok(ids.remove(0))
+    }
+
+    /// ATOMICALLY validate + arm a BATCH of raw plans against ONE current queue
+    /// snapshot: either EVERY plan is armed (in order, ascending [`PlanId`]) or
+    /// NONE is (a single failing plan leaves the registry untouched). Used by
+    /// `nl confirm` for a multi-plan (wake) batch so a mid-batch failure can never
+    /// leave a partial, inconsistent arm. The whole body is await-free; the (async)
+    /// Immediate actions are handed to the executor after the lock is released.
+    pub fn plan_add_batch(&self, raws: Vec<RawPlan>) -> Result<Vec<PlanId>, PlanError> {
         let bounds = self.plan_bounds();
-        let clamped = clamp_raw(&raw, &bounds);
         let snap = self.queue_snapshot();
         let now = Instant::now();
         let now_civil = chrono::Utc::now();
-        let resolved = validate(&clamped, &snap, now, now_civil, &bounds)?;
 
-        let id = PlanId(self.next_plan_id.fetch_add(1, Ordering::Relaxed));
-        // Arm an absolute timer for a deadline plan NOW (the deadline is already
-        // concrete). TimeRemaining is armed lazily by the executor on a live Tick.
-        let (timer_id, guard) = match &resolved {
-            Resolved::OnDeadline(deadline) => match self.plan_timers.get() {
-                Some(t) => {
-                    let (tid, g) = t.arm(*deadline);
-                    (Some(tid), Some(g))
-                }
-                None => (None, None),
-            },
-            _ => (None, None),
-        };
+        // Phase 1: clamp + validate ALL against one snapshot. NO mutation, NO timer
+        // armed yet - a failure here aborts with nothing armed.
+        let mut prepared: Vec<(RawPlan, Resolved)> = Vec::with_capacity(raws.len());
+        for raw in &raws {
+            let clamped = clamp_raw(raw, &bounds);
+            let resolved = validate(&clamped, &snap, now, now_civil, &bounds)?;
+            prepared.push((clamped, resolved));
+        }
 
-        let armed = ArmedPlan {
-            id,
-            once: clamped.once,
-            raw: clamped,
-            resolved: resolved.clone(),
-            armed_at: now,
-            timer_id,
-        };
-        self.plan_pending
-            .lock()
-            .unwrap()
-            .push(PendingPlan { armed, guard, remaining_deadline: None });
+        // Phase 2: every plan validated -> arm them all. Mint ids, arm deadline
+        // timers, then push under one lock scope.
+        let mut ids = Vec::with_capacity(prepared.len());
+        let mut immediates: Vec<PlanId> = Vec::new();
+        let mut pendings: Vec<PendingPlan> = Vec::with_capacity(prepared.len());
+        for (clamped, resolved) in prepared {
+            let id = PlanId(self.next_plan_id.fetch_add(1, Ordering::Relaxed));
+            // Arm an absolute timer for a deadline plan NOW (the deadline is already
+            // concrete). TimeRemaining is armed lazily by the executor on a live Tick.
+            let (timer_id, guard) = match &resolved {
+                Resolved::OnDeadline(deadline) => match self.plan_timers.get() {
+                    Some(t) => {
+                        let (tid, g) = t.arm(*deadline);
+                        (Some(tid), Some(g))
+                    }
+                    None => (None, None),
+                },
+                _ => (None, None),
+            };
+            if matches!(resolved, Resolved::Immediate) {
+                immediates.push(id);
+            }
+            let armed = ArmedPlan {
+                id,
+                once: clamped.once,
+                raw: clamped,
+                resolved,
+                armed_at: now,
+                timer_id,
+            };
+            pendings.push(PendingPlan { armed, guard, remaining_deadline: None });
+            ids.push(id);
+        }
+        self.plan_pending.lock().unwrap().extend(pendings);
 
         // An Immediate plan executes at add-time: nudge the executor (its action
         // is async, so it cannot run inside this sync, lock-holding path).
-        if matches!(resolved, Resolved::Immediate) {
-            if let Some(tx) = self.plan_immediate.get() {
+        if let Some(tx) = self.plan_immediate.get() {
+            for id in immediates {
                 let _ = tx.send(id);
             }
         }
-        Ok(id)
+        Ok(ids)
     }
 
     /// List the armed plans (id + the raw, clamped plan) for `plan list`.
@@ -692,6 +763,166 @@ impl HypodjHandler {
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
             },
         }
+    }
+
+    // ── P3 natural-language surface ─────────────────────────────────────────
+
+    /// Register the injected NL translator (rules + optional local model). Called
+    /// once by the daemon, same pattern as [`Self::set_plan_timers`]. When never
+    /// called, `nl` ACKs [`NlError::NotAvailable`] (degrades gracefully).
+    pub fn set_translator(&self, translator: Arc<dyn Translator>) {
+        let _ = self.translator.set(translator);
+    }
+
+    /// Mint a fresh single-use `nl` token. UNGUESSABLE + non-sequential: the
+    /// monotonic counter (uniqueness) is hashed under the per-handler random seed
+    /// mixed with a wall instant, so an observer cannot predict the next token.
+    fn mint_nl_token(&self) -> String {
+        let n = self.next_nl_token.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let h = self.nl_token_hasher.hash_one((n, nanos));
+        format!("nl-{h:016x}")
+    }
+
+    /// Build the disambiguation context from the LIVE snapshot (owned data only).
+    fn nl_context(&self) -> NlContext {
+        let snap = self.queue_snapshot();
+        let current = snap
+            .current
+            .as_ref()
+            .and_then(|c| snap.find(c.queue_id).and_then(|(_, e)| e.song.clone()));
+        NlContext {
+            current,
+            now: Instant::now(),
+            now_civil: chrono::Utc::now(),
+            // ADAPTATION: no tz knob in config yet, so a UTC fixed offset. The echo
+            // always shows the fully-resolved absolute civil time, so a meridian
+            // mistake is still caught at confirm; a configurable IANA zone is a P4
+            // refinement.
+            tz: chrono::FixedOffset::east_opt(0).unwrap(),
+            queue_len: snap.entries.len(),
+        }
+    }
+
+    /// Dispatch a parsed `nl` command. Async so a model-backed translate can run
+    /// under `spawn_blocking`; the std `Mutex<nl_pending>` is only ever locked in
+    /// short, await-free scopes.
+    async fn handle_nl(&self, cmd: NlCmd) -> MpdResponse {
+        match cmd {
+            NlCmd::Translate { req, owner } => self.nl_translate(req, owner).await,
+            NlCmd::Confirm { token, owner } => self.nl_confirm(&token, owner),
+            NlCmd::Cancel { token, owner } => self.nl_cancel(&token, owner),
+        }
+    }
+
+    /// Translate + echo. EMITS + validates (dry-run) + stores under a token; it
+    /// NEVER arms (that is `nl confirm`, which re-validates against the CURRENT
+    /// snapshot).
+    async fn nl_translate(&self, req: String, owner: u64) -> MpdResponse {
+        let translator = match self.translator.get() {
+            Some(t) => t.clone(),
+            None => return ack(ACK_ERROR_UNKNOWN, "nl", &NlError::NotAvailable.to_string()),
+        };
+        let ctx = self.nl_context();
+        // Run the (possibly model-backed) translate OFF the reactor: Rules is
+        // instant; a local model can take hundreds of ms. hypodj-nl needs no tokio.
+        let hit = match tokio::task::spawn_blocking(move || translator.translate(&req, &ctx)).await {
+            Ok(r) => r,
+            Err(_) => return ack(ACK_ERROR_UNKNOWN, "nl", "translator task failed"),
+        };
+        let hit = match hit {
+            // Loud ACK with the SPECIFIC reason (NotUnderstood / Ambiguous /
+            // Unresolvable / NotAvailable), never a generic fail.
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "nl", &e.to_string()),
+            Ok(h) => h,
+        };
+        // Stamp origin (adapter, NEVER the model) and DRY-RUN validate every plan
+        // to render the echo + fail loud early. DO NOT arm here.
+        let source_tag = match hit.source {
+            NlSource::Rules => "nl:rules",
+            NlSource::Llm => "nl:llm",
+        };
+        let bounds = self.plan_bounds();
+        let snap = self.queue_snapshot();
+        let now = Instant::now();
+        let now_civil = chrono::Utc::now();
+        // SAFETY (echo == arm): CLAMP each plan now and store + echo the CLAMPED
+        // plan, so the human confirms EXACTLY the values that will arm. Clamping is
+        // numeric (duration/vol/position bounds) and snapshot-independent, so the
+        // re-clamp inside `plan_add` at confirm time is idempotent. A dry-run
+        // validate against the current snapshot fails loud early.
+        let mut plans = Vec::with_capacity(hit.plans.len());
+        for raw in hit.plans {
+            let mut clamped = clamp_raw(&raw, &bounds);
+            clamped.origin = source_tag.to_string();
+            if let Err(e) = validate(&clamped, &snap, now, now_civil, &bounds) {
+                return ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan invalid: {e}"));
+            }
+            plans.push(clamped);
+        }
+        let echo = describe_batch(&plans, hit.source);
+        let token = self.mint_nl_token();
+        {
+            let mut g = self.nl_pending.lock().unwrap();
+            prune_expired_nl(&mut g);
+            g.insert(
+                token.clone(),
+                PendingNl { plans, created: Instant::now(), source: hit.source, owner },
+            );
+        }
+        MpdResponse::pairs()
+            .pair("nl_echo", echo)
+            .pair("nl_token", token)
+            .build()
+    }
+
+    /// Confirm: pop the (single-use) token and RE-VALIDATE + arm each plan against
+    /// the CURRENT snapshot via `plan_add`. A queue mutation since the echo that
+    /// invalidates a target -> loud ACK (per-plan), nothing stale armed.
+    fn nl_confirm(&self, token: &str, owner: u64) -> MpdResponse {
+        // Pop ONLY when the token exists AND belongs to this connection. A confirm
+        // from a different owner is treated as "no such token" (indistinguishable,
+        // so it leaks nothing about another connection's pending plans).
+        let pending = {
+            let mut g = self.nl_pending.lock().unwrap();
+            prune_expired_nl(&mut g);
+            match g.get(token) {
+                Some(p) if p.owner == owner => g.remove(token),
+                _ => None,
+            }
+        };
+        let pending = match pending {
+            Some(p) => p,
+            None => return ack(ACK_ERROR_NO_EXIST, "nl", "no such nl token"),
+        };
+        let _ = pending.source;
+        // SAFETY (atomic batch): arm ALL plans or NONE. `plan_add_batch`
+        // pre-validates every plan against ONE current snapshot and only then arms
+        // them; a single invalid plan arms nothing (no partial, inconsistent arm).
+        match self.plan_add_batch(pending.plans) {
+            Ok(ids) => {
+                let mut b = MpdResponse::pairs();
+                for id in ids {
+                    b = b.pair("plan_id", id.0.to_string());
+                }
+                b.build()
+            }
+            Err(e) => ack(ACK_ERROR_UNKNOWN, "nl", &format!("plan no longer valid: {e}")),
+        }
+    }
+
+    /// Cancel: drop the token (idempotent OK), but ONLY for the owning connection;
+    /// a cancel from another owner is a no-op OK (it never touches the pending map).
+    fn nl_cancel(&self, token: &str, owner: u64) -> MpdResponse {
+        let mut g = self.nl_pending.lock().unwrap();
+        prune_expired_nl(&mut g);
+        if matches!(g.get(token), Some(p) if p.owner == owner) {
+            g.remove(token);
+        }
+        MpdResponse::ok()
     }
 
     fn notify_change(&self) {
@@ -1101,6 +1332,13 @@ fn is_stream_uri(uri: &str) -> bool {
     uri.starts_with("http://") || uri.starts_with("https://")
 }
 
+/// Drop expired `nl` tokens (TTL-bounded), called on every `nl_pending` access so
+/// the map never grows unbounded and a stale intent can never be confirmed.
+fn prune_expired_nl(map: &mut HashMap<String, PendingNl>) {
+    let now = Instant::now();
+    map.retain(|_, p| now.duration_since(p.created) < NL_TOKEN_TTL);
+}
+
 fn ack(code: u32, command: &str, message: &str) -> MpdResponse {
     MpdResponse::Ack {
         code,
@@ -1301,6 +1539,7 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::Plan(cmd) => self.handle_plan(cmd),
+            MpdCommand::Nl(cmd) => self.handle_nl(cmd).await,
             MpdCommand::Next => {
                 let next = {
                     let st = self.state.lock().unwrap();
@@ -2486,6 +2725,225 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    // ── P3 NL flow: nl -> validate -> echo -> confirm -> arm ─────────────────
+
+    /// A minimal inline translator (no model, no hypodj-nl dep) emitting a fixed
+    /// valid plan, so the handler-side flow is exercised model-free.
+    struct StubTranslator(RawPlan);
+    impl crate::nl::Translator for StubTranslator {
+        fn translate(
+            &self,
+            _u: &str,
+            _c: &crate::nl::NlContext,
+        ) -> Result<crate::nl::NlHit, crate::nl::NlError> {
+            Ok(crate::nl::NlHit { plans: vec![self.0.clone()], source: crate::nl::NlSource::Rules })
+        }
+    }
+
+    fn pair<'a>(resp: &'a MpdResponse, key: &str) -> Option<&'a str> {
+        match resp {
+            MpdResponse::Pairs(p) => p.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
+            _ => None,
+        }
+    }
+
+    fn nl_translate(req: &str, owner: u64) -> MpdCommand {
+        MpdCommand::Nl(NlCmd::Translate { req: req.into(), owner })
+    }
+    fn nl_confirm(token: &str, owner: u64) -> MpdCommand {
+        MpdCommand::Nl(NlCmd::Confirm { token: token.into(), owner })
+    }
+    fn nl_cancel(token: &str, owner: u64) -> MpdCommand {
+        MpdCommand::Nl(NlCmd::Cancel { token: token.into(), owner })
+    }
+
+    /// A translator emitting a caller-supplied batch of plans (for the atomic-batch
+    /// and echo-equals-arm tests).
+    struct BatchTranslator(Vec<RawPlan>);
+    impl crate::nl::Translator for BatchTranslator {
+        fn translate(
+            &self,
+            _u: &str,
+            _c: &crate::nl::NlContext,
+        ) -> Result<crate::nl::NlHit, crate::nl::NlError> {
+            Ok(crate::nl::NlHit {
+                plans: self.0.clone(),
+                source: crate::nl::NlSource::Rules,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn nl_translate_echoes_then_confirm_arms() {
+        let Some((handler, _events)) = handler_with_null_player() else { return };
+        // No translator injected yet -> NotAvailable (degrades gracefully).
+        let resp = handler.handle(nl_translate("stop", 1)).await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }), "no translator -> ACK");
+
+        let plan = RawPlan {
+            version: 1,
+            trigger: crate::plan::RawTrigger::Immediate,
+            action: crate::plan::Action::Stop,
+            once: true,
+            origin: String::new(),
+        };
+        handler.set_translator(Arc::new(StubTranslator(plan)));
+
+        // Translate echoes + mints a token but does NOT arm.
+        let resp = handler.handle(nl_translate("stop", 1)).await;
+        let token = pair(&resp, "nl_token").expect("a token is minted").to_string();
+        assert!(pair(&resp, "nl_echo").is_some(), "an echo is rendered");
+        assert!(handler.plan_list().is_empty(), "translate must NOT arm");
+
+        // Confirm arms via the P2 registry and returns a plan id.
+        let resp = handler.handle(nl_confirm(&token, 1)).await;
+        assert!(pair(&resp, "plan_id").is_some(), "confirm arms + returns id");
+        assert_eq!(handler.plan_list().len(), 1, "exactly one plan armed");
+
+        // The token is single-use: a second confirm fails loud.
+        let resp = handler.handle(nl_confirm(&token, 1)).await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }), "single-use token");
+    }
+
+    #[tokio::test]
+    async fn nl_cancel_drops_the_token() {
+        let Some((handler, _events)) = handler_with_null_player() else { return };
+        let plan = RawPlan {
+            version: 1,
+            trigger: crate::plan::RawTrigger::Immediate,
+            action: crate::plan::Action::Pause,
+            once: true,
+            origin: String::new(),
+        };
+        handler.set_translator(Arc::new(StubTranslator(plan)));
+        let resp = handler.handle(nl_translate("pause", 1)).await;
+        let token = pair(&resp, "nl_token").unwrap().to_string();
+        // Cancel then confirm -> the token is gone (loud ACK), nothing armed.
+        handler.handle(nl_cancel(&token, 1)).await;
+        let resp = handler.handle(nl_confirm(&token, 1)).await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }));
+        assert!(handler.plan_list().is_empty());
+    }
+
+    /// F1: the human confirms EXACTLY what arms. A plan whose fade duration is
+    /// over the max is CLAMPED at translate time, so the echo and the armed plan
+    /// both carry the final clamped value (never the raw over-limit one).
+    #[tokio::test]
+    async fn nl_echo_equals_the_armed_clamped_plan() {
+        let Some((handler, _events)) = handler_with_null_player() else { return };
+        // 9999s fade out is well over the 1800s (max_dur) ceiling -> clamps.
+        let plan = RawPlan {
+            version: 1,
+            trigger: crate::plan::RawTrigger::Immediate,
+            action: crate::plan::Action::Fade(crate::plan::FadeIntentIr::Out { secs: 9999.0 }),
+            once: true,
+            origin: String::new(),
+        };
+        handler.set_translator(Arc::new(BatchTranslator(vec![plan])));
+
+        let resp = handler.handle(nl_translate("fade out", 7)).await;
+        let echo = pair(&resp, "nl_echo").expect("an echo").to_string();
+        let token = pair(&resp, "nl_token").expect("a token").to_string();
+
+        let resp = handler.handle(nl_confirm(&token, 7)).await;
+        assert!(pair(&resp, "plan_id").is_some(), "confirm arms");
+        let armed: Vec<RawPlan> = handler.plan_list().into_iter().map(|(_, r)| r).collect();
+        assert_eq!(armed.len(), 1);
+        // The armed plan carries the CLAMPED value (9999 -> 1800), not the raw one.
+        match &armed[0].action {
+            crate::plan::Action::Fade(crate::plan::FadeIntentIr::Out { secs }) => {
+                assert_eq!(*secs, 1800.0, "the fade was clamped to max_dur");
+            }
+            other => panic!("got {other:?}"),
+        }
+        // The echo the human confirmed is a description of the plan that armed.
+        let expected = crate::echo::describe_batch(&armed, crate::nl::NlSource::Rules);
+        assert_eq!(echo, expected, "echo must equal the armed (clamped) plan");
+    }
+
+    /// F2: a multi-plan batch arms ATOMICALLY. One failing plan -> NONE armed.
+    #[tokio::test]
+    async fn plan_add_batch_is_atomic() {
+        let Some((handler, _events)) = handler_with_null_player() else { return };
+        let good = RawPlan {
+            version: 1,
+            trigger: crate::plan::RawTrigger::Immediate,
+            action: crate::plan::Action::Stop,
+            once: true,
+            origin: "t".into(),
+        };
+        // A WallClock already in the past fails validate (PastDeadline).
+        let bad = RawPlan {
+            version: 1,
+            trigger: crate::plan::RawTrigger::WallClock {
+                at: chrono::Utc::now() - chrono::Duration::hours(1),
+            },
+            action: crate::plan::Action::Stop,
+            once: true,
+            origin: "t".into(),
+        };
+        // Good FIRST, bad second: a naive plan-by-plan arm would leave the good one
+        // armed. The atomic batch must arm NOTHING.
+        let err = handler
+            .plan_add_batch(vec![good.clone(), bad])
+            .expect_err("a batch with an invalid plan fails");
+        assert!(matches!(err, crate::plan::PlanError::PastDeadline));
+        assert!(handler.plan_list().is_empty(), "a failed batch arms NONE");
+
+        // An all-valid batch arms every plan, in order.
+        let ids = handler
+            .plan_add_batch(vec![good.clone(), good.clone()])
+            .expect("all-valid batch arms");
+        assert_eq!(ids.len(), 2);
+        assert_eq!(handler.plan_list().len(), 2, "both plans armed");
+    }
+
+    /// F3: a pending translation is confirmable ONLY by its owning connection, and
+    /// tokens are unguessable (not a sequential nl-0, nl-1, ... counter).
+    #[tokio::test]
+    async fn nl_confirm_is_owner_scoped_and_tokens_are_unguessable() {
+        let Some((handler, _events)) = handler_with_null_player() else { return };
+        let plan = RawPlan {
+            version: 1,
+            trigger: crate::plan::RawTrigger::Immediate,
+            action: crate::plan::Action::Stop,
+            once: true,
+            origin: String::new(),
+        };
+        handler.set_translator(Arc::new(StubTranslator(plan)));
+
+        // Owner A translates + gets a token.
+        let resp = handler.handle(nl_translate("stop", 100)).await;
+        let token_a = pair(&resp, "nl_token").expect("a token").to_string();
+        // Token must NOT be the predictable sequential counter.
+        assert_ne!(token_a, "nl-0");
+
+        // A DIFFERENT owner cannot confirm A's pending plan.
+        let resp = handler.handle(nl_confirm(&token_a, 200)).await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }), "cross-owner confirm rejected");
+        assert!(handler.plan_list().is_empty(), "a foreign owner armed nothing");
+        // A foreign cancel is likewise a no-op (the token survives for its owner).
+        handler.handle(nl_cancel(&token_a, 200)).await;
+
+        // The rightful owner still confirms + arms.
+        let resp = handler.handle(nl_confirm(&token_a, 100)).await;
+        assert!(pair(&resp, "plan_id").is_some(), "the owner can confirm");
+        assert_eq!(handler.plan_list().len(), 1);
+
+        // Tokens are non-sequential + distinct across several mints.
+        let mut toks = Vec::new();
+        for _ in 0..5 {
+            let r = handler.handle(nl_translate("stop", 1)).await;
+            toks.push(pair(&r, "nl_token").unwrap().to_string());
+        }
+        assert!(toks.iter().all(|t| t.starts_with("nl-")));
+        for seq in ["nl-0", "nl-1", "nl-2", "nl-3", "nl-4"] {
+            assert!(!toks.contains(&seq.to_string()), "tokens must not be sequential");
+        }
+        let uniq: std::collections::HashSet<&String> = toks.iter().collect();
+        assert_eq!(uniq.len(), toks.len(), "tokens are distinct");
     }
 
     fn sample_song() -> Song {

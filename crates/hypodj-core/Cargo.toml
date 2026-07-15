@@ -5,7 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# NON-model schema-derive gate. Adds `schemars::JsonSchema` to the bounded plan
+# IR pieces the NL model surface references, so `hypodj-nl`'s `llm` feature can
+# derive a JSON-Schema/GBNF from the SINGLE source of truth (this crate's IR).
+# schemars is NOT a model dependency, so hypodj-core stays "model-free" with this
+# on; it is off by default and off in the daemon's default build.
+schema = ["dep:schemars"]
+
 [dependencies]
+schemars = { version = "0.8", optional = true }
 tokio.workspace = true
 serde.workspace = true
 toml.workspace = true
