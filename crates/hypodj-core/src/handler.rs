@@ -604,6 +604,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Search(filters) => self.search_filtered(filters, false).await,
             MpdCommand::FindAdd(filters) => self.find_add(filters, true).await,
             MpdCommand::SearchAdd(filters) => self.find_add(filters, false).await,
+            MpdCommand::Count(filters) => self.count(filters).await,
 
             MpdCommand::List { tag, filter } => {
                 // `list <tag> [filter]`: support Artist, Album, Genre. When a
@@ -723,7 +724,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Commands => {
                 let cmds = [
                     "add", "addid", "albumart", "binarylimit", "clear",
-                    "commands", "currentsong", "delete", "find", "findadd",
+                    "commands", "count", "currentsong", "delete", "find", "findadd",
                     "getvol", "idle",
                     "list", "listall", "listallinfo", "listplaylistinfo",
                     "listplaylists", "load", "lsinfo", "next", "noidle",
@@ -1117,6 +1118,38 @@ impl HypodjHandler {
         MpdResponse::Pairs(pairs)
     }
 
+    /// `count <filter...>`: the same exact-match search3 + client-side
+    /// post-filter as `find`, but instead of listing the songs it returns their
+    /// tally and total playtime. MPD's shape is two lines: `songs: <N>` and
+    /// `playtime: <total_seconds>` (integer seconds, songs of unknown duration
+    /// contributing 0). An empty filter yields a zero tally: we have no
+    /// full-library enumeration to count against, so 0 is the honest floor
+    /// rather than a fabricated total. On a search3 error, ACK as `count`.
+    async fn count(&self, filters: Vec<(String, String)>) -> MpdResponse {
+        if filters.is_empty() {
+            return MpdResponse::pairs()
+                .pair("songs", "0")
+                .pair("playtime", "0")
+                .build();
+        }
+        // count is an aggregate: page much further than find/findadd so the tally
+        // is honest for large artists/genres (500 pages = 100k songs), still
+        // bounded against a backend that ignores offset.
+        let matches = match self.collect_matches_capped(&filters, true, 500).await {
+            Ok(m) => m,
+            Err(e) => return ack(ACK_ERROR_UNKNOWN, "count", &e),
+        };
+        let songs = matches.len();
+        let playtime: u64 = matches
+            .iter()
+            .map(|s| s.duration_secs.unwrap_or(0) as u64)
+            .sum();
+        MpdResponse::pairs()
+            .pair("songs", songs.to_string())
+            .pair("playtime", playtime.to_string())
+            .build()
+    }
+
     /// The shared core of find/search/findadd/searchadd: run search3 (full-text)
     /// for the combined filter values, then recover MPD-tag precision with a
     /// client-side post-filter. `exact` (find) matches equality; otherwise
@@ -1129,21 +1162,39 @@ impl HypodjHandler {
         filters: &[(String, String)],
         exact: bool,
     ) -> Result<Vec<Song>, String> {
+        // find/findadd targets are listings/enqueues: 25 pages (5000 songs) is
+        // far beyond any real request. `count` needs an honest total, so it pages
+        // further via collect_matches_capped.
+        self.collect_matches_capped(filters, exact, 25).await
+    }
+
+    /// [`collect_matches`] with an explicit page ceiling. The ceiling exists only
+    /// so a backend that ignores `song_offset` (keeps returning a full page)
+    /// cannot loop forever, grow the buffer without bound, or overflow the i32
+    /// offset. Hitting it is logged (never a silent cap - CLAUDE.md).
+    async fn collect_matches_capped(
+        &self,
+        filters: &[(String, String)],
+        exact: bool,
+        max_pages: i32,
+    ) -> Result<Vec<Song>, String> {
         // Build the full-text query from all values (search3 is full-text).
         let query = filters
             .iter()
             .map(|(_, v)| v.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        // Page search3 so a bulk findadd is COMPLETE, not silently truncated at
-        // the 200-song cap: request 200 at a time, accumulating until a short
-        // page (< PAGE) signals exhaustion (honors CLAUDE.md "no silent caps").
+        // Page search3 so the result is COMPLETE, not silently truncated at the
+        // 200-song cap: request 200 at a time, accumulating until a short page
+        // (< PAGE) signals exhaustion.
         const PAGE: i32 = 200;
-        // Ceiling so a backend that ignores `song_offset` (keeps returning a full
-        // page) cannot loop forever, grow `songs` without bound, or overflow the
-        // i32 offset. 25 pages = 5000 songs is far beyond any real findadd target.
-        const MAX_PAGES: i32 = 25;
         let mut songs: Vec<Song> = Vec::new();
+        // De-dup by song id ACROSS pages. A backend that ignores `song_offset`
+        // returns the same page every request; without dedup `count` would sum
+        // those repeats into a fabricated total (500 pages * 200 = 100000). Dedup
+        // also absorbs a row that overlaps a page boundary on a well-behaved
+        // server. `seen` is the source of truth for the tally.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut offset: i32 = 0;
         let mut page = 0;
         loop {
@@ -1153,9 +1204,26 @@ impl HypodjHandler {
                 .await
                 .map_err(|e| e.to_string())?;
             let got = hits.songs.len();
-            songs.extend(hits.songs);
+            let mut fresh = 0usize;
+            for s in hits.songs {
+                if seen.insert(s.id.0.clone()) {
+                    songs.push(s);
+                    fresh += 1;
+                }
+            }
             page += 1;
-            if (got as i32) < PAGE || page >= MAX_PAGES {
+            // Short page -> exhausted. A full page that added NOTHING new means the
+            // backend is repeating (ignoring offset) -> stop rather than spin.
+            if (got as i32) < PAGE || fresh == 0 {
+                break;
+            }
+            if page >= max_pages {
+                tracing::warn!(
+                    query = %query,
+                    collected = songs.len(),
+                    max_pages,
+                    "collect_matches hit the page ceiling; result may be incomplete"
+                );
                 break;
             }
             offset += PAGE;
@@ -1319,6 +1387,17 @@ fn tag_matches(song: &Song, tag: &str, val: &str, exact: bool) -> bool {
             field.to_lowercase().contains(&val.to_lowercase())
         }
     };
+    // Composer/performer are MPD MULTI-VALUED tags: a track can credit several,
+    // and a filter must match on ANY single value (real MPD matches per value).
+    // We store them as a ", "-joined display string (from displayComposer /
+    // contributors), so split on that delimiter and match any part - otherwise an
+    // exact `find performer "Yo-Yo Ma"` never equals "Itzhak Perlman, Yo-Yo Ma".
+    let cmp_multi = |field: &Option<String>| -> bool {
+        match field {
+            Some(s) => s.split(", ").filter(|p| !p.is_empty()).any(cmp),
+            None => false,
+        }
+    };
     match tag {
         "title" => cmp(&song.title),
         "artist" | "albumartist" => song.artist.as_deref().map(cmp).unwrap_or(false),
@@ -1330,13 +1409,26 @@ fn tag_matches(song: &Song, tag: &str, val: &str, exact: bool) -> bool {
         "track" => song.track.map(|t| cmp(&t.to_string())).unwrap_or(false),
         "disc" => song.disc.map(|d| cmp(&d.to_string())).unwrap_or(false),
         "comment" => song.comment.as_deref().map(cmp).unwrap_or(false),
+        // Composer/performer come from OpenSubsonic metadata (displayComposer /
+        // contributors). Absent on plain-Subsonic servers -> None -> no match.
+        "composer" => cmp_multi(&song.composer),
+        "performer" => cmp_multi(&song.performer),
+        // MPD `any` spans EVERY tag - all the ones this Song models, not just
+        // title/artist/album (else `any "Techno"` misses a genre-only match).
         "any" => {
             cmp(&song.title)
                 || song.artist.as_deref().map(cmp).unwrap_or(false)
                 || song.album.as_deref().map(cmp).unwrap_or(false)
+                || song.genre.as_deref().map(cmp).unwrap_or(false)
+                || song.comment.as_deref().map(cmp).unwrap_or(false)
+                || song.year.map(|y| cmp(&y.to_string())).unwrap_or(false)
+                || song.track.map(|t| cmp(&t.to_string())).unwrap_or(false)
+                || song.disc.map(|d| cmp(&d.to_string())).unwrap_or(false)
+                || cmp_multi(&song.composer)
+                || cmp_multi(&song.performer)
         }
-        // Genuinely unmodeled tag (composer, performer, base, file,
-        // modified-since, or unknown): the Song carries no data to satisfy it, so
+        // Genuinely unmodeled tag (base, file, modified-since, or unknown): the
+        // Song carries no data to satisfy it, so
         // it matches NOTHING rather than passing all. tag_matches is shared by
         // find (list) and findadd (enqueue); passing-all would make findadd
         // over-add on an unsatisfiable constraint. MPD-correct: an unsatisfiable
@@ -1505,6 +1597,8 @@ mod tests {
             bitrate: None,
             comment: Some("vinyl rip".into()),
             user_rating: None,
+            composer: Some("Kalabrese".into()),
+            performer: Some("Itzhak Perlman, Yo-Yo Ma".into()),
         }
     }
 
@@ -1525,13 +1619,40 @@ mod tests {
     }
 
     #[test]
+    fn tag_matches_constrains_composer_and_performer() {
+        // Composer/performer come from OpenSubsonic metadata; exact + substring
+        // both work, and a non-matching value is rejected.
+        let s = sample_song();
+        assert!(tag_matches(&s, "composer", "Kalabrese", true));
+        assert!(tag_matches(&s, "composer", "kala", false));
+        assert!(!tag_matches(&s, "composer", "Bach", false));
+        assert!(tag_matches(&s, "performer", "Yo-Yo Ma", false));
+        assert!(!tag_matches(&s, "performer", "nobody", false));
+        // Multi-valued: an EXACT filter on one of several joined performers must
+        // match (real MPD treats performer/composer as multi-valued tags).
+        assert!(tag_matches(&s, "performer", "Yo-Yo Ma", true));
+        assert!(tag_matches(&s, "performer", "Itzhak Perlman", true));
+        // The whole joined string is not itself a single value, so it must not
+        // match as one under exact.
+        assert!(!tag_matches(&s, "performer", "Itzhak Perlman, Yo-Yo Ma", true));
+        // `any` spans composer and performer too, not just title/artist/album.
+        assert!(tag_matches(&s, "any", "Kalabrese", false));
+        assert!(tag_matches(&s, "any", "Yo-Yo Ma", true));
+        // Absent metadata (plain-Subsonic) -> no match, never passes-all.
+        let mut bare = sample_song();
+        bare.composer = None;
+        bare.performer = None;
+        assert!(!tag_matches(&bare, "composer", "anything", false));
+        assert!(!tag_matches(&bare, "performer", "anyone", false));
+    }
+
+    #[test]
     fn tag_matches_rejects_unmodeled_tag_rather_than_passing_all() {
-        // A genuinely unsupported tag (composer/performer/base/...) must match
+        // A genuinely unsupported tag (base/file/modified-since/...) must match
         // NOTHING so findadd never over-adds on an unsatisfiable constraint.
         let s = sample_song();
-        assert!(!tag_matches(&s, "composer", "anything", false));
-        assert!(!tag_matches(&s, "performer", "anyone", false));
         assert!(!tag_matches(&s, "modified-since", "2020", false));
+        assert!(!tag_matches(&s, "base", "anything", false));
     }
 
     #[test]

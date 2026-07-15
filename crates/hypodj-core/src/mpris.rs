@@ -417,6 +417,8 @@ mod tests {
             bitrate: None,
             comment: None,
             user_rating: None,
+            composer: None,
+            performer: None,
         }
     }
 
