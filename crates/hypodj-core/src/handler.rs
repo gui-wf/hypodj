@@ -39,7 +39,7 @@ use crate::fade::{
     run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
-use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
+use crate::model::{AlbumId, ArtistId, Favorite, Genre, QueueEntry, Song, SongId};
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
     RawTrigger, Resolved, Selector, ORIGIN_SLEEP, ORIGIN_WAKE, ORIGIN_WINDDOWN,
@@ -2285,9 +2285,11 @@ impl MpdHandler for HypodjHandler {
             }
             MpdCommand::ListPlaylistInfo(_) | MpdCommand::Load(_) => MpdResponse::ok(),
             MpdCommand::PlaylistAdd(name, uri) if name == "Starred" => {
-                // `playlistadd Starred song/<id>` -> star the song server-side.
-                match song_id_from_uri(&uri) {
-                    Some(id) => match self.client.star_song(&id).await {
+                // The uri PREFIX is the sole routing authority: `song/<id>` stars
+                // a song, `album/<id>` an album, `artist/<id>` an artist. Anything
+                // else fails LOUD rather than falling to the silent generic arm.
+                match Favorite::from_uri(&uri) {
+                    Some(fav) => match self.client.star(&fav).await {
                         Ok(()) => {
                             self.bust_star_caches();
                             self.notify_change();
@@ -2306,7 +2308,7 @@ impl MpdHandler for HypodjHandler {
                     st.last_starred_order.get(pos).cloned()
                 };
                 match target {
-                    Some(id) => match self.client.unstar_song(&id).await {
+                    Some(id) => match self.client.unstar(&Favorite::Song(id)).await {
                         Ok(()) => {
                             self.bust_star_caches();
                             self.notify_change();
@@ -2724,13 +2726,49 @@ impl HypodjHandler {
             }
 
             // ── Starred (feature 3) - NEVER cached (freshness) ──────────────
+            // The Starred dir mixes two browse subdirs (Albums / Artists, legal
+            // directory rows) with the starred-song `file:` rows. Albums/artists
+            // are DIRECTORY entities, so they surface as subdirs (ncmpcpp expands
+            // them on add), never as fake song rows in a stored playlist.
             Some("Starred") => match self.client.starred_songs().await {
                 Ok(songs) => {
                     {
                         let mut st = self.state.lock().unwrap();
                         st.last_starred_order = songs.iter().map(|s| s.id.clone()).collect();
                     }
-                    song_rows(&songs)
+                    let mut pairs = vec![
+                        ("directory".to_string(), "Starred/Albums".to_string()),
+                        ("directory".to_string(), "Starred/Artists".to_string()),
+                    ];
+                    for s in &songs {
+                        pairs.extend(browse_song_pairs(s));
+                    }
+                    MpdResponse::Pairs(pairs)
+                }
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
+            },
+            // Starred albums/artists as browse subdirs. Each row is a real
+            // `album/<id>` / `artist/<id>` directory, so adding it reuses the
+            // existing album/artist expansion and becomes directly playable.
+            Some("Starred/Albums") => match self.client.starred().await {
+                Ok(starred) => {
+                    let mut pairs = Vec::new();
+                    for al in &starred.albums {
+                        pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
+                        pairs.push(("Album".to_string(), al.name.clone()));
+                    }
+                    MpdResponse::Pairs(pairs)
+                }
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
+            },
+            Some("Starred/Artists") => match self.client.starred().await {
+                Ok(starred) => {
+                    let mut pairs = Vec::new();
+                    for ar in &starred.artists {
+                        pairs.push(("directory".to_string(), format!("artist/{}", ar.id.0)));
+                        pairs.push(("Artist".to_string(), ar.name.clone()));
+                    }
+                    MpdResponse::Pairs(pairs)
                 }
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
             },
