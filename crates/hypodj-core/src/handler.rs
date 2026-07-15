@@ -157,11 +157,17 @@ impl State {
 
     /// Set the baseline AND live gain together (a manual volume change) and clear
     /// the `fading` switch: manual wins, so `reported_volume()` returns exactly
-    /// `v` afterward.
+    /// `v` afterward. Also clears `pending_pause`: a manual volume commit
+    /// (setvol/mpris/clear/stop/fade-terminal) reconciles the deck to a concrete
+    /// baseline, so it must never leave the reported state stuck at Paused. In
+    /// particular, when a `setvol` supersedes an in-flight PauseOut fade before its
+    /// Terminal::Pause runs (mpv still Playing), clearing here is what keeps the
+    /// reported state from lying Paused forever while audio keeps playing.
     fn set_manual_volume(&mut self, v: u8) {
         self.target_volume = v;
         self.live_gain_db = mpv_volume_to_db(v as f64);
         self.fading = false;
+        self.pending_pause = false;
     }
 }
 
@@ -1468,8 +1474,13 @@ impl HypodjHandler {
                     // step under the 3 dB cap, so FadeSpec::new never rejects it as
                     // StepTooLarge and it is never a hard cut.
                     let eff_dur = if clamp_dur_up {
+                        // Use the SAME per-step interval FadeSpec::new will use
+                        // (tick.max(min_slew)); passing bare min_slew when
+                        // tick > min_slew under-counts the steps and the clamp
+                        // fails to prevent the StepTooLarge rejection.
                         let min_slew = Duration::from_millis(cfg.min_slew_ms);
-                        dur.max(min_deliberate_dur(from_db, target, min_slew, synth_floor))
+                        let step_interval = tick.max(min_slew);
+                        dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor))
                     } else {
                         dur
                     };
@@ -1995,7 +2006,12 @@ impl HypodjHandler {
         };
         match next {
             Some(idx) => {
-                let _ = self.play_index(idx).await;
+                // A natural EOF advance is NOT a user gesture: it must NOT cancel an
+                // in-flight fade or snap mpv's gain back to the baseline. A slow ramp
+                // (winddown/sleep) has to survive across the track boundary (mpv
+                // `volume` persists across loadfile replace), so play WITHOUT the
+                // resync that play_index performs for fresh-play gestures.
+                let _ = self.play_index_inner(idx, false).await;
             }
             None => {
                 let mut st = self.state.lock().unwrap();
@@ -4625,6 +4641,34 @@ mod tests {
         assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0, "fresh play not silent");
     }
 
+    // A natural EOF advance must NOT cancel an in-flight fade or snap mpv's gain back
+    // to the baseline: a slow winddown/sleep ramp has to continue across the track
+    // boundary (it is not a user gesture).
+    #[tokio::test(start_paused = true)]
+    async fn eof_advance_preserves_in_flight_fade() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // Arm a wind-down (ToFloor) ramp; let it drop the gain a bit.
+        h.start_fade(fade_args(FadeKind::ToFloor, 30)).await.unwrap();
+        pump(250, 6).await;
+        assert!(h.fade_active().await, "winddown running");
+        let mid = h.live_gain_db();
+        assert!(mid < -1.0, "gain has started descending (was {mid})");
+
+        // Natural EOF advance to the next track: the fade must survive, not be wiped
+        // and the gain re-asserted to the baseline.
+        h.advance_on_eof().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "advanced to next track");
+        assert!(h.fade_active().await, "winddown must survive the track boundary");
+        assert!(
+            h.live_gain_db() <= mid + 1e-6,
+            "gain must not snap back to the baseline at EOF"
+        );
+    }
+
     // C2: a manual setvol against a running fade must leave NO surviving fade task
     // and report EXACTLY the manual value - the cancel + the state mutation happen
     // atomically under the slot lock, so there is no window a concurrent fade
@@ -4647,6 +4691,30 @@ mod tests {
         assert!(!st.fading, "fading switch cleared");
         assert_eq!(st.target_volume, 42);
         assert_eq!(st.reported_volume(), 42);
+    }
+
+    // A setvol that supersedes an in-flight PauseOut fade (before its Terminal::Pause
+    // freezes mpv) must clear the pending-pause intent: otherwise reported_play_state
+    // lies Paused forever while mpv keeps playing at the new volume.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_during_pause_fade_clears_pending_pause() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.set_pause(Some(true)).await.unwrap();
+        pump(20, 2).await;
+        assert!(h.fade_active().await, "pause fade still running");
+        assert_eq!(h.player.state(), PlayState::Playing, "mpv not frozen yet");
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "pending pause");
+
+        // setvol supersedes the pause fade before it froze mpv.
+        h.handle(MpdCommand::SetVol(80)).await;
+        assert!(!h.fade_active().await, "no surviving fade");
+        assert_eq!(h.player.state(), PlayState::Playing, "mpv still playing");
+        // The deck must report Playing, not stuck Paused, since audio is audible.
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 80);
     }
 
     // C2: even when a `fade` from a second logical caller races a setvol, the end

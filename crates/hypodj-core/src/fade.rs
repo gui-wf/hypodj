@@ -74,12 +74,17 @@ pub const DELIBERATE_STEP_CAP_DB: f64 = 3.0;
 /// `from_db -> target` at `min_slew` per step stays at or under the 3 dB/step
 /// startle cap - i.e. the smallest `dur` for which [`FadeSpec::new`] will NOT
 /// return [`FadeError::StepTooLarge`]. Used by the pause/resume path to clamp a
-/// too-short requested duration UP (never a hard cut). `min_slew` is the per-step
-/// interval floor; `synth_floor_db` resolves a `Silence` target to its ramp end.
+/// too-short requested duration UP (never a hard cut). `step_interval` MUST be the
+/// SAME per-step interval [`FadeSpec::new`] will use - i.e. `tick.max(min_slew)`,
+/// NOT `min_slew` alone. Passing the bare `min_slew` when `tick > min_slew` yields
+/// a duration whose `ceil(dur / t_eff)` step count is too small, so the deliberate
+/// ramp exceeds the 3 dB/step cap and `FadeSpec::new` rejects it as `StepTooLarge`
+/// - the exact rejection this clamp exists to prevent. `synth_floor_db` resolves a
+/// `Silence` target to its ramp end.
 pub fn min_deliberate_dur(
     from_db: f64,
     target: FadeTarget,
-    min_slew: Duration,
+    step_interval: Duration,
     synth_floor_db: f64,
 ) -> Duration {
     let t_db = match target {
@@ -90,7 +95,7 @@ pub fn min_deliberate_dur(
     // ceil(range / cap) steps keeps every per-step delta <= cap; at least one.
     let steps = (range / DELIBERATE_STEP_CAP_DB).ceil().max(1.0);
     let steps = steps.min(MAX_SCHEDULE_STEPS as f64) as u32;
-    min_slew.saturating_mul(steps)
+    step_interval.saturating_mul(steps)
 }
 
 /// Hard cap on the number of scheduled steps. Belt-and-suspenders against a
@@ -725,6 +730,28 @@ mod tests {
             neg,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn min_deliberate_dur_survives_tick_gt_min_slew() {
+        // Regression: when tick_ms > min_slew_ms, FadeSpec steps at t_eff = tick,
+        // so the clamp must size the duration off tick, not min_slew. A pause from
+        // vol 100 (0 dB) to Silence with tick 500ms / min_slew 250ms must NOT get
+        // rejected as StepTooLarge.
+        let min_slew = Duration::from_millis(250);
+        let tick = Duration::from_millis(500);
+        let step_interval = tick.max(min_slew);
+        let dur = min_deliberate_dur(0.0, FadeTarget::Silence, step_interval, SYNTH_FLOOR_DB);
+        let b = StartleBounds { sub_jnd: false, ..bounds(false) };
+        let spec = FadeSpec::new(0.0, FadeTarget::Silence, dur, tick, Curve::DbLinear, b)
+            .expect("deliberate pause fade must build, not reject as StepTooLarge");
+        // Every ramp step stays under the 3 dB deliberate cap.
+        let steps = &spec.schedule.steps;
+        for w in steps.windows(2) {
+            if w[1].gain_db.is_finite() {
+                assert!((w[0].gain_db - w[1].gain_db).abs() <= DELIBERATE_STEP_CAP_DB + 1e-9);
+            }
+        }
     }
 
     #[test]
