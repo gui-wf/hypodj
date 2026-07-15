@@ -70,12 +70,15 @@ Parity is done; the project is now growing hypodj from a protocol proxy into a
 music server that understands human intent. The design is a **deterministic
 capability core + a typed Plan-IR trigger/executor** over stable primitives, with
 an optional natural-language translator that only ever emits a *validated* plan,
-and embeddings reserved for content selection. Phases: **P0 fade primitive**
-(cancellable dB-domain volume envelope - done) -> **P1 event substrate** ->
-**P2 Plan IR + executor + DSL** -> **P3 natural-language front-end** ->
-**P4 mood/energy selection**. Post-parity MPD additions already landed:
-`findadd`/`searchadd`, `count`, filtered `list <tag> <filter>`, composer/performer
-tags, and a `fade` command.
+and embeddings reserved for content selection. Phases (all now merged):
+**P0 fade primitive** -> **P1 event substrate** -> **P2 Plan IR + executor + DSL**
+(`plan add ...`) -> **P3 natural-language front-end** (`nl "..."`, rules-first with
+an optional local model, echo-before-arm) -> **P4 mood/energy selection** (a local
+heuristic + a FeatureStore seam for offline features). Built on top: sleep /
+wind-down / wake commands, a graceful smooth-restart (fade-out on SIGTERM,
+wake-ramp-in on restart), startle-safe pause/resume, and a first-class favorites
+model (songs / albums / artists). Post-parity MPD additions: `findadd`/`searchadd`,
+`count`, filtered `list <tag> <filter>`, composer/performer tags, and `fade`.
 
 ## Phase 3 feature status (honest)
 
@@ -86,8 +89,10 @@ loop (the in-code default bind is `6601`; the live deployment binds `6600`):
   off the player event loop.
 - **cover art** - `albumart`/`readpicture` -> getCoverArt, chunked to
   `binarylimit`, cached.
-- **star / love** - the synthetic `Starred` playlist: `playlistadd Starred
-  song/<id>` stars, position-based `playlistdelete` unstars.
+- **star / love** - a first-class favorites model over the Subsonic star API:
+  `playlistadd Starred song/<id>` stars (position-based `playlistdelete` unstars);
+  albums and artists are also favoritable and surface as `Starred/Albums` +
+  `Starred/Artists` browse dirs.
 - **rating** - WIRED via the MPD `sticker` command (ncmpcpp's rating path):
   `sticker set song song/<id> rating <0-5>` -> Subsonic `setRating`;
   `sticker get`/`list` read back `userRating` as `sticker: rating=<n>`;
@@ -337,7 +342,7 @@ ncmpcpp -h 127.0.0.1 -p 6601
 
 Set `services.hypodj.audio = "device"` only when you actually want hypodj to own
 audio output; the default `"null"` keeps it headless so it never grabs your
-speakers while mopidy runs.
+speakers (it stays a headless MPD server by default).
 
 ## Layout
 
