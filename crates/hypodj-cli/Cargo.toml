@@ -9,8 +9,9 @@ license.workspace = true
 name = "hjq"
 path = "src/main.rs"
 
-# Model-free by construction: std::net + thiserror only. NO dependency on
-# hypodj-nl, hypodj-core, or any model, so the default workspace build stays
-# model-free. NO async, NO TUI, NO JSON.
+# Depends on the shared hypodj-client for the one client implementation (MpdConn,
+# nl handshake seams, config, and the NowPlaying/queue parsing). This crate keeps
+# only the text card/queue formatters and the argv/handshake glue. Model-free by
+# construction: no dependency on hypodj-nl, hypodj-core, or any model.
 [dependencies]
-thiserror.workspace = true
+hypodj-client = { path = "../hypodj-client" }

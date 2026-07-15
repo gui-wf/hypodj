@@ -1,38 +1,9 @@
-//! Pure now-playing + queue rendering from parsed pairs. The server emits only a
-//! known subset of keys - there is NO `elapsed` and NO `time` key, so we NEVER
-//! render elapsed. Everything is Option-typed; a stopped/empty deck renders a
+//! Text formatters for the hjq CLI, expressed on top of the shared parse layer in
+//! `hypodj_client::model`. This crate owns ONLY the text card/queue rendering; the
+//! NowPlaying + queue parsing lives in the client. A stopped/empty deck renders a
 //! friendly "nothing playing".
 
-/// The now-playing state assembled from `status` + `currentsong` pairs. Fully
-/// Option-typed - the server may omit any field.
-#[derive(Debug, Default, PartialEq)]
-pub struct NowPlaying {
-    pub state: Option<String>, // "play" / "pause" / "stop"
-    pub volume: Option<i32>,   // -1 or absent => unknown, hidden
-    pub playlistlength: Option<usize>,
-    pub song: Option<usize>,      // 0-based index of current
-    pub duration: Option<f64>,    // library songs only
-    pub title: Option<String>,
-    pub artist: Option<String>,
-    pub album: Option<String>,
-}
-
-fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
-}
-
-pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) -> NowPlaying {
-    NowPlaying {
-        state: find(status, "state").map(str::to_string),
-        volume: find(status, "volume").and_then(|v| v.parse::<i32>().ok()),
-        playlistlength: find(status, "playlistlength").and_then(|v| v.parse().ok()),
-        song: find(status, "song").and_then(|v| v.parse().ok()),
-        duration: find(status, "duration").and_then(|v| v.parse().ok()),
-        title: find(current, "Title").map(str::to_string),
-        artist: find(current, "Artist").map(str::to_string),
-        album: find(current, "Album").map(str::to_string),
-    }
-}
+use hypodj_client::model::{parse_queue, NowPlaying};
 
 /// Render the now-playing card as plain text (a couple of lines). A stopped or
 /// empty deck is "nothing playing" - never a leftover title/artist.
@@ -85,66 +56,40 @@ fn fmt_dur(secs: f64) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
-/// Render the queue from repeated `playlistinfo` song_pairs blocks. Each block
-/// starts at a `file` key; group by that boundary, print "<Pos+1>. <Title> -
-/// <Artist>". Empty -> "queue is empty".
+/// Render the queue from `playlistinfo` pairs, iterating the shared structured
+/// parse (`parse_queue`) so the CLI and TUI share one queue model. Prints
+/// "<Pos+1>. <Title> - <Artist>" per item. Empty -> "queue is empty".
 pub fn render_queue(pairs: &[(String, String)]) -> String {
-    let blocks = group_blocks(pairs);
-    if blocks.is_empty() {
+    let items = parse_queue(pairs);
+    if items.is_empty() {
         return "queue is empty".to_string();
     }
-    let mut lines = Vec::new();
-    for (i, b) in blocks.iter().enumerate() {
-        let pos = find(b, "Pos")
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|p| p.saturating_add(1))
-            .unwrap_or(i + 1);
-        let title = find(b, "Title").unwrap_or("(unknown)");
-        let artist = find(b, "Artist");
-        match artist {
-            Some(a) => lines.push(format!("{pos}. {title} - {a}")),
-            None => lines.push(format!("{pos}. {title}")),
-        }
-    }
-    lines.join("\n")
-}
-
-/// Split a flat pair list into per-song blocks, each beginning at a `file` key.
-fn group_blocks(pairs: &[(String, String)]) -> Vec<Vec<(String, String)>> {
-    let mut blocks: Vec<Vec<(String, String)>> = Vec::new();
-    for (k, v) in pairs {
-        if k == "file" {
-            blocks.push(Vec::new());
-        }
-        if let Some(cur) = blocks.last_mut() {
-            cur.push((k.clone(), v.clone()));
-        }
-    }
-    blocks
+    items
+        .iter()
+        .map(|it| match &it.artist {
+            Some(a) => format!("{}. {} - {}", it.pos + 1, it.title, a),
+            None => format!("{}. {}", it.pos + 1, it.title),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hypodj_client::model::now_playing;
 
     fn p(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     }
 
     #[test]
-    fn nowplaying_playing() {
-        // Canned status WITHOUT elapsed/time (the server never emits them).
+    fn card_playing() {
         let status = p(&[
             ("volume", "70"),
-            ("repeat", "0"),
-            ("random", "0"),
-            ("single", "0"),
-            ("consume", "0"),
-            ("playlist", "5"),
             ("playlistlength", "12"),
             ("state", "play"),
             ("song", "2"),
-            ("songid", "42"),
             ("duration", "215.000"),
         ]);
         let current = p(&[
@@ -153,38 +98,31 @@ mod tests {
             ("Artist", "Miles Davis"),
             ("Album", "Kind of Blue"),
             ("Pos", "2"),
-            ("Id", "42"),
         ]);
-        let np = now_playing(&status, &current);
-        let card = render_card(&np);
+        let card = render_card(&now_playing(&status, &current));
         assert!(card.contains("Blue in Green"));
         assert!(card.contains("Miles Davis - Kind of Blue"));
         assert!(card.contains("playing"));
         assert!(card.contains("vol 70%"));
-        assert!(card.contains("3 of 12")); // song 2 (0-based) -> 3 of 12
-        assert!(card.contains("3:35")); // 215s
-        // No elapsed rendered (there is no elapsed key at all).
+        assert!(card.contains("3 of 12"));
+        assert!(card.contains("3:35"));
         assert!(!card.to_lowercase().contains("elapsed"));
     }
 
     #[test]
-    fn nowplaying_stopped() {
+    fn card_stopped() {
         let status = p(&[("volume", "50"), ("playlistlength", "3"), ("state", "stop")]);
-        let np = now_playing(&status, &[]);
-        assert_eq!(render_card(&np), "nothing playing");
+        assert_eq!(render_card(&now_playing(&status, &[])), "nothing playing");
     }
 
     #[test]
-    fn nowplaying_empty_currentsong() {
-        // state=play but currentsong returned bare OK (no pairs) -> nothing playing,
-        // no leftover title.
+    fn card_empty_currentsong() {
         let status = p(&[("volume", "50"), ("playlistlength", "0"), ("state", "play")]);
-        let np = now_playing(&status, &[]);
-        assert_eq!(render_card(&np), "nothing playing");
+        assert_eq!(render_card(&now_playing(&status, &[])), "nothing playing");
     }
 
     #[test]
-    fn nowplaying_hides_unknown_volume() {
+    fn card_hides_unknown_volume() {
         let status = p(&[("volume", "-1"), ("playlistlength", "1"), ("state", "play"), ("song", "0")]);
         let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
         let card = render_card(&now_playing(&status, &current));
@@ -199,15 +137,12 @@ mod tests {
             ("Title", "One"),
             ("Artist", "A"),
             ("Pos", "0"),
-            ("Id", "1"),
             ("file", "song/2"),
             ("Title", "Two"),
             ("Artist", "B"),
             ("Pos", "1"),
-            ("Id", "2"),
         ]);
-        let out = render_queue(&pairs);
-        assert_eq!(out, "1. One - A\n2. Two - B");
+        assert_eq!(render_queue(&pairs), "1. One - A\n2. Two - B");
     }
 
     #[test]

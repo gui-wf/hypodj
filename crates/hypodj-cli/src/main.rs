@@ -3,17 +3,14 @@
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
 
-mod config;
-mod mpd;
-mod nl;
 mod render;
-mod route;
 
 use std::io::{BufRead, Write};
 
-use config::Env;
-use mpd::{MpdConn, MpdError};
-use route::Action;
+use hypodj_client::config::{self, Env};
+use hypodj_client::mpd::{MpdConn, MpdError};
+use hypodj_client::route::{self, Action};
+use hypodj_client::{model, nl};
 
 const HELP: &str = "\
 hjq - hypodj jukebox
@@ -132,7 +129,7 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
 fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
     let status = conn.command("status")?;
     let current = conn.command("currentsong")?;
-    let np = render::now_playing(&status, &current);
+    let np = model::now_playing(&status, &current);
     println!("{}", render::render_card(&np));
     Ok(())
 }

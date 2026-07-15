@@ -1,0 +1,13 @@
+[package]
+name = "hypodj-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The single blocking hypodj client, shared by hjq (CLI) and hypodj-tui. Model-free
+# by construction: std::net + thiserror only. NO dependency on hypodj-nl,
+# hypodj-core, or any model, so the default workspace build stays model-free.
+# NO async, NO TUI, NO JSON.
+[dependencies]
+thiserror.workspace = true

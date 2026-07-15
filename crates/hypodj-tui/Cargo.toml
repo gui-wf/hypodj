@@ -1,0 +1,19 @@
+[package]
+name = "hypodj-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hypodj-tui"
+path = "src/main.rs"
+
+# The interactive jukebox TUI. IO (crossterm/ratatui) stays at the edges (main.rs
+# + ui.rs); the pure, testable core lives in state.rs. Model-free: builds only on
+# hypodj-client, never on hypodj-nl or hypodj-core.
+[dependencies]
+hypodj-client = { path = "../hypodj-client" }
+ratatui.workspace = true
+crossterm.workspace = true
+thiserror.workspace = true
