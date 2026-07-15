@@ -776,6 +776,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypodj-cli"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "hypodj-core"
 version = "0.1.0"
 dependencies = [

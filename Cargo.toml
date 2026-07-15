@@ -4,6 +4,7 @@ members = [
     "crates/hypodj-core",
     "crates/hypodj-nl",
     "crates/hypodj-daemon",
+    "crates/hypodj-cli",
 ]
 
 [workspace.package]

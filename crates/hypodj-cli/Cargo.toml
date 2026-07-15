@@ -1,0 +1,16 @@
+[package]
+name = "hypodj-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hjq"
+path = "src/main.rs"
+
+# Model-free by construction: std::net + thiserror only. NO dependency on
+# hypodj-nl, hypodj-core, or any model, so the default workspace build stays
+# model-free. NO async, NO TUI, NO JSON.
+[dependencies]
+thiserror.workspace = true
