@@ -1189,6 +1189,12 @@ impl HypodjHandler {
         // (< PAGE) signals exhaustion.
         const PAGE: i32 = 200;
         let mut songs: Vec<Song> = Vec::new();
+        // De-dup by song id ACROSS pages. A backend that ignores `song_offset`
+        // returns the same page every request; without dedup `count` would sum
+        // those repeats into a fabricated total (500 pages * 200 = 100000). Dedup
+        // also absorbs a row that overlaps a page boundary on a well-behaved
+        // server. `seen` is the source of truth for the tally.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut offset: i32 = 0;
         let mut page = 0;
         loop {
@@ -1198,9 +1204,17 @@ impl HypodjHandler {
                 .await
                 .map_err(|e| e.to_string())?;
             let got = hits.songs.len();
-            songs.extend(hits.songs);
+            let mut fresh = 0usize;
+            for s in hits.songs {
+                if seen.insert(s.id.0.clone()) {
+                    songs.push(s);
+                    fresh += 1;
+                }
+            }
             page += 1;
-            if (got as i32) < PAGE {
+            // Short page -> exhausted. A full page that added NOTHING new means the
+            // backend is repeating (ignoring offset) -> stop rather than spin.
+            if (got as i32) < PAGE || fresh == 0 {
                 break;
             }
             if page >= max_pages {
@@ -1380,7 +1394,7 @@ fn tag_matches(song: &Song, tag: &str, val: &str, exact: bool) -> bool {
     // exact `find performer "Yo-Yo Ma"` never equals "Itzhak Perlman, Yo-Yo Ma".
     let cmp_multi = |field: &Option<String>| -> bool {
         match field {
-            Some(s) => s.split(", ").any(cmp),
+            Some(s) => s.split(", ").filter(|p| !p.is_empty()).any(cmp),
             None => false,
         }
     };
@@ -1399,11 +1413,17 @@ fn tag_matches(song: &Song, tag: &str, val: &str, exact: bool) -> bool {
         // contributors). Absent on plain-Subsonic servers -> None -> no match.
         "composer" => cmp_multi(&song.composer),
         "performer" => cmp_multi(&song.performer),
-        // MPD `any` spans every tag, including composer/performer.
+        // MPD `any` spans EVERY tag - all the ones this Song models, not just
+        // title/artist/album (else `any "Techno"` misses a genre-only match).
         "any" => {
             cmp(&song.title)
                 || song.artist.as_deref().map(cmp).unwrap_or(false)
                 || song.album.as_deref().map(cmp).unwrap_or(false)
+                || song.genre.as_deref().map(cmp).unwrap_or(false)
+                || song.comment.as_deref().map(cmp).unwrap_or(false)
+                || song.year.map(|y| cmp(&y.to_string())).unwrap_or(false)
+                || song.track.map(|t| cmp(&t.to_string())).unwrap_or(false)
+                || song.disc.map(|d| cmp(&d.to_string())).unwrap_or(false)
                 || cmp_multi(&song.composer)
                 || cmp_multi(&song.performer)
         }

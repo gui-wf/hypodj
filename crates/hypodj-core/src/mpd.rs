@@ -340,7 +340,9 @@ pub fn parse(line: &str) -> MpdCommand {
         // followed by `group <tag>`. We do not tally per-group (that would need
         // one search3 per group value), so a trailing `group <tag>` is dropped
         // and the plain overall count is returned - honest and cheap.
-        "count" => MpdCommand::Count(parse_filter(&strip_group(&args))),
+        // count shares the list filter parser so it honors the modern
+        // `(tag == "value")` expression form and the same `group` handling.
+        "count" => MpdCommand::Count(parse_list_filter(&args)),
         "list" => {
             let tag = args.first().cloned().unwrap_or_default().to_lowercase();
             let filter = parse_list_filter(&args[args.len().min(1)..]);
@@ -483,6 +485,31 @@ mod parse_tests {
         match parse("count Artist group") {
             MpdCommand::Count(pairs) => {
                 assert_eq!(pairs, vec![("artist".to_string(), "group".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_parses_expression_form() {
+        // count shares the list filter parser, so the modern `(tag == "value")`
+        // expression works (previously swallowed as a bare `any` value).
+        match parse(r#"count "(Artist == \"Tosca\")""#) {
+            MpdCommand::Count(pairs) => {
+                assert_eq!(pairs, vec![("artist".to_string(), "Tosca".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_strips_group_after_a_bare_value() {
+        // A bare (any) value before `group <tag>` used to desync the even-index
+        // strip and leak the clause. `group` followed by a known tag is the
+        // clause start regardless of position.
+        match parse("count foo group album") {
+            MpdCommand::Count(pairs) => {
+                assert_eq!(pairs, vec![("any".to_string(), "foo".to_string())]);
             }
             other => panic!("got {other:?}"),
         }
@@ -683,10 +710,19 @@ fn parse_filter(args: &[String]) -> Vec<(String, String)> {
 /// clause only when it lands on a tag slot (even index), so a filter VALUE that
 /// is literally "group" (odd index) is preserved.
 fn strip_group(args: &[String]) -> Vec<String> {
-    let cut = args
-        .iter()
-        .enumerate()
-        .position(|(i, t)| i % 2 == 0 && t.eq_ignore_ascii_case("group"));
+    // MPD grouping (`... group TAG [group TAG]...`) always TRAILS the filter and
+    // each `group` is immediately followed by a tag name. Recognize the clause by
+    // that shape - a `group` token followed by a known filter tag - rather than by
+    // token parity, which desyncs whenever the filter contains a bare (tag-less)
+    // `any` value. A filter VALUE literally "group" is not followed by a tag, so
+    // it is kept.
+    let cut = args.iter().enumerate().position(|(i, t)| {
+        t.eq_ignore_ascii_case("group")
+            && args
+                .get(i + 1)
+                .map(|n| FILTER_TAGS.contains(&n.to_lowercase().as_str()))
+                .unwrap_or(false)
+    });
     match cut {
         Some(pos) => args[..pos].to_vec(),
         None => args.to_vec(),
@@ -707,26 +743,16 @@ fn strip_group(args: &[String]) -> Vec<String> {
 /// everything from `group` onward is dropped rather than mis-parsed into a bogus
 /// `(any, group)` / `(any, albumartist)` filter that would return empty.
 fn parse_list_filter(rest: &[String]) -> Vec<(String, String)> {
-    // Drop a trailing `group <tag>` clause (we do not yet honor grouping, but we
-    // must not let it corrupt the filter). MPD grouping trails the `TAG VALUE`
-    // filter pairs, so `group` only begins the clause when it lands on a tag slot
-    // (even index); a filter VALUE that is literally "group" sits on an odd index
-    // and must be kept.
-    let cut = rest
-        .iter()
-        .enumerate()
-        .position(|(i, t)| i % 2 == 0 && t.eq_ignore_ascii_case("group"));
-    let rest = match cut {
-        Some(pos) => &rest[..pos],
-        None => rest,
-    };
+    // Drop a trailing `group <tag>` clause before parsing the filter (shared with
+    // count via strip_group).
+    let rest = strip_group(rest);
     // Modern single-arg expression form: `(tag == "value")`.
     if rest.len() == 1 && rest[0].contains("==") {
         if let Some(pair) = parse_filter_expression(&rest[0]) {
             return vec![pair];
         }
     }
-    parse_filter(rest)
+    parse_filter(&rest)
 }
 
 /// Parse a single MPD filter expression `(tag == "value")` (also tolerating

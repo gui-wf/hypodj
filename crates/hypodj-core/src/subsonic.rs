@@ -466,6 +466,7 @@ fn map_song(c: data::Child) -> Song {
         composer: c
             .display_composer
             .clone()
+            .filter(|s| !s.trim().is_empty())
             .or_else(|| contributors_by_role(&c.contributors, "composer")),
         // Performer: no display field exists; derive from the "performer"-role
         // contributors joined by artist name (OpenSubsonic only).
@@ -485,7 +486,8 @@ fn contributors_by_role(
         .as_ref()?
         .iter()
         .filter(|c| c.role.eq_ignore_ascii_case(role))
-        .map(|c| c.artist.name.as_str())
+        .map(|c| c.artist.name.trim())
+        .filter(|n| !n.is_empty())
         .collect();
     if names.is_empty() {
         None
@@ -666,6 +668,29 @@ mod tests {
         let s = map_song(wire);
         assert_eq!(s.composer.as_deref(), Some("Chopin"));
         assert_eq!(s.performer, None);
+    }
+
+    #[test]
+    fn map_song_empty_display_composer_falls_back_and_never_yields_empty() {
+        // An EMPTY displayComposer must not short-circuit the contributor
+        // fallback (else the real composer is lost and composer=Some("") would
+        // spuriously match `find composer ""`).
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-9", "title": "Prelude", "isDir": false,
+                 "displayComposer": "",
+                 "contributors": [
+                   { "role": "composer", "artist": { "id": "ar-y", "name": "Bach" } }
+                 ] }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.composer.as_deref(), Some("Bach"));
+        // No contributors and empty display -> None, never Some("").
+        let bare: data::Child = serde_json::from_str(
+            r#"{ "id": "so-10", "title": "X", "isDir": false, "displayComposer": "" }"#,
+        )
+        .unwrap();
+        assert_eq!(map_song(bare).composer, None);
     }
 
     #[test]
