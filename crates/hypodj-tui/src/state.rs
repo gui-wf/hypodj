@@ -3,14 +3,49 @@
 //! machine. NO terminal, NO network - crossterm KeyEvents come in, Intents go out,
 //! and the event loop in main.rs does all the IO.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use std::cell::Cell;
+
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use hypodj_client::model::{NowPlaying, QueueItem};
 use hypodj_client::nl::not_understood_hint;
 use hypodj_client::route::{route, Action};
 
-/// Volume step for +/- keys.
+/// Volume step for +/-/9/0 keys.
 const VOL_STEP: i32 = 5;
+
+/// Vim-style scrolloff: keep this many rows of context above/below the cursor.
+const SCROLLOFF: usize = 3;
+
+/// Scrub step in seconds for Space (forward) / Backspace (back).
+const SCRUB_STEP: i32 = 5;
+
+/// Derive the top visible row for a scrolloff viewport. Pure and testable: given
+/// the selected row `sel`, the queue length `n`, the viewport height `h`, and the
+/// previous offset `prev`, return the new top row.
+///
+/// - Top-edge exception: when `sel < so` the cursor reaches literal row 0 with no
+///   top buffer (falls out of the saturating_sub).
+/// - Bottom reachable: the offset is clamped to `n - h`, so the cursor advances
+///   into the bottom margin to reach the last row.
+/// - Mid-list the cursor pins (at `h-1-so` going down, `so` going up) while the
+///   list scrolls underneath.
+/// - In a tiny viewport `so` shrinks so the top/bottom margins never overlap.
+pub fn scroll_offset(sel: usize, n: usize, h: usize, prev: usize) -> usize {
+    if n == 0 || h == 0 {
+        return 0;
+    }
+    let so = SCROLLOFF.min(h.saturating_sub(1) / 2);
+    let max_off = n.saturating_sub(h);
+    let mut off = prev;
+    if sel < off + so {
+        off = sel.saturating_sub(so);
+    }
+    if sel + so >= off + h {
+        off = (sel + so + 1).saturating_sub(h);
+    }
+    off.min(max_off)
+}
 
 /// Which input surface has focus.
 #[derive(Debug, PartialEq, Eq)]
@@ -57,6 +92,11 @@ pub struct TuiState {
     pub now: NowPlaying,
     pub queue: Vec<QueueItem>,
     pub selected: usize,
+    /// Top visible queue row, derived in render (where the viewport height is
+    /// known) via [`scroll_offset`] and persisted here so scroll state survives
+    /// across frames. Interior-mutable so the render (which holds `&TuiState`)
+    /// can write the freshly computed offset back.
+    pub offset: Cell<usize>,
     pub mode: Mode,
     pub input: String,
     pub pending: Option<Pending>,
@@ -70,6 +110,7 @@ impl Default for TuiState {
             now: NowPlaying::default(),
             queue: Vec::new(),
             selected: 0,
+            offset: Cell::new(0),
             mode: Mode::Normal,
             input: String::new(),
             pending: None,
@@ -130,13 +171,36 @@ impl TuiState {
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Intent> {
+        // Readline-style CONTROL bindings first, so a plain `p`/`n`/`s` never
+        // shadows ctrl+p/ctrl+n (cursor) or ctrl+s (stop).
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return match key.code {
+                KeyCode::Char('n') => {
+                    self.move_selection(1);
+                    None
+                }
+                KeyCode::Char('p') => {
+                    self.move_selection(-1);
+                    None
+                }
+                KeyCode::Char('s') => Some(Intent::Command("stop".into())),
+                _ => None,
+            };
+        }
         match key.code {
-            KeyCode::Char(' ') => Some(Intent::Command("pause".into())),
-            KeyCode::Char('n') => Some(Intent::Command("next".into())),
-            KeyCode::Char('p') | KeyCode::Char('b') => Some(Intent::Command("previous".into())),
-            KeyCode::Char('s') => Some(Intent::Command("stop".into())),
-            KeyCode::Char('+') | KeyCode::Char('=') => self.volume_intent(VOL_STEP),
-            KeyCode::Char('-') | KeyCode::Char('_') => self.volume_intent(-VOL_STEP),
+            // Space/Backspace scrub the current track (relative seekcur).
+            KeyCode::Char(' ') => Some(Intent::Command(format!("seekcur +{SCRUB_STEP}"))),
+            KeyCode::Backspace => Some(Intent::Command(format!("seekcur -{SCRUB_STEP}"))),
+            KeyCode::Char('p') => Some(Intent::Command("pause".into())),
+            // `<`/`>` arrive as Char with SHIFT; the char value already encodes it.
+            KeyCode::Char('<') => Some(Intent::Command("previous".into())),
+            KeyCode::Char('>') => Some(Intent::Command("next".into())),
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('9') => {
+                self.volume_intent(VOL_STEP)
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('0') => {
+                self.volume_intent(-VOL_STEP)
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.move_selection(1);
                 None
@@ -145,6 +209,15 @@ impl TuiState {
                 self.move_selection(-1);
                 None
             }
+            KeyCode::Char('g') => {
+                self.go_top();
+                None
+            }
+            KeyCode::Char('G') => {
+                self.go_bottom();
+                None
+            }
+            KeyCode::Char('f') => self.favorite_selected(),
             KeyCode::Enter => self
                 .queue
                 .get(self.selected)
@@ -156,6 +229,37 @@ impl TuiState {
             }
             KeyCode::Char('q') => Some(Intent::Quit),
             _ => None,
+        }
+    }
+
+    /// Jump the selection to the top of the queue (no-op on an empty queue).
+    fn go_top(&mut self) {
+        if !self.queue.is_empty() {
+            self.selected = 0;
+        }
+    }
+
+    /// Jump the selection to the last row (no-op on an empty queue).
+    fn go_bottom(&mut self) {
+        if !self.queue.is_empty() {
+            self.selected = self.queue.len() - 1;
+        }
+    }
+
+    /// Favorite (star) the SELECTED row from its uri (`song/<id>`); mirrors Enter
+    /// in acting on the cursor, so any track can be starred without playing it. A
+    /// stream row (URL uri) is a friendly status; an empty queue is a silent
+    /// no-op.
+    fn favorite_selected(&mut self) -> Option<Intent> {
+        match self.queue.get(self.selected).and_then(|it| it.uri.as_deref()) {
+            Some(uri) if uri.starts_with("song/") => {
+                Some(Intent::Command(format!("playlistadd Starred {uri}")))
+            }
+            Some(_) => {
+                self.status_msg = Some("that row is a stream, can't favorite".into());
+                None
+            }
+            None => None,
         }
     }
 
@@ -272,7 +376,11 @@ mod tests {
     }
 
     fn item(pos: usize) -> QueueItem {
-        QueueItem { pos, title: format!("t{pos}"), artist: None }
+        QueueItem { pos, title: format!("t{pos}"), artist: None, uri: Some(format!("song/{pos}")) }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -292,12 +400,106 @@ mod tests {
     #[test]
     fn normal_transport_keys() {
         let mut s = TuiState::new();
-        assert_eq!(s.handle_key(ch(' ')), Some(Intent::Command("pause".into())));
-        assert_eq!(s.handle_key(ch('n')), Some(Intent::Command("next".into())));
-        assert_eq!(s.handle_key(ch('p')), Some(Intent::Command("previous".into())));
-        assert_eq!(s.handle_key(ch('b')), Some(Intent::Command("previous".into())));
-        assert_eq!(s.handle_key(ch('s')), Some(Intent::Command("stop".into())));
+        // Space/Backspace scrub (relative seekcur), NOT pause.
+        assert_eq!(s.handle_key(ch(' ')), Some(Intent::Command("seekcur +5".into())));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Backspace)),
+            Some(Intent::Command("seekcur -5".into()))
+        );
+        // Pause moved to bare `p`.
+        assert_eq!(s.handle_key(ch('p')), Some(Intent::Command("pause".into())));
+        // `<`/`>` are prev/next.
+        assert_eq!(s.handle_key(ch('<')), Some(Intent::Command("previous".into())));
+        assert_eq!(s.handle_key(ch('>')), Some(Intent::Command("next".into())));
+        // ctrl+s stops.
+        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("stop".into())));
         assert_eq!(s.handle_key(ch('q')), Some(Intent::Quit));
+        // Bare n/b/s are freed - no transport.
+        assert_eq!(s.handle_key(ch('n')), None);
+        assert_eq!(s.handle_key(ch('b')), None);
+        assert_eq!(s.handle_key(ch('s')), None);
+    }
+
+    #[test]
+    fn ctrl_np_move_cursor() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1), item(2)]);
+        assert_eq!(s.handle_key(ctrl('n')), None);
+        assert_eq!(s.selected, 1);
+        assert_eq!(s.handle_key(ctrl('n')), None);
+        assert_eq!(s.selected, 2);
+        assert_eq!(s.handle_key(ctrl('p')), None);
+        assert_eq!(s.selected, 1);
+    }
+
+    #[test]
+    fn g_and_shift_g_jump_and_empty_noop() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1), item(2), item(3)]);
+        s.selected = 2;
+        s.handle_key(ch('g'));
+        assert_eq!(s.selected, 0);
+        s.handle_key(ch('G'));
+        assert_eq!(s.selected, 3);
+        // Empty queue -> both no-op.
+        s.apply_snapshot(NowPlaying::default(), vec![]);
+        s.handle_key(ch('G'));
+        assert_eq!(s.selected, 0);
+        s.handle_key(ch('g'));
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn f_favorites_selected_row() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(6), item(7)]);
+        s.selected = 1;
+        assert_eq!(
+            s.handle_key(ch('f')),
+            Some(Intent::Command("playlistadd Starred song/7".into()))
+        );
+        // A stream row (URL uri) is a friendly status, not a command.
+        s.queue[1].uri = Some("http://stream.example/live".into());
+        assert_eq!(s.handle_key(ch('f')), None);
+        assert!(s.status_msg.is_some());
+        // No uri at all -> silent no-op.
+        s.queue[1].uri = None;
+        assert_eq!(s.handle_key(ch('f')), None);
+        // Empty queue -> no-op.
+        s.apply_snapshot(NowPlaying::default(), vec![]);
+        assert_eq!(s.handle_key(ch('f')), None);
+    }
+
+    #[test]
+    fn keys_9_and_0_step_volume() {
+        let mut s = TuiState::new();
+        s.now.volume = Some(70);
+        assert_eq!(s.handle_key(ch('9')), Some(Intent::Command("setvol 75".into())));
+        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("setvol 65".into())));
+        // Unknown volume -> no-op.
+        s.now.volume = None;
+        assert_eq!(s.handle_key(ch('9')), None);
+        assert_eq!(s.handle_key(ch('0')), None);
+    }
+
+    #[test]
+    fn scroll_offset_top_edge_and_bottom_and_tiny() {
+        // Top-edge exception: cursor within the top margin -> offset 0 (literal top).
+        assert_eq!(scroll_offset(1, 100, 10, 0), 0);
+        assert_eq!(scroll_offset(0, 100, 10, 0), 0);
+        // Moving down past the bottom margin scrolls: sel 6, h 10, so 3 -> pins at
+        // 6 + 3 + 1 - 10 = 0 still (6+3 < 10). sel 7 -> 7+3+1-10 = 1.
+        assert_eq!(scroll_offset(7, 100, 10, 0), 1);
+        // Mid-list the cursor pins at h-1-so while scrolling: sel 50 -> 50+3+1-10=44.
+        assert_eq!(scroll_offset(50, 100, 10, 40), 44);
+        // Bottom: last row reachable, offset clamps to n-h = 90.
+        assert_eq!(scroll_offset(99, 100, 10, 80), 90);
+        // Tiny viewport: so shrinks to (h-1)/2 so margins never overlap.
+        // h=2 -> so=0; sel 5 -> off = 5+0+1-2 = 4, clamped to n-h=8 -> 4.
+        assert_eq!(scroll_offset(5, 10, 2, 0), 4);
+        // Empty queue / zero height -> 0.
+        assert_eq!(scroll_offset(0, 0, 10, 5), 0);
+        assert_eq!(scroll_offset(3, 100, 0, 5), 0);
     }
 
     #[test]

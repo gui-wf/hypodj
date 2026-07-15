@@ -46,6 +46,10 @@ pub struct QueueItem {
     pub pos: usize,
     pub title: String,
     pub artist: Option<String>,
+    /// The row's uri from the block `file` key (`song/<id>` for a library track,
+    /// an `http(s)://...` URL for a raw stream). Needed to favorite the SELECTED
+    /// row (`playlistadd Starred <uri>`); a stream has no star surface.
+    pub uri: Option<String>,
 }
 
 /// Parse the flat `playlistinfo` pair list into structured queue items. Each entry
@@ -58,6 +62,7 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
             pos: find(b, "Pos").and_then(|v| v.parse::<usize>().ok()).unwrap_or(i),
             title: find(b, "Title").unwrap_or("(unknown)").to_string(),
             artist: find(b, "Artist").map(str::to_string),
+            uri: find(b, "file").map(str::to_string),
         })
         .collect()
 }
@@ -144,9 +149,20 @@ mod tests {
         ]);
         let q = parse_queue(&pairs);
         assert_eq!(q.len(), 2);
-        assert_eq!(q[0], QueueItem { pos: 0, title: "One".into(), artist: Some("A".into()) });
+        assert_eq!(
+            q[0],
+            QueueItem {
+                pos: 0,
+                title: "One".into(),
+                artist: Some("A".into()),
+                uri: Some("song/1".into()),
+            }
+        );
         // Second block has no Artist -> None.
-        assert_eq!(q[1], QueueItem { pos: 1, title: "Two".into(), artist: None });
+        assert_eq!(
+            q[1],
+            QueueItem { pos: 1, title: "Two".into(), artist: None, uri: Some("song/2".into()) }
+        );
     }
 
     #[test]

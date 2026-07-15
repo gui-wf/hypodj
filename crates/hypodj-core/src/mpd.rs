@@ -85,9 +85,12 @@ pub enum MpdCommand {
         id: u64,
         secs: f64,
     },
-    /// `seekcur <secs>` (absolute; leading `+`/`-` for relative is accepted but
-    /// treated as absolute for now).
-    SeekCur(f64),
+    /// `seekcur <secs>`. A leading `+`/`-` means RELATIVE to the live position
+    /// (`relative = true`, `secs` keeps its sign); a bare number is ABSOLUTE.
+    SeekCur {
+        secs: f64,
+        relative: bool,
+    },
     SetVol(u8),
     /// `getvol` - current volume.
     GetVol,
@@ -874,8 +877,16 @@ pub fn parse(line: &str) -> MpdCommand {
             (Some(id), Some(secs)) => MpdCommand::SeekId { id, secs },
             _ => MpdCommand::Unsupported(line.to_string()),
         },
-        "seekcur" => match arg(0).and_then(|s| s.trim_start_matches(['+', '-']).parse().ok()) {
-            Some(secs) => MpdCommand::SeekCur(secs),
+        "seekcur" => match arg(0) {
+            // f64 parses a leading `+`/`-` itself, so `secs` keeps its sign; the
+            // sign presence is what marks the seek relative.
+            Some(s) => match s.parse::<f64>() {
+                Ok(secs) => MpdCommand::SeekCur {
+                    secs,
+                    relative: s.starts_with('+') || s.starts_with('-'),
+                },
+                Err(_) => MpdCommand::Unsupported(line.to_string()),
+            },
             None => MpdCommand::Unsupported(line.to_string()),
         },
         "setvol" => match arg(0).and_then(|s| s.parse().ok()) {
@@ -1128,6 +1139,33 @@ mod parse_tests {
                     ("album".to_string(), "baz".to_string()),
                 ]
             ),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn seekcur_sign_marks_relative() {
+        // A bare number is absolute; a leading +/- is a RELATIVE seek that keeps
+        // its sign so the handler can offset from the live position.
+        match parse("seekcur 30") {
+            MpdCommand::SeekCur { secs, relative } => {
+                assert_eq!(secs, 30.0);
+                assert!(!relative);
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("seekcur +10") {
+            MpdCommand::SeekCur { secs, relative } => {
+                assert_eq!(secs, 10.0);
+                assert!(relative);
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("seekcur -10") {
+            MpdCommand::SeekCur { secs, relative } => {
+                assert_eq!(secs, -10.0);
+                assert!(relative);
+            }
             other => panic!("got {other:?}"),
         }
     }

@@ -3031,8 +3031,19 @@ impl MpdHandler for HypodjHandler {
                     None => MpdResponse::ok(),
                 }
             }
-            MpdCommand::Seek { secs, .. } | MpdCommand::SeekCur(secs) => {
-                match self.player.seek(secs).await {
+            MpdCommand::Seek { secs, .. } => match self.player.seek(secs).await {
+                Ok(()) => MpdResponse::ok(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
+            },
+            MpdCommand::SeekCur { secs, relative } => {
+                // A relative seek (`seekcur +/-N`) is computed against the live
+                // lockless position; the player itself only seeks ABSOLUTELY.
+                let target = if relative {
+                    (self.last_elapsed_secs() + secs).max(0.0)
+                } else {
+                    secs
+                };
+                match self.player.seek(target).await {
                     Ok(()) => MpdResponse::ok(),
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "seek", &e.to_string()),
                 }
@@ -4246,6 +4257,41 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    #[tokio::test]
+    async fn seekcur_relative_offsets_from_live_position() {
+        let Some((handler, mut events)) = handler_with_null_player() else { return };
+        // Live position is 30s (the lockless elapsed atomic).
+        handler.note_elapsed_ms(30_000);
+
+        // Relative back 10 -> absolute 20.
+        handler.handle(MpdCommand::SeekCur { secs: -10.0, relative: true }).await;
+        match events.recv().await {
+            Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 20.0),
+            other => panic!("got {other:?}"),
+        }
+
+        // Relative forward 10 -> absolute 40.
+        handler.handle(MpdCommand::SeekCur { secs: 10.0, relative: true }).await;
+        match events.recv().await {
+            Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 40.0),
+            other => panic!("got {other:?}"),
+        }
+
+        // Overshoot below 0 clamps to 0.
+        handler.handle(MpdCommand::SeekCur { secs: -100.0, relative: true }).await;
+        match events.recv().await {
+            Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 0.0),
+            other => panic!("got {other:?}"),
+        }
+
+        // An absolute seekcur ignores the live position.
+        handler.handle(MpdCommand::SeekCur { secs: 5.0, relative: false }).await;
+        match events.recv().await {
+            Some(PlayerEvent::TimePos { pos, .. }) => assert_eq!(pos, 5.0),
+            other => panic!("got {other:?}"),
+        }
     }
 
     // ── P3 NL flow: nl -> validate -> echo -> confirm -> arm ─────────────────

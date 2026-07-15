@@ -93,6 +93,13 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     );
     let mut ls = ListState::default();
     if !state.queue.is_empty() {
+        // Inner list height (area minus the top/bottom border rows).
+        let h = area.height.saturating_sub(2) as usize;
+        let off = crate::state::scroll_offset(state.selected, state.queue.len(), h, state.offset.get());
+        // Persist the derived offset for the next frame, then force it onto the
+        // ListState (ratatui would otherwise recompute its own scroll).
+        state.offset.set(off);
+        *ls.offset_mut() = off;
         ls.select(Some(state.selected));
     }
     f.render_stateful_widget(list, area, &mut ls);
@@ -102,7 +109,7 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
     let block = Block::default().borders(Borders::ALL);
     let lines: Vec<Line> = match state.mode {
         Mode::Normal => {
-            let hint = "keys: space=play/pause n=next p=prev s=stop +/-=vol j/k=move enter=play  /=command  q=quit";
+            let hint = "keys: space/bksp=scrub p=pause </>=prev/next ^s=stop j/k=move g/G=top/bot f=fav 9/0=vol enter=play  /=command  q=quit";
             match &state.status_msg {
                 Some(msg) => vec![Line::from(msg.replace('\n', " "))],
                 None => vec![Line::from(Span::styled(
