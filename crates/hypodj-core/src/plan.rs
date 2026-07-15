@@ -35,6 +35,13 @@ use crate::model::{AlbumId, SongId};
 /// acceptable bounded hole in an otherwise fully-bounded IR.
 pub const MAX_ENQUEUE: u32 = 100;
 
+/// Reserved plan origins for the convenience sleep/winddown/wake features. Each
+/// names the SINGLE active instance of its feature in the registry, so a
+/// `find_by_origin` lookup can replace/cancel it (single-instance control).
+pub const ORIGIN_SLEEP: &str = "sleep";
+pub const ORIGIN_WINDDOWN: &str = "winddown";
+pub const ORIGIN_WAKE: &str = "wake";
+
 fn one() -> u16 {
     1
 }
@@ -122,6 +129,11 @@ pub enum Action {
     /// INVARIANT: `Enqueue` is APPEND-ONLY + count-clamped - the only reason the
     /// string [`Selector`]s are an acceptable bounded hole.
     Enqueue { selector: Selector, count: u32 },
+    /// A gentle alarm: at the deadline, optionally enqueue `selector` (append-only,
+    /// count-clamped), force playback to start from silence, then ramp IN to the
+    /// saved comfort level. ONE atomic effect (enqueue -> silence -> play ->
+    /// WakeTo), so the ordering cannot be split across independent timers.
+    Wake { selector: Option<Selector>, count: u32 },
 }
 
 /// A local serde mirror of [`crate::handler::FadeIntent`], plus the duration the
@@ -136,6 +148,14 @@ pub enum FadeIntentIr {
     In { secs: f64 },
     /// Deliberate cue to an explicit level, committing `vol` on completion.
     To { target_db: f64, vol: u8, secs: f64 },
+    /// Sub-JND wind-down to the configured non-silence floor (`floor_level_db`),
+    /// leaving playback running. The floor is read from the LIVE config at spawn
+    /// (never baked into the raw plan), so `secs` is the only knob carried here.
+    ToFloor { secs: f64 },
+    /// Sub-JND wake ramp UP from silence to the SAVED comfort level, committing
+    /// `vol` as the restored baseline. Distinct from `In` (which targets the
+    /// comfort ceiling / vol 100): a wake restores the exact saved comfort volume.
+    WakeTo { target_db: f64, vol: u8, secs: f64 },
 }
 
 /// A bounded content selector for [`Action::Enqueue`]. Unimplemented variants
@@ -279,8 +299,27 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
                 secs: clamp_secs(*secs),
             })
         }
+        Action::Fade(FadeIntentIr::ToFloor { secs }) => {
+            Action::Fade(FadeIntentIr::ToFloor { secs: clamp_secs(*secs) })
+        }
+        Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
+            let td = if target_db.is_finite() {
+                target_db.clamp(bounds.synth_floor_db, bounds.wake_ceiling_db)
+            } else {
+                bounds.wake_ceiling_db
+            };
+            Action::Fade(FadeIntentIr::WakeTo {
+                target_db: td,
+                vol: (*vol).min(100),
+                secs: clamp_secs(*secs),
+            })
+        }
         Action::SetVolume(v) => Action::SetVolume((*v).min(100)),
         Action::Enqueue { selector, count } => Action::Enqueue {
+            selector: selector.clone(),
+            count: (*count).min(bounds.max_enqueue),
+        },
+        Action::Wake { selector, count } => Action::Wake {
             selector: selector.clone(),
             count: (*count).min(bounds.max_enqueue),
         },
@@ -726,6 +765,59 @@ mod tests {
         .unwrap();
         match r {
             Resolved::OnDeadline(_) => {}
+            other => panic!("expected OnDeadline, got {other:?}"),
+        }
+    }
+
+    // The NEW convenience-feature IR variants clamp exactly like their siblings:
+    // ToFloor secs into [min,max]; WakeTo target_db into [synth_floor, ceiling],
+    // vol -> 100, secs clamped; Action::Wake count -> MAX_ENQUEUE.
+    #[test]
+    fn clamp_convenience_fade_and_wake_variants() {
+        let b = bounds();
+        match clamp_action(&Action::Fade(FadeIntentIr::ToFloor { secs: 1e9 }), &b) {
+            Action::Fade(FadeIntentIr::ToFloor { secs }) => {
+                assert!(secs >= b.min_dur.as_secs_f64() && secs <= b.max_dur.as_secs_f64());
+            }
+            other => panic!("got {other:?}"),
+        }
+        match clamp_action(
+            &Action::Fade(FadeIntentIr::WakeTo { target_db: 999.0, vol: 250, secs: 1e9 }),
+            &b,
+        ) {
+            Action::Fade(FadeIntentIr::WakeTo { target_db, vol, secs }) => {
+                assert!(target_db >= b.synth_floor_db && target_db <= b.wake_ceiling_db);
+                assert_eq!(vol, 100);
+                assert!(secs <= b.max_dur.as_secs_f64());
+            }
+            other => panic!("got {other:?}"),
+        }
+        match clamp_action(
+            &Action::Wake { selector: Some(Selector::Query("x".into())), count: 9999 },
+            &b,
+        ) {
+            Action::Wake { count, .. } => assert_eq!(count, MAX_ENQUEUE),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // The WallClock horizon is UNCLAMPED: an `at` 1h out (> max_dur = 30min) yields
+    // OnDeadline ~now+3600, proving the fade-duration cap never bounds the timer.
+    #[test]
+    fn wallclock_horizon_unclamped_beyond_max_dur() {
+        let snap = snap5(0);
+        let n = now();
+        let c = civil();
+        let future = c + chrono::Duration::seconds(3600); // 1h, well past max_dur
+        let r = validate(&raw(RawTrigger::WallClock { at: future }), &snap, n, c, &bounds()).unwrap();
+        match r {
+            Resolved::OnDeadline(inst) => {
+                let delay = inst - n;
+                assert!(
+                    delay >= Duration::from_secs(3599) && delay <= Duration::from_secs(3601),
+                    "horizon not capped at max_dur, got {delay:?}"
+                );
+            }
             other => panic!("expected OnDeadline, got {other:?}"),
         }
     }

@@ -41,12 +41,16 @@ use crate::fade::{
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
 use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
 use crate::plan::{
-    clamp_raw, validate, ArmedPlan, PlanBounds, PlanError, PlanId, RawPlan, Resolved, Selector,
+    clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
+    RawTrigger, Resolved, Selector, ORIGIN_SLEEP, ORIGIN_WAKE, ORIGIN_WINDDOWN,
 };
 use crate::subsonic::SubsonicError;
 use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
-use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, StickerCmd};
+use crate::mpd::{
+    FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, SleepCmd, StickerCmd,
+    WakeCmd, WakeWhen, WinddownCmd,
+};
 use crate::player::{db_to_mpv_volume, mpv_volume_to_db, PlayState, PlayerHandle};
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
@@ -294,14 +298,29 @@ pub enum FadeIntent {
     /// 100): a wake must restore the EXACT volume the user had before the restart,
     /// starting from silence. Sub-JND so the wake is imperceptibly gentle.
     WakeTo { target_db: f64, vol: u8 },
+    /// Sub-JND wind-down to the configured non-silence floor (`floor_db`), leaving
+    /// playback RUNNING (SetBaseline, no mute step). Distinct from [`FadeIntent::Out`]
+    /// (which reaches silence + stops). The floor is passed in from the live config
+    /// at resolve time, never baked into a plan.
+    ToFloor,
 }
 
 impl FadeIntent {
-    /// Resolve into `(target, sub_jnd, terminal)` against the live `from_db` and
-    /// the configured comfort `ceiling`.
-    fn resolve(self, from_db: f64, ceiling: f64) -> (FadeTarget, bool, Terminal) {
+    /// Resolve into `(target, sub_jnd, terminal)` against the live `from_db`, the
+    /// configured comfort `ceiling`, and the wind-down `floor_db`.
+    fn resolve(self, from_db: f64, ceiling: f64, floor_db: f64) -> (FadeTarget, bool, Terminal) {
         match self {
             FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore),
+            // Sub-JND to the floor level, committing it as the baseline: playback
+            // continues quiet, no mute step, no click.
+            FadeIntent::ToFloor => {
+                // Never ramp UP: if the live level is already at/below the floor,
+                // hold it (target = min(floor, from)) so a wind-down cannot
+                // re-brighten a quieter state.
+                let target = floor_db.min(from_db);
+                let vol = db_to_mpv_volume(target).round().clamp(0.0, 100.0) as u8;
+                (FadeTarget::Db(target), true, Terminal::SetBaseline(vol))
+            }
             FadeIntent::In => {
                 // Ceiling clamp: target the HIGHER of the live gain and the
                 // ceiling, so the fade only ever rises (never re-brightens past a
@@ -724,6 +743,250 @@ impl HypodjHandler {
         Ok(new_id)
     }
 
+    // ── convenience features: sleep / winddown / wake ────────────────────────
+
+    /// A read-only view of every armed plan's `(id, origin, deadline)`. The
+    /// deadline is the absolute [`Instant`] for a [`Resolved::OnDeadline`] plan and
+    /// `None` otherwise. Pure registry read (a short lock, no `.await`), so a
+    /// remaining-time computation is fake-clock assertable.
+    pub fn plan_deadlines(&self) -> Vec<(PlanId, String, Option<Instant>)> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pp| {
+                let deadline = match pp.armed.resolved {
+                    Resolved::OnDeadline(inst) => Some(inst),
+                    _ => None,
+                };
+                (pp.armed.id, pp.armed.raw.origin.clone(), deadline)
+            })
+            .collect()
+    }
+
+    /// The id of the SINGLE armed plan with this reserved origin, if any. Backs
+    /// single-instance control (replace/cancel) for the convenience features.
+    fn find_by_origin(&self, origin: &str) -> Option<PlanId> {
+        self.plan_pending
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|pp| pp.armed.raw.origin == origin)
+            .map(|pp| pp.armed.id)
+    }
+
+    /// Build a convenience plan for `origin`: replace the existing single instance
+    /// (validate-then-cancel) or add a fresh one, so exactly one is ever active.
+    fn set_singleton(&self, origin: &str, raw: RawPlan) -> Result<PlanId, PlanError> {
+        match self.find_by_origin(origin) {
+            Some(id) => self.plan_replace(id, raw),
+            None => self.plan_add(raw),
+        }
+    }
+
+    /// A `WallClock` trigger `dur` from now, reduced from civil time exactly as a
+    /// raw `plan add trigger at ...` is (UNCLAMPED - the SpanElapsed clamp caps the
+    /// horizon at max_dur=30min, so a `sleep 1h` must use WallClock).
+    fn wallclock_in(dur: Duration) -> Result<RawTrigger, PlanError> {
+        let delta =
+            chrono::Duration::from_std(dur).map_err(|_| PlanError::OutOfBounds { field: "dur" })?;
+        // checked_add_signed so a pathological duration returns OutOfBounds rather
+        // than panicking the DateTime addition.
+        let at = chrono::Utc::now()
+            .checked_add_signed(delta)
+            .ok_or(PlanError::OutOfBounds { field: "dur" })?;
+        Ok(RawTrigger::WallClock { at })
+    }
+
+    /// SLEEP: schedule a graceful fade-to-silence-then-stop at now+`dur`. ONE plan
+    /// (Fade(Out) already StopRestores - no sibling Stop). Single-instance.
+    pub fn sleep_set(&self, dur: Duration) -> Result<PlanId, PlanError> {
+        let raw = RawPlan {
+            version: 1,
+            trigger: Self::wallclock_in(dur)?,
+            action: Action::Fade(FadeIntentIr::Out { secs: self.fade_cfg.sleep_fade_secs as f64 }),
+            once: true,
+            origin: ORIGIN_SLEEP.into(),
+        };
+        self.set_singleton(ORIGIN_SLEEP, raw)
+    }
+
+    /// The remaining time on the armed sleep plan, or `None` if none is armed.
+    /// Computed from the resolved deadline minus the shared clock's now (pure read,
+    /// deterministic under the fake clock).
+    pub fn sleep_remaining(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.plan_deadlines()
+            .into_iter()
+            .find(|(_, origin, _)| origin == ORIGIN_SLEEP)
+            .and_then(|(_, _, deadline)| deadline)
+            .map(|inst| inst.saturating_duration_since(now))
+    }
+
+    /// Cancel the armed sleep plan (RAII disarm). `true` if one was cancelled.
+    pub fn sleep_cancel(&self) -> bool {
+        match self.find_by_origin(ORIGIN_SLEEP) {
+            Some(id) => self.plan_cancel(id),
+            None => false,
+        }
+    }
+
+    /// WINDDOWN v1 (volume half only): a long sub-JND fade to the non-silence floor
+    /// (`ToFloor`, playback continues). `None` winds down immediately; `Some(dur)`
+    /// schedules it at now+dur. Single-instance.
+    ///
+    /// P4 SEAM: energy-aware calmer-track SELECTION (routing through
+    /// [`Selector::Calmer`], loud-unsupported at [`Self::plan_enqueue`]) is out of
+    /// scope here. This v1 does not enqueue - it is a pure volume wind-down.
+    pub fn winddown_set(&self, dur: Option<Duration>) -> Result<PlanId, PlanError> {
+        let trigger = match dur {
+            None => RawTrigger::Immediate,
+            Some(d) => Self::wallclock_in(d)?,
+        };
+        let raw = RawPlan {
+            version: 1,
+            trigger,
+            action: Action::Fade(FadeIntentIr::ToFloor {
+                secs: self.fade_cfg.winddown_fade_secs as f64,
+            }),
+            once: true,
+            origin: ORIGIN_WINDDOWN.into(),
+        };
+        self.set_singleton(ORIGIN_WINDDOWN, raw)
+    }
+
+    /// Cancel the armed winddown plan (RAII disarm). `true` if one was cancelled.
+    pub fn winddown_cancel(&self) -> bool {
+        match self.find_by_origin(ORIGIN_WINDDOWN) {
+            Some(id) => self.plan_cancel(id),
+            None => false,
+        }
+    }
+
+    /// WAKE: schedule a gentle alarm at an absolute civil deadline. At the deadline
+    /// the single [`Action::Wake`] atomically enqueues (optional), starts from
+    /// silence, plays, and ramps IN to comfort. Single-instance.
+    pub fn wake_set(
+        &self,
+        at: chrono::DateTime<chrono::Utc>,
+        selector: Option<Selector>,
+        count: u32,
+    ) -> Result<PlanId, PlanError> {
+        let raw = RawPlan {
+            version: 1,
+            trigger: RawTrigger::WallClock { at },
+            action: Action::Wake { selector, count },
+            once: true,
+            origin: ORIGIN_WAKE.into(),
+        };
+        self.set_singleton(ORIGIN_WAKE, raw)
+    }
+
+    /// The remaining time on the armed wake plan, or `None` if none is armed.
+    pub fn wake_remaining(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.plan_deadlines()
+            .into_iter()
+            .find(|(_, origin, _)| origin == ORIGIN_WAKE)
+            .and_then(|(_, _, deadline)| deadline)
+            .map(|inst| inst.saturating_duration_since(now))
+    }
+
+    /// Cancel the armed wake plan (RAII disarm). `true` if one was cancelled.
+    pub fn wake_cancel(&self) -> bool {
+        match self.find_by_origin(ORIGIN_WAKE) {
+            Some(id) => self.plan_cancel(id),
+            None => false,
+        }
+    }
+
+    /// Resolve the next future civil `h:m` (today if still ahead, else tomorrow) in
+    /// the handler's fixed-offset zone, as an absolute UTC instant. Mirrors the P3
+    /// nl civil-time seam so `wake at 7` is deterministic under a fixed civil now.
+    pub fn resolve_next_civil(&self, h: u32, m: u32) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::TimeZone;
+        // An alarm is a LOCAL-time promise: `wake at 7` means 07:00 in the system
+        // zone, DST-aware, not 07:00 UTC. Use chrono::Local (reads the system TZ)
+        // and pick the next FUTURE occurrence, then reduce to UTC for the trigger.
+        let now = chrono::Local::now();
+        let today = now.date_naive();
+        let naive_today = today.and_hms_opt(h, m, 0)?;
+        let dt = match chrono::Local.from_local_datetime(&naive_today).single() {
+            Some(d) if d > now => d,
+            _ => {
+                let tomorrow = today.succ_opt()?;
+                chrono::Local
+                    .from_local_datetime(&tomorrow.and_hms_opt(h, m, 0)?)
+                    .single()?
+            }
+        };
+        Some(dt.with_timezone(&chrono::Utc))
+    }
+
+    /// The single atomic wake effect: (1) optionally enqueue the selector (ABORT
+    /// the whole wake on Err - never ramp silence over an empty queue); (2) force
+    /// start-from-silence (`live_gain_db = synth_floor` AND `player.set_volume(0)`
+    /// BEFORE the first buffer); (3) play; (4) sub-JND `WakeTo` ramp from silence to
+    /// the saved comfort volume. Reuses the smooth-restart composition verbatim.
+    pub async fn wake_now(&self, selector: Option<Selector>, count: u32) -> Result<(), String> {
+        // Where the enqueued batch will START (append-only), captured BEFORE the
+        // enqueue so we wake INTO the freshly enqueued selection, not a stale
+        // `current` left from a previous session.
+        let enqueue_start = if selector.is_some() {
+            Some(self.state.lock().unwrap().queue.len())
+        } else {
+            None
+        };
+        // (1) Enqueue first; a failure aborts before any ramp (single Action, so
+        // this ordering is guaranteed - three timers could not enforce it).
+        if let Some(sel) = &selector {
+            self.plan_enqueue(sel, count).await?;
+        }
+
+        // (2) Force start-from-silence BEFORE the first buffer: a stopped player's
+        // baseline is the comfort volume, so without this the WakeTo ramp would
+        // snapshot from_db=comfort and not rise from silence.
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        // An ALARM wakes to a stable comfort level - the configured wake ceiling -
+        // NOT `target_volume`, which a preceding `winddown` may have lowered to the
+        // floor (that would ramp the alarm to a barely-audible level). This is the
+        // deliberate difference from smooth-restart restore, which returns to the
+        // saved volume.
+        let comfort_db = self.fade_cfg.wake_ceiling_db;
+        let comfort_vol = db_to_mpv_volume(comfort_db).round().clamp(0.0, 100.0) as u8;
+        let idx = {
+            let mut st = self.state.lock().unwrap();
+            st.live_gain_db = synth_floor;
+            // Wake INTO the enqueued selection (its first track) when one was
+            // enqueued; otherwise resume `current` or the head of the queue.
+            match enqueue_start {
+                Some(start) if start < st.queue.len() => Some(start),
+                _ => st
+                    .current
+                    .filter(|&i| i < st.queue.len())
+                    .or_else(|| (!st.queue.is_empty()).then_some(0)),
+            }
+        };
+        let Some(idx) = idx else {
+            return Err("wake: nothing to play (empty queue and no selector)".into());
+        };
+        let _ = self.player.set_volume(0).await;
+
+        // (3) Play from silence.
+        self.play_index(idx).await?;
+
+        // (4) Sub-JND ramp silence -> saved comfort level (startle-safe by
+        // construction; WakeTo resolves sub_jnd=true / SetBaseline).
+        let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.wake_ramp_secs));
+        let intent = FadeIntent::WakeTo {
+            target_db: mpv_volume_to_db(comfort_vol as f64),
+            vol: comfort_vol,
+        };
+        self.start_fade_spec(FadeRequest { intent, dur })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     /// Resolve a plan [`Selector`] to concrete songs and APPEND them (append-only,
     /// count-clamped). Unimplemented selectors return a loud not-yet. Used by the
     /// executor's `Enqueue` action; touches the network, never a test path.
@@ -793,6 +1056,74 @@ impl HypodjHandler {
                 Ok(new_id) => MpdResponse::pairs().pair("plan_id", new_id.0.to_string()).build(),
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
             },
+        }
+    }
+
+    /// Dispatch a parsed `sleep` command: (re)arm / report / cancel the single
+    /// sleep timer, mapping a [`PlanError`] 1:1 to a fail-loud ACK.
+    fn handle_sleep(&self, cmd: SleepCmd) -> MpdResponse {
+        match cmd {
+            SleepCmd::Set(dur) => match self.sleep_set(dur) {
+                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "sleep", &e.to_string()),
+            },
+            SleepCmd::Status => match self.sleep_remaining() {
+                Some(d) => MpdResponse::pairs()
+                    .pair("sleep_remaining", d.as_secs().to_string())
+                    .build(),
+                None => MpdResponse::pairs().pair("sleep", "none").build(),
+            },
+            SleepCmd::Cancel => {
+                self.sleep_cancel();
+                MpdResponse::ok()
+            }
+        }
+    }
+
+    /// Dispatch a parsed `winddown` command: (re)arm / cancel the single wind-down.
+    fn handle_winddown(&self, cmd: WinddownCmd) -> MpdResponse {
+        match cmd {
+            WinddownCmd::Set(dur) => match self.winddown_set(dur) {
+                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "winddown", &e.to_string()),
+            },
+            WinddownCmd::Cancel => {
+                self.winddown_cancel();
+                MpdResponse::ok()
+            }
+        }
+    }
+
+    /// Dispatch a parsed `wake` command: (re)arm / report / cancel the single wake.
+    fn handle_wake(&self, cmd: WakeCmd) -> MpdResponse {
+        match cmd {
+            WakeCmd::Set { when, selector, count } => {
+                let at = match when {
+                    WakeWhen::In(d) => match chrono::Duration::from_std(d) {
+                        Ok(delta) => chrono::Utc::now() + delta,
+                        Err(_) => return ack(ACK_ERROR_UNKNOWN, "wake", "duration out of range"),
+                    },
+                    WakeWhen::At { h, m } => match self.resolve_next_civil(h, m) {
+                        Some(at) => at,
+                        None => return ack(ACK_ERROR_UNKNOWN, "wake", "bad time"),
+                    },
+                };
+                let sel = selector.map(Selector::Query);
+                match self.wake_set(at, sel, count) {
+                    Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "wake", &e.to_string()),
+                }
+            }
+            WakeCmd::Status => match self.wake_remaining() {
+                Some(d) => MpdResponse::pairs()
+                    .pair("wake_remaining", d.as_secs().to_string())
+                    .build(),
+                None => MpdResponse::pairs().pair("wake", "none").build(),
+            },
+            WakeCmd::Cancel => {
+                self.wake_cancel();
+                MpdResponse::ok()
+            }
         }
     }
 
@@ -1023,6 +1354,9 @@ impl HypodjHandler {
         let tick = Duration::from_millis(self.fade_cfg.tick_ms);
         let ceiling = self.fade_cfg.wake_ceiling_db;
         let synth_floor = self.fade_cfg.synth_floor_db;
+        // Single source of truth: the wind-down floor is read from the LIVE config
+        // at spawn and passed into resolve, never baked into a stored plan.
+        let floor_db = self.fade_cfg.floor_level_db;
         let dur = req.dur;
         let intent = req.intent;
 
@@ -1044,7 +1378,7 @@ impl HypodjHandler {
             .supersede(
                 move || {
                     let from_db = state_read.lock().unwrap().live_gain_db;
-                    let (target, sub_jnd, terminal) = intent.resolve(from_db, ceiling);
+                    let (target, sub_jnd, terminal) = intent.resolve(from_db, ceiling, floor_db);
                     let bounds = startle_bounds(&cfg, sub_jnd);
                     let spec = FadeSpec::new(from_db, target, dur, tick, Curve::DbLinear, bounds)?;
                     Ok((spec, terminal))
@@ -1300,6 +1634,13 @@ impl HypodjHandler {
     /// TEST-ONLY: read the live gain in dB (the internal source of truth).
     #[cfg(test)]
     fn live_gain_db(&self) -> f64 {
+        self.state.lock().unwrap().live_gain_db
+    }
+
+    /// TEST-ONLY (crate): read the live gain in dB. Exposed to the executor tests,
+    /// which assert a wake ramp starts from silence (near the synth floor).
+    #[cfg(test)]
+    pub(crate) fn live_gain_db_for_test(&self) -> f64 {
         self.state.lock().unwrap().live_gain_db
     }
 
@@ -1767,6 +2108,9 @@ impl MpdHandler for HypodjHandler {
             }
             MpdCommand::Plan(cmd) => self.handle_plan(cmd),
             MpdCommand::Nl(cmd) => self.handle_nl(cmd).await,
+            MpdCommand::Sleep(cmd) => self.handle_sleep(cmd),
+            MpdCommand::Winddown(cmd) => self.handle_winddown(cmd),
+            MpdCommand::Wake(cmd) => self.handle_wake(cmd),
             MpdCommand::Next => {
                 let next = {
                     let st = self.state.lock().unwrap();
@@ -3798,7 +4142,7 @@ mod tests {
         let saved_vol = 60u8;
         let target = mpv_volume_to_db(saved_vol as f64);
         let intent = FadeIntent::WakeTo { target_db: target, vol: saved_vol };
-        let (t, sub_jnd, terminal) = intent.resolve(SYNTH_FLOOR_DB, 0.0);
+        let (t, sub_jnd, terminal) = intent.resolve(SYNTH_FLOOR_DB, 0.0, -45.0);
         match t {
             FadeTarget::Db(db) => assert!((db - target).abs() < 1e-9),
             _ => panic!("WakeTo must target a specific Db, not Silence"),
@@ -3807,6 +4151,25 @@ mod tests {
         match terminal {
             Terminal::SetBaseline(v) => assert_eq!(v, saved_vol),
             _ => panic!("WakeTo commits the saved baseline"),
+        }
+    }
+
+    // FadeIntent::ToFloor resolves to the wind-down floor (Db(floor_db)), sub-JND,
+    // with a SetBaseline terminal - playback CONTINUES (no Silence, no mute/stop).
+    #[test]
+    fn to_floor_resolves_to_floor_sub_jnd_playback_continues() {
+        let floor = -45.0;
+        let (t, sub_jnd, terminal) = FadeIntent::ToFloor.resolve(0.0, 0.0, floor);
+        match t {
+            FadeTarget::Db(db) => assert!((db - floor).abs() < 1e-9, "targets the floor level"),
+            FadeTarget::Silence => panic!("ToFloor must NOT reach Silence (playback continues)"),
+        }
+        assert!(sub_jnd, "a wind-down is sub-JND (imperceptibly gentle)");
+        match terminal {
+            Terminal::SetBaseline(v) => {
+                assert_eq!(v, db_to_mpv_volume(floor).round().clamp(0.0, 100.0) as u8);
+            }
+            _ => panic!("ToFloor commits a baseline (no stop)"),
         }
     }
 

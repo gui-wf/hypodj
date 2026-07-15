@@ -190,10 +190,69 @@ pub enum MpdCommand {
     /// token. NOT a standard MPD command; a hypodj extension. See [`NlCmd`].
     Nl(NlCmd),
 
+    /// `sleep [<dur>|off|cancel]` - the convenience sleep timer (a P2 plan
+    /// BUILDER). NOT a standard MPD command; a hypodj extension. See [`SleepCmd`].
+    Sleep(SleepCmd),
+    /// `winddown [<dur>|off|cancel]` - the convenience wind-down to the non-silence
+    /// floor. NOT a standard MPD command; a hypodj extension. See [`WinddownCmd`].
+    Winddown(WinddownCmd),
+    /// `wake at <time>|in <dur> [with <selector>]` / `wake [list|cancel|off]` - the
+    /// convenience wake ramp-in. NOT a standard MPD command; a hypodj extension.
+    /// See [`WakeCmd`].
+    Wake(WakeCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
 }
+
+/// A parsed `sleep` subcommand (the convenience sleep-timer surface).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SleepCmd {
+    /// `sleep` - report the remaining time on the armed sleep timer (or none).
+    Status,
+    /// `sleep off` / `sleep cancel` - cancel the armed sleep timer.
+    Cancel,
+    /// `sleep <dur>` - (re)arm a sleep timer firing in `dur`.
+    Set(Duration),
+}
+
+/// A parsed `winddown` subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinddownCmd {
+    /// `winddown off` / `winddown cancel` - cancel the armed wind-down.
+    Cancel,
+    /// `winddown` (immediate) or `winddown <dur>` (scheduled at now+dur).
+    Set(Option<Duration>),
+}
+
+/// When a `wake` fires: an absolute civil `h:m` today/tomorrow, or `in <dur>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeWhen {
+    /// `wake at <time>` - the next future civil `h:m`.
+    At { h: u32, m: u32 },
+    /// `wake in <dur>` - a monotonic span from now.
+    In(Duration),
+}
+
+/// A parsed `wake` subcommand (the convenience wake ramp-in surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WakeCmd {
+    /// `wake` / `wake list` - report the remaining time on the armed wake (or none).
+    Status,
+    /// `wake off` / `wake cancel` - cancel the armed wake.
+    Cancel,
+    /// `wake at <time>|in <dur> [with <selector>]` - (re)arm the wake.
+    Set {
+        when: WakeWhen,
+        /// The optional `with <text>` query selector (P4 Calmer routing aside).
+        selector: Option<String>,
+        count: u32,
+    },
+}
+
+/// Default enqueue count for a `wake ... with <selector>` (append-only, clamped).
+const DEFAULT_WAKE_ENQUEUE: u32 = 20;
 
 /// Which direction / target a `fade` drives toward. `To(vol)` fades to an
 /// explicit 0..=100 volume; `ToFloor` winds down to the configured non-silence
@@ -599,6 +658,130 @@ fn parse_secs(tok: &str) -> Option<f64> {
     (v.is_finite() && v >= 0.0).then_some(v)
 }
 
+/// Parse a duration token accepting a bare/`s`/`m`/`h` suffix (a small
+/// humantime-style extension of [`parse_secs`]): `30`, `30s`, `30m`, `2h`. Rejects
+/// NaN / inf / negative / non-numeric / overflow. Pure + config-free.
+fn parse_dur_hms(tok: &str) -> Option<Duration> {
+    let (num, mult) = if let Some(n) = tok.strip_suffix('h') {
+        (n, 3600.0)
+    } else if let Some(n) = tok.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = tok.strip_suffix('s') {
+        (n, 1.0)
+    } else {
+        (tok, 1.0)
+    };
+    let v: f64 = num.parse().ok()?;
+    if !(v.is_finite() && v >= 0.0) {
+        return None;
+    }
+    Duration::try_from_secs_f64(v * mult).ok()
+}
+
+/// Parse a civil clock token into `(hour, minute)` in 24h space. Accepts `7`,
+/// `7:30`, `19:00`, and 12h forms with an `am`/`pm` suffix (`7pm`, `12am`).
+/// Rejects out-of-range values. Pure + config-free.
+fn parse_civil_time(tok: &str) -> Option<(u32, u32)> {
+    let t = tok.to_lowercase();
+    let (body, pm, has_mer) = if let Some(x) = t.strip_suffix("pm") {
+        (x.trim(), true, true)
+    } else if let Some(x) = t.strip_suffix("am") {
+        (x.trim(), false, true)
+    } else {
+        (t.as_str(), false, false)
+    };
+    let (h, m) = match body.split_once(':') {
+        Some((hh, mm)) => (hh.trim().parse::<u32>().ok()?, mm.trim().parse::<u32>().ok()?),
+        None => (body.trim().parse::<u32>().ok()?, 0),
+    };
+    if m > 59 {
+        return None;
+    }
+    let h = if has_mer {
+        // 12h -> 24h: 12am == 00, 12pm == 12, else +12 for pm.
+        if h == 0 || h > 12 {
+            return None;
+        }
+        if h == 12 {
+            if pm { 12 } else { 0 }
+        } else if pm {
+            h + 12
+        } else {
+            h
+        }
+    } else {
+        if h > 23 {
+            return None;
+        }
+        h
+    };
+    Some((h, m))
+}
+
+/// Extract an optional `with <selector text>` from the trailing tokens of a wake
+/// command, joining everything after `with` into one query string.
+fn parse_wake_selector(toks: &[String]) -> Option<String> {
+    let pos = toks.iter().position(|t| t.eq_ignore_ascii_case("with"))?;
+    let sel = toks[pos + 1..].join(" ");
+    (!sel.trim().is_empty()).then(|| sel.trim().to_string())
+}
+
+/// Parse a `sleep` request: `sleep` (status), `sleep off|cancel`, `sleep <dur>`.
+fn parse_sleep(args: &[String], line: &str) -> MpdCommand {
+    match args.first().map(|s| s.to_lowercase()).as_deref() {
+        None => MpdCommand::Sleep(SleepCmd::Status),
+        Some("off") | Some("cancel") => MpdCommand::Sleep(SleepCmd::Cancel),
+        Some(_) => match parse_dur_hms(&args[0]) {
+            Some(d) => MpdCommand::Sleep(SleepCmd::Set(d)),
+            None => MpdCommand::Unsupported(line.to_string()),
+        },
+    }
+}
+
+/// Parse a `winddown` request: `winddown` (immediate), `winddown <dur>`,
+/// `winddown off|cancel`.
+fn parse_winddown(args: &[String], line: &str) -> MpdCommand {
+    match args.first().map(|s| s.to_lowercase()).as_deref() {
+        None => MpdCommand::Winddown(WinddownCmd::Set(None)),
+        Some("off") | Some("cancel") => MpdCommand::Winddown(WinddownCmd::Cancel),
+        Some(_) => match parse_dur_hms(&args[0]) {
+            Some(d) => MpdCommand::Winddown(WinddownCmd::Set(Some(d))),
+            None => MpdCommand::Unsupported(line.to_string()),
+        },
+    }
+}
+
+/// Parse a `wake` request: `wake`/`wake list` (status), `wake off|cancel`,
+/// `wake at <time> [with <sel>]`, `wake in <dur> [with <sel>]`.
+fn parse_wake(args: &[String], line: &str) -> MpdCommand {
+    let unsupported = || MpdCommand::Unsupported(line.to_string());
+    match args.first().map(|s| s.to_lowercase()).as_deref() {
+        None | Some("list") => MpdCommand::Wake(WakeCmd::Status),
+        Some("off") | Some("cancel") => MpdCommand::Wake(WakeCmd::Cancel),
+        Some("at") => {
+            let Some((h, m)) = args.get(1).and_then(|t| parse_civil_time(t)) else {
+                return unsupported();
+            };
+            MpdCommand::Wake(WakeCmd::Set {
+                when: WakeWhen::At { h, m },
+                selector: parse_wake_selector(&args[2.min(args.len())..]),
+                count: DEFAULT_WAKE_ENQUEUE,
+            })
+        }
+        Some("in") => {
+            let Some(d) = args.get(1).and_then(|t| parse_dur_hms(t)) else {
+                return unsupported();
+            };
+            MpdCommand::Wake(WakeCmd::Set {
+                when: WakeWhen::In(d),
+                selector: parse_wake_selector(&args[2.min(args.len())..]),
+                count: DEFAULT_WAKE_ENQUEUE,
+            })
+        }
+        _ => unsupported(),
+    }
+}
+
 /// Tokenize an MPD request line, honoring double-quoted arguments (MPD quotes
 /// any arg containing spaces; `\"` and `\\` are the only escapes). Returns the
 /// bare command name lowercased plus the raw argument vector.
@@ -730,6 +913,9 @@ pub fn parse(line: &str) -> MpdCommand {
         "fade" => parse_fade(&args, line),
         "plan" => parse_plan(&args, line),
         "nl" => parse_nl(&args, line),
+        "sleep" => parse_sleep(&args, line),
+        "winddown" => parse_winddown(&args, line),
+        "wake" => parse_wake(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1174,6 +1360,59 @@ mod parse_tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_sleep_winddown_wake_verbs() {
+        // sleep: status / cancel / durations with m/h suffixes.
+        assert!(matches!(parse("sleep"), MpdCommand::Sleep(SleepCmd::Status)));
+        assert!(matches!(parse("sleep off"), MpdCommand::Sleep(SleepCmd::Cancel)));
+        assert!(matches!(parse("sleep cancel"), MpdCommand::Sleep(SleepCmd::Cancel)));
+        assert!(matches!(
+            parse("sleep 30m"),
+            MpdCommand::Sleep(SleepCmd::Set(d)) if d == Duration::from_secs(1800)
+        ));
+        assert!(matches!(
+            parse("sleep 1h"),
+            MpdCommand::Sleep(SleepCmd::Set(d)) if d == Duration::from_secs(3600)
+        ));
+        assert!(matches!(parse("sleep banana"), MpdCommand::Unsupported(_)));
+
+        // winddown: immediate (no dur) / scheduled / cancel.
+        assert!(matches!(parse("winddown"), MpdCommand::Winddown(WinddownCmd::Set(None))));
+        assert!(matches!(
+            parse("winddown 20m"),
+            MpdCommand::Winddown(WinddownCmd::Set(Some(d))) if d == Duration::from_secs(1200)
+        ));
+        assert!(matches!(parse("winddown cancel"), MpdCommand::Winddown(WinddownCmd::Cancel)));
+
+        // wake: status / cancel / at <time> [with] / in <dur> [with].
+        assert!(matches!(parse("wake"), MpdCommand::Wake(WakeCmd::Status)));
+        assert!(matches!(parse("wake list"), MpdCommand::Wake(WakeCmd::Status)));
+        assert!(matches!(parse("wake cancel"), MpdCommand::Wake(WakeCmd::Cancel)));
+        match parse("wake at 7 with jazz") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::At { h: 7, m: 0 });
+                assert_eq!(selector.as_deref(), Some("jazz"));
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("wake at 7:30pm") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::At { h: 19, m: 30 });
+                assert!(selector.is_none());
+            }
+            other => panic!("got {other:?}"),
+        }
+        match parse("wake in 2h with deep house") {
+            MpdCommand::Wake(WakeCmd::Set { when, selector, .. }) => {
+                assert_eq!(when, WakeWhen::In(Duration::from_secs(7200)));
+                assert_eq!(selector.as_deref(), Some("deep house"));
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(parse("wake at bogus"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("wake in nope"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

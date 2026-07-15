@@ -329,6 +329,16 @@ fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
             intent: FadeIntent::To { target_db: *target_db, vol: *vol },
             dur: dur(*secs),
         },
+        // Wind-down to the configured floor, playback continuing. The floor is
+        // resolved from the LIVE config inside `start_fade_spec` (never baked here).
+        FadeIntentIr::ToFloor { secs } => FadeRequest {
+            intent: FadeIntent::ToFloor,
+            dur: dur(*secs),
+        },
+        FadeIntentIr::WakeTo { target_db, vol, secs } => FadeRequest {
+            intent: FadeIntent::WakeTo { target_db: *target_db, vol: *vol },
+            dur: dur(*secs),
+        },
     }
 }
 
@@ -356,6 +366,11 @@ async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action) {
         }
         Action::Enqueue { selector, count } => {
             handler.plan_enqueue(selector, *count).await.map(|_| ())
+        }
+        // ONE atomic effect: enqueue? -> start-from-silence -> play -> WakeTo ramp.
+        // A single Action (not three timers) is what guarantees this order.
+        Action::Wake { selector, count } => {
+            handler.wake_now(selector.clone(), *count).await
         }
     };
     if let Err(e) = r {
@@ -1005,5 +1020,159 @@ mod tests {
             "album boundary fired across the advance; not lost to the cursor move"
         );
         assert!(rig.handler.plan_list().is_empty(), "fired boundary removed");
+    }
+
+    // ── convenience features: sleep / winddown / wake (end-to-end) ────────────
+
+    // SLEEP: `sleep 30m` builds ONE plan (origin sleep); no fire at 1799s; fires at
+    // 1801s -> the sub-JND sleep fade-out; once plan removed. The WallClock horizon
+    // (1800s > max_dur 1800 boundary) is NOT capped by the fade cap.
+    #[tokio::test(start_paused = true)]
+    async fn sleep_timer_fires_after_horizon_single_plan() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        rig.handler.sleep_set(Duration::from_secs(1800)).unwrap();
+        assert_eq!(rig.handler.plan_list().len(), 1, "exactly one sleep plan");
+        tokio::time::advance(Duration::from_secs(1799)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "no fade before the horizon");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "sleep fade fired after the horizon");
+        assert!(rig.handler.plan_list().is_empty(), "once sleep plan removed");
+    }
+
+    // SLEEP: sleep_remaining counts down from the resolved deadline under the fake
+    // clock (arm 1800s, advance 600s, remaining ~1200s).
+    #[tokio::test(start_paused = true)]
+    async fn sleep_remaining_counts_down() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        rig.handler.sleep_set(Duration::from_secs(1800)).unwrap();
+        tokio::time::advance(Duration::from_secs(600)).await;
+        settle().await;
+        let rem = rig.handler.sleep_remaining().expect("a sleep plan is armed");
+        assert!(
+            rem >= Duration::from_secs(1198) && rem <= Duration::from_secs(1201),
+            "remaining ~1200s, got {rem:?}"
+        );
+    }
+
+    // SLEEP: `sleep off` cancels (no fire); `sleep 30m` then `sleep 45m` replaces
+    // in place (single instance, only the 45m fires - no double-stop plan).
+    #[tokio::test(start_paused = true)]
+    async fn sleep_off_and_replace_single_instance() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        rig.handler.sleep_set(Duration::from_secs(1800)).unwrap();
+        assert!(rig.handler.sleep_cancel(), "sleep off cancels");
+        tokio::time::advance(Duration::from_secs(2000)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "no fire after cancel");
+
+        // Re-arm 30m then replace with 45m: exactly one sleep plan, only 45m fires.
+        rig.handler.sleep_set(Duration::from_secs(1800)).unwrap();
+        rig.handler.sleep_set(Duration::from_secs(2700)).unwrap();
+        assert_eq!(rig.handler.plan_list().len(), 1, "single sleep instance after replace");
+        tokio::time::advance(Duration::from_secs(1801)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "the old 30m plan was cancelled");
+        tokio::time::advance(Duration::from_secs(901)).await; // total ~2702s
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "the 45m plan fires");
+    }
+
+    // WINDDOWN: `winddown` (immediate) installs a ToFloor fade at add-time and is
+    // removed (no zombie). `winddown 20m` fires only after its WallClock horizon.
+    #[tokio::test(start_paused = true)]
+    async fn winddown_immediate_and_scheduled() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        rig.handler.winddown_set(None).unwrap();
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "immediate winddown fade installed");
+        assert!(rig.handler.plan_list().is_empty(), "immediate winddown removed, no zombie");
+
+        // Scheduled winddown fires only past the horizon.
+        rig.handler.winddown_set(Some(Duration::from_secs(1200))).unwrap();
+        assert_eq!(rig.handler.plan_list().len(), 1, "one scheduled winddown");
+        tokio::time::advance(Duration::from_secs(1201)).await;
+        settle().await;
+        assert!(rig.handler.plan_list().is_empty(), "scheduled winddown fired + removed");
+    }
+
+    // WAKE (no selector): `wake in 2h` fires only past 2h. At the deadline wake_now
+    // starts from silence (live gain near the synth floor) and installs the sub-JND
+    // WakeTo ramp; the once plan is removed.
+    #[tokio::test(start_paused = true)]
+    async fn wake_in_ramps_from_silence() {
+        use crate::player::SYNTH_FLOOR_DB;
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = chrono::Utc::now() + chrono::Duration::seconds(7200); // 2h
+        rig.handler.wake_set(at, None, 0).unwrap();
+        assert_eq!(rig.handler.plan_list().len(), 1);
+        // Not at 30min (proves the horizon is not capped to max_dur = 30min).
+        tokio::time::advance(Duration::from_secs(1800)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "wake in 2h must not fire at 30min");
+        // Cross 2h.
+        tokio::time::advance(Duration::from_secs(5401)).await;
+        settle().await;
+        assert!(rig.handler.fade_active_for_test().await, "wake ramp installed at the deadline");
+        assert!(
+            rig.handler.live_gain_db_for_test() <= SYNTH_FLOOR_DB + 5.0,
+            "wake ramp starts near silence"
+        );
+        assert!(rig.handler.plan_list().is_empty(), "once wake plan removed");
+    }
+
+    // WAKE: an enqueue failure ABORTS the ramp - never ramp silence over an empty
+    // queue. Selector::Calmer is loud-unsupported (P4), so plan_enqueue errors
+    // deterministically (no network) and wake_now returns Err before any ramp.
+    #[tokio::test(start_paused = true)]
+    async fn wake_enqueue_failure_aborts_ramp() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = chrono::Utc::now() + chrono::Duration::seconds(60);
+        rig.handler
+            .wake_set(at, Some(crate::plan::Selector::Calmer(SongId("x".into()))), 5)
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        settle().await;
+        assert!(
+            !rig.handler.fade_active_for_test().await,
+            "no ramp installed when the enqueue fails"
+        );
+    }
+
+    // WAKE control: wake_remaining reports the countdown; wake_cancel disarms (no
+    // fire after advancing past the deadline).
+    #[tokio::test(start_paused = true)]
+    async fn wake_remaining_and_cancel() {
+        let Some(rig) = Rig::new(&[("s0", Some(200), Some("A"))]).await else {
+            eprintln!("skip: no CA certs");
+            return;
+        };
+        let at = chrono::Utc::now() + chrono::Duration::seconds(1800);
+        rig.handler.wake_set(at, None, 0).unwrap();
+        let rem = rig.handler.wake_remaining().expect("a wake is armed");
+        assert!(rem >= Duration::from_secs(1798) && rem <= Duration::from_secs(1801), "got {rem:?}");
+        assert!(rig.handler.wake_cancel(), "wake cancel disarms");
+        tokio::time::advance(Duration::from_secs(2000)).await;
+        settle().await;
+        assert!(!rig.handler.fade_active_for_test().await, "no fire after wake cancel");
     }
 }

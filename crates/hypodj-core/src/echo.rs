@@ -77,6 +77,11 @@ fn action_dsl(a: &Action) -> Option<String> {
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
+        // ToFloor/WakeTo/Wake are built only by the convenience sleep/winddown/wake
+        // commands, not the keyword `plan add` DSL - so they are not round-tripped.
+        Action::Fade(FadeIntentIr::ToFloor { .. })
+        | Action::Fade(FadeIntentIr::WakeTo { .. })
+        | Action::Wake { .. } => return None,
     })
 }
 
@@ -139,6 +144,24 @@ pub fn describe_plan(raw: &RawPlan) -> String {
             }
             s
         }
+        Action::Fade(FadeIntentIr::ToFloor { secs: s }) => {
+            format!("wind DOWN to the quiet floor over {}", human_dur(*s))
+        }
+        Action::Fade(FadeIntentIr::WakeTo { vol, secs: s, .. }) => {
+            format!("wake UP to volume {} over {}", vol, human_dur(*s))
+        }
+        Action::Wake { selector, count } => match selector {
+            Some(sel) => {
+                let what = match sel {
+                    Selector::Genre(g) => format!("{g} tracks"),
+                    Selector::Query(q) => format!("tracks matching \"{q}\""),
+                    Selector::Radio => "random tracks".to_string(),
+                    _ => "tracks".to_string(),
+                };
+                format!("wake: enqueue {count} {what}, then ramp up from silence")
+            }
+            None => "wake: ramp up from silence to the saved comfort level".to_string(),
+        },
     };
     format!("{what} {when}")
 }
