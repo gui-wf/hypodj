@@ -5,6 +5,8 @@ members = [
     "crates/hypodj-nl",
     "crates/hypodj-daemon",
     "crates/hypodj-cli",
+    "crates/hypodj-client",
+    "crates/hypodj-tui",
 ]
 
 [workspace.package]
@@ -18,6 +20,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 anyhow = "1"
 thiserror = "2"
+ratatui = "0.29"
+crossterm = "0.28"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Pinned exactly: opensubsonic 0.3.0 is a young, single-maintainer crate (first
