@@ -35,7 +35,7 @@ use mpris_server::{
 
 use crate::handler::{CurrentItem, HypodjHandler};
 use crate::model::{QueueEntry, Song};
-use crate::player::{effective_play_state, PlayState, PlayerHandle};
+use crate::player::{PlayState, PlayerHandle};
 use crate::subsonic::SubsonicClient;
 
 /// The MPRIS implementation object served on the bus. Cheap to hold: three Arc/
@@ -97,11 +97,11 @@ pub fn spawn_raise(raise_command: Option<&[String]>) {
 
 impl HypodjMpris {
     fn playback_status(&self) -> PlaybackStatus {
-        // Idle guard: with nothing loaded the status MUST be Stopped so the
-        // GNOME media widget disappears rather than showing a phantom
-        // "playing nothing". Mirrors the MPD `status` source of truth.
-        let raw = effective_play_state(self.player.state(), self.handler.current_item().is_some());
-        state_to_status(raw)
+        // The handler's single source of truth: idle-guarded (nothing loaded ->
+        // Stopped so the GNOME widget disappears) AND pending-pause-aware (Paused the
+        // instant a pause is requested, so the widget flips to a play symbol without
+        // waiting for the fade to freeze mpv). Mirrors the MPD `status` source.
+        state_to_status(self.handler.reported_play_state())
     }
 
     fn metadata(&self) -> Metadata {
@@ -276,22 +276,24 @@ impl PlayerInterface for HypodjMpris {
         Ok(())
     }
     async fn pause(&self) -> fdo::Result<()> {
-        let _ = self.player.pause().await;
+        // Route through the handler (NOT the player directly) so the startle-safe
+        // pause fade runs AND the change signal fires - the latter is what makes the
+        // GNOME widget re-read PlaybackStatus and flip the button to a play symbol.
+        let _ = self.handler.set_pause(Some(true)).await;
         Ok(())
     }
     async fn play_pause(&self) -> fdo::Result<()> {
-        let _ = match self.player.state() {
-            PlayState::Playing => self.player.pause().await,
-            _ => self.player.resume().await,
-        };
+        let _ = self.handler.set_pause(None).await;
         Ok(())
     }
     async fn stop(&self) -> fdo::Result<()> {
-        let _ = self.player.stop().await;
+        // Route through the handler so the stop also fires the change signal (the
+        // desktop widget refresh), same reason as pause().
+        self.handler.stop_playback().await;
         Ok(())
     }
     async fn play(&self) -> fdo::Result<()> {
-        let _ = self.player.resume().await;
+        let _ = self.handler.set_pause(Some(false)).await;
         Ok(())
     }
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
@@ -378,6 +380,7 @@ impl PlayerInterface for HypodjMpris {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::effective_play_state;
     use crate::config::ServerConfig;
     use crate::model::SongId;
 

@@ -36,7 +36,8 @@ use crate::clock::TokioClock;
 use crate::config::FadeConfig;
 use crate::executor::PendingPlan;
 use crate::fade::{
-    run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget, StartleBounds,
+    min_deliberate_dur, run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget,
+    StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
 use crate::intelligence::{FeatureStore, MetadataStore};
@@ -53,7 +54,7 @@ use crate::mpd::{
     WakeCmd, WakeWhen, WinddownCmd,
 };
 use crate::player::{
-    db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerHandle,
+    db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
 };
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
@@ -98,6 +99,15 @@ struct State {
     /// domain would floor it to 0). Cleared by any manual volume set and by fade
     /// completion.
     fading: bool,
+    /// PENDING-PAUSE intent: `true` from the instant a pause is REQUESTED until it
+    /// is superseded (a fresh play/next/prev/stop) or explicitly resumed. It is the
+    /// reported-state override in [`Self::reported_play_state`]: while `true` the
+    /// outward play state is Paused IMMEDIATELY, without waiting for the pause fade
+    /// to reach silence and freeze mpv. This collapses the inconsistent window where
+    /// mpv is still raw-Playing during the fade - status/MPRIS/checkpoint all report
+    /// Paused at request time, so an ACK, a mid-fade checkpoint, and a Play-during-
+    /// fade branch all see the true intent, not a stale Playing.
+    pending_pause: bool,
     /// Bumped whenever the queue changes (MPD "playlist version").
     playlist_version: u64,
     /// Client-negotiated binary chunk size (ncmpcpp sends `binarylimit`). MPD is
@@ -121,6 +131,7 @@ impl Default for State {
             live_gain_db: 0.0,
             fade_epoch: 0,
             fading: false,
+            pending_pause: false,
             playlist_version: 0,
             binary_limit: 8192,
             last_starred_order: Vec::new(),
@@ -147,11 +158,17 @@ impl State {
 
     /// Set the baseline AND live gain together (a manual volume change) and clear
     /// the `fading` switch: manual wins, so `reported_volume()` returns exactly
-    /// `v` afterward.
+    /// `v` afterward. Also clears `pending_pause`: a manual volume commit
+    /// (setvol/mpris/clear/stop/fade-terminal) reconciles the deck to a concrete
+    /// baseline, so it must never leave the reported state stuck at Paused. In
+    /// particular, when a `setvol` supersedes an in-flight PauseOut fade before its
+    /// Terminal::Pause runs (mpv still Playing), clearing here is what keeps the
+    /// reported state from lying Paused forever while audio keeps playing.
     fn set_manual_volume(&mut self, v: u8) {
         self.target_volume = v;
         self.live_gain_db = mpv_volume_to_db(v as f64);
         self.fading = false;
+        self.pending_pause = false;
     }
 }
 
@@ -267,6 +284,16 @@ enum Terminal {
     StopRestore,
     /// `fade to <v>`: commit `v` as the new baseline volume.
     SetBaseline(u8),
+    /// Startle-safe transport PAUSE: the ramp has reached silence, so now PAUSE mpv
+    /// (audio already silent - no click) and clear `fading`, WITHOUT touching
+    /// `target_volume` (the baseline is preserved as the level a later RESUME rises
+    /// to). Then RESTORE mpv's real volume to that baseline while paused - paused is
+    /// silent anyway, so this is inaudible, and it guarantees that ANY later play
+    /// path (a fresh play, a new queue, a plan) starts at the correct level rather
+    /// than stuck at the faded-down ~0. RESUME re-forces silence and fades back in,
+    /// so this restore never causes a resume to skip the ramp. Distinct from
+    /// [`Terminal::StopRestore`] (which stops and restores).
+    Pause,
 }
 
 /// A fade-NATIVE request: the abstract intent plus the (already resolved +
@@ -288,6 +315,19 @@ pub struct FadeRequest {
 pub enum FadeIntent {
     /// Ramp to silence, then stop playback and restore the pre-fade baseline.
     Out,
+    /// Startle-safe transport PAUSE: a SHORT DELIBERATE ramp to silence (3 dB/step,
+    /// NOT the long sub-JND fade), then PAUSE mpv (not stop) leaving the baseline
+    /// volume untouched, so a later RESUME ramps back to exactly the pre-pause level.
+    /// Resolves to (Silence, sub_jnd=false, [`Terminal::Pause`]) with the duration
+    /// clamped UP to the deliberate-safe minimum (never a hard cut). The RESUME half
+    /// reuses [`FadeIntent::ResumeIn`] (a short deliberate wake from silence).
+    PauseOut,
+    /// User-initiated RESUME ramp: a SHORT DELIBERATE ramp UP from silence to the
+    /// pre-pause level, committing it as the baseline. Unlike [`FadeIntent::WakeTo`]
+    /// (the long sub-JND alarm/restore wake), a resume is a responsive, click-safe
+    /// cue - deliberate 3 dB/step, duration clamped UP to the safe minimum. Resolves
+    /// to (Db(target_db), sub_jnd=false, [`Terminal::SetBaseline`]).
+    ResumeIn { target_db: f64, vol: u8 },
     /// Wake ramp UP to the comfort ceiling. NEVER ramps down: if the live gain is
     /// already at/above the ceiling the target is the live gain (a degenerate
     /// no-op), so a `fade in` at full volume does nothing rather than dropping.
@@ -309,11 +349,23 @@ pub enum FadeIntent {
 }
 
 impl FadeIntent {
-    /// Resolve into `(target, sub_jnd, terminal)` against the live `from_db`, the
-    /// configured comfort `ceiling`, and the wind-down `floor_db`.
-    fn resolve(self, from_db: f64, ceiling: f64, floor_db: f64) -> (FadeTarget, bool, Terminal) {
+    /// Resolve into `(target, sub_jnd, terminal, clamp_dur_up)` against the live
+    /// `from_db`, the configured comfort `ceiling`, and the wind-down `floor_db`.
+    /// `clamp_dur_up` requests that a too-short DELIBERATE duration be extended to
+    /// the startle-safe minimum instead of being rejected as `StepTooLarge` (the
+    /// pause/resume transport ramps must always land, never hard-cut).
+    fn resolve(
+        self,
+        from_db: f64,
+        ceiling: f64,
+        floor_db: f64,
+    ) -> (FadeTarget, bool, Terminal, bool) {
         match self {
-            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore),
+            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore, false),
+            // Short DELIBERATE ramp to silence, then PAUSE (not stop): the baseline
+            // is preserved as the resume level. clamp_dur_up so a 0.5s request over a
+            // large span extends to the safe minimum rather than being rejected.
+            FadeIntent::PauseOut => (FadeTarget::Silence, false, Terminal::Pause, true),
             // Sub-JND to the floor level, committing it as the baseline: playback
             // continues quiet, no mute step, no click.
             FadeIntent::ToFloor => {
@@ -322,7 +374,7 @@ impl FadeIntent {
                 // re-brighten a quieter state.
                 let target = floor_db.min(from_db);
                 let vol = db_to_mpv_volume(target).round().clamp(0.0, 100.0) as u8;
-                (FadeTarget::Db(target), true, Terminal::SetBaseline(vol))
+                (FadeTarget::Db(target), true, Terminal::SetBaseline(vol), false)
             }
             FadeIntent::In => {
                 // Ceiling clamp: target the HIGHER of the live gain and the
@@ -330,16 +382,21 @@ impl FadeIntent {
                 // manual level, never drops when named `in`).
                 let target_db = from_db.max(ceiling);
                 let vol = db_to_mpv_volume(target_db).round().clamp(0.0, 100.0) as u8;
-                (FadeTarget::Db(target_db), true, Terminal::SetBaseline(vol))
+                (FadeTarget::Db(target_db), true, Terminal::SetBaseline(vol), false)
             }
             FadeIntent::To { target_db, vol } => {
-                (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol))
+                (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol), false)
             }
             // Wake ramp: sub-JND ramp to the SAVED level, committing it as the
             // restored baseline. from_db is the synth floor (silence) at restore,
             // so the schedule rises from silence to the user's real level.
             FadeIntent::WakeTo { target_db, vol } => {
-                (FadeTarget::Db(target_db), true, Terminal::SetBaseline(vol))
+                (FadeTarget::Db(target_db), true, Terminal::SetBaseline(vol), false)
+            }
+            // Short deliberate resume ramp from silence to the saved level. Like To
+            // but clamp_dur_up so a short request never rejects; SetBaseline commits.
+            FadeIntent::ResumeIn { target_db, vol } => {
+                (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol), true)
             }
         }
     }
@@ -450,6 +507,38 @@ async fn fade_task(
                     // fade drove the fractional seam; snap the u8 seam to match).
                     let _ = sink.set_volume(v).await;
                     state.lock().unwrap().set_manual_volume(v);
+                    changed.notify_waiters();
+                }
+                Terminal::Pause => {
+                    // The ramp reached silence: PAUSE mpv now (audio already muted,
+                    // no click). Awaiting the player actor here is fine - we hold the
+                    // tokio slot mutex, never the std Mutex<State>, across the await.
+                    // Surface a pause failure honestly instead of swallowing it (the
+                    // pause happens here, off the set_pause call stack - see F6).
+                    if let Err(e) = sink.pause().await {
+                        tracing::warn!(error = %e, "pause fade terminal: mpv pause failed");
+                    }
+                    // Restore mpv's real volume to the preserved baseline while paused
+                    // (paused is silent, so inaudible + no click): this guarantees ANY
+                    // later play path starts at the correct level, never stuck at the
+                    // faded-down ~0. RESUME re-forces silence and fades back in, so
+                    // this never lets a resume skip its ramp.
+                    let baseline = state.lock().unwrap().target_volume;
+                    let _ = sink.set_volume(baseline).await;
+                    // Clear `fading` and re-sync the live gain to the restored
+                    // baseline so the reported volume snaps back to it; leave
+                    // target_volume (the resume level) untouched.
+                    {
+                        let mut st = state.lock().unwrap();
+                        st.live_gain_db = mpv_volume_to_db(baseline as f64);
+                        st.fading = false;
+                        // The real pause has landed (mpv is Paused): the pending
+                        // intent is fulfilled and the raw state now carries it.
+                        st.pending_pause = false;
+                    }
+                    // Fire the change signal AFTER the Paused state edge, so the MPRIS
+                    // property-update loop re-emits PlaybackStatus = Paused (the GNOME
+                    // widget refresh) and MPD `idle` wakes.
                     changed.notify_waiters();
                 }
             },
@@ -1022,7 +1111,7 @@ impl HypodjHandler {
         let _ = self.player.set_volume(0).await;
 
         // (3) Play from silence.
-        self.play_index(idx).await?;
+        self.play_index_from_silence(idx).await?;
 
         // (4) Sub-JND ramp silence -> saved comfort level (startle-safe by
         // construction; WakeTo resolves sub_jnd=true / SetBaseline).
@@ -1476,9 +1565,26 @@ impl HypodjHandler {
             .supersede(
                 move || {
                     let from_db = state_read.lock().unwrap().live_gain_db;
-                    let (target, sub_jnd, terminal) = intent.resolve(from_db, ceiling, floor_db);
+                    let (target, sub_jnd, terminal, clamp_dur_up) =
+                        intent.resolve(from_db, ceiling, floor_db);
                     let bounds = startle_bounds(&cfg, sub_jnd);
-                    let spec = FadeSpec::new(from_db, target, dur, tick, Curve::DbLinear, bounds)?;
+                    // A DELIBERATE transport ramp (pause/resume) must always land:
+                    // clamp the duration UP to the shortest length that keeps every
+                    // step under the 3 dB cap, so FadeSpec::new never rejects it as
+                    // StepTooLarge and it is never a hard cut.
+                    let eff_dur = if clamp_dur_up {
+                        // Use the SAME per-step interval FadeSpec::new will use
+                        // (tick.max(min_slew)); passing bare min_slew when
+                        // tick > min_slew under-counts the steps and the clamp
+                        // fails to prevent the StepTooLarge rejection.
+                        let min_slew = Duration::from_millis(cfg.min_slew_ms);
+                        let step_interval = tick.max(min_slew);
+                        dur.max(min_deliberate_dur(from_db, target, step_interval, synth_floor))
+                    } else {
+                        dur
+                    };
+                    let spec =
+                        FadeSpec::new(from_db, target, eff_dur, tick, Curve::DbLinear, bounds)?;
                     Ok((spec, terminal))
                 },
                 move |(spec, terminal)| {
@@ -1504,6 +1610,163 @@ impl HypodjHandler {
         // On rejection nothing was disturbed: the in-flight fade (if any) is still
         // running and no volume was touched, so just surface the ACK error.
         res
+    }
+
+    // ── startle-safe transport (pause / resume) ─────────────────────────────
+
+    /// The play state to REPORT outward (MPD `status`, MPRIS `PlaybackStatus`,
+    /// resume checkpoints). Layers TWO guards over the raw mpv state:
+    ///   1. the idle guard ([`effective_play_state`]): nothing loaded -> Stopped;
+    ///   2. the pending-pause intent: a pause has been requested but the fade to
+    ///      silence has not yet frozen mpv -> report Paused IMMEDIATELY, so the whole
+    ///      pause window is consistent (no stale Playing at the ACK, in a mid-fade
+    ///      checkpoint, or on a Play-during-fade branch).
+    /// One source of truth shared by `status`, the MPRIS surface, and the resume
+    /// checkpoint - so they can never disagree about the play state.
+    pub fn reported_play_state(&self) -> PlayState {
+        let (has_current, pending) = {
+            let st = self.state.lock().unwrap();
+            (
+                st.current.and_then(|i| st.queue.get(i)).is_some(),
+                st.pending_pause,
+            )
+        };
+        if !has_current {
+            return PlayState::Stopped;
+        }
+        if pending {
+            return PlayState::Paused;
+        }
+        effective_play_state(self.player.state(), has_current)
+    }
+
+    /// The clamped pause/resume fade duration (float-second `pause_fade_secs` into
+    /// `[min_slew, max_dur]`). Saturating parse: a pathological float never panics.
+    fn pause_fade_dur(&self) -> Duration {
+        let raw = Duration::try_from_secs_f64(self.fade_cfg.pause_fade_secs)
+            .unwrap_or_else(|_| Duration::from_millis(self.fade_cfg.min_slew_ms));
+        self.clamp_fade_dur(raw)
+    }
+
+    /// THE startle-safe transport toggle, shared by the MPD `pause` command and the
+    /// MPRIS Pause/PlayPause/Play controls. `want`: `Some(true)` pause, `Some(false)`
+    /// resume, `None` toggle from the live state.
+    ///
+    /// PAUSE first runs a SHORT sub-JND fade to silence via [`Self::start_fade_spec`]
+    /// (reused verbatim), THEN pauses mpv in the fade terminal (silent at the freeze,
+    /// no click). RESUME unpauses from silence, THEN ramps back to the pre-pause
+    /// level. Both notify on the transition so the MPRIS PropertiesChanged loop (and
+    /// MPD `idle`) refresh - the fix for a desktop widget that would otherwise never
+    /// see the Paused edge (it never went through `notify_change`).
+    pub async fn set_pause(&self, want: Option<bool>) -> Result<(), PlayerError> {
+        // Decide from the EFFECTIVE (pending-pause-aware) state, not the raw mpv
+        // state: during a pause-out fade mpv is still raw-Playing but the intent is
+        // Paused, so a Play/Resume/PlayPause issued in that window must take the
+        // resume branch (aborting the pause), never re-pause or drop (F5).
+        let state = self.reported_play_state();
+        let should_pause = match want {
+            Some(p) => p,
+            None => matches!(state, PlayState::Playing),
+        };
+        match (should_pause, state) {
+            // Playing -> pause (fade to silence, then pause).
+            (true, PlayState::Playing) => self.pause_with_fade().await,
+            // Paused (or pending-pause) -> resume (unpause from silence, then fade
+            // in). This also aborts an in-flight pause-out fade (F5).
+            (false, PlayState::Paused) => self.resume_with_fade().await,
+            // Stopped and asked to play: nothing loaded to fade; mirror the prior
+            // direct-resume behavior and notify so a listener still refreshes.
+            (false, PlayState::Stopped) => {
+                let r = self.player.resume().await;
+                self.notify_change();
+                r
+            }
+            // Already in the desired state (or pause requested while not playing):
+            // a no-op OK, no fade, no spurious notify.
+            _ => Ok(()),
+        }
+    }
+
+    /// Run the sub-JND fade to silence, then pause (via [`Terminal::Pause`]). The
+    /// pause happens in the spawned fade terminal, so this returns as soon as the
+    /// fade is installed. A rejected spec (should not happen for a sub-JND Silence
+    /// fade) degrades to a direct pause so playback never stays audible.
+    async fn pause_with_fade(&self) -> Result<(), PlayerError> {
+        // Flip the REPORTED state to Paused IMMEDIATELY (F2): set the pending-pause
+        // intent and notify BEFORE the fade runs, so status/MPRIS/checkpoints see
+        // Paused at once and the whole fade window is consistent.
+        self.state.lock().unwrap().pending_pause = true;
+        self.notify_change();
+        let dur = self.pause_fade_dur();
+        match self
+            .start_fade_spec(FadeRequest { intent: FadeIntent::PauseOut, dur })
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                tracing::warn!(error = %e, "pause fade rejected; pausing without fade");
+                let r = self.player.pause().await;
+                self.notify_change();
+                r
+            }
+        }
+    }
+
+    /// Unpause from silence, then sub-JND ramp back to the pre-pause baseline. Force
+    /// start-from-silence FIRST (cancel any in-flight fade AND drop the live gain to
+    /// the synth floor atomically under the slot lock, then set mpv volume 0) so the
+    /// ramp genuinely rises from silence rather than snapping to the prior level. The
+    /// ramp reuses [`FadeIntent::WakeTo`] verbatim (identical to the wake path).
+    async fn resume_with_fade(&self) -> Result<(), PlayerError> {
+        // The level to restore: the baseline preserved across the pause.
+        let vol = self.state.lock().unwrap().target_volume;
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        // Atomically cancel the (possibly still-running) pause fade AND force the
+        // live gain to silence AND clear the pending-pause intent, so no straggler
+        // write races the set_volume(0) below and the reported state flips to Playing
+        // (this also ABORTS an in-flight pause-out fade - the F5 resume-during-window
+        // path). If the pause fade was superseded here BEFORE its Terminal::Pause
+        // ran, mpv is still Playing; if it already froze, resume() unpauses it.
+        self.fade
+            .cancel_with(|| {
+                let mut st = self.state.lock().unwrap();
+                st.live_gain_db = synth_floor;
+                st.pending_pause = false;
+            })
+            .await;
+        let _ = self.player.set_volume(0).await;
+        // Unpause from silence.
+        let r = self.player.resume().await;
+        // Reflect the Playing edge immediately so the MPRIS widget flips to a pause
+        // symbol without waiting for the ramp to finish.
+        self.notify_change();
+        // Short DELIBERATE ramp silence -> the saved level (ResumeIn: SetBaseline).
+        // A user resume is responsive, not the long sub-JND alarm wake.
+        let dur = self.pause_fade_dur();
+        let intent = FadeIntent::ResumeIn { target_db: mpv_volume_to_db(vol as f64), vol };
+        let _ = self.start_fade_spec(FadeRequest { intent, dur }).await;
+        r
+    }
+
+    /// Stop playback the startle-safe way the MPD `stop` path does: atomically cancel
+    /// any in-flight fade and settle the baseline, then stop mpv and re-assert the
+    /// baseline gain, then notify. Shared by the MPD `stop` command and MPRIS Stop
+    /// (so an MPRIS-initiated stop also refreshes the desktop widget).
+    pub async fn stop_playback(&self) {
+        self.fade
+            .cancel_with(|| {
+                let mut st = self.state.lock().unwrap();
+                let v = st.target_volume;
+                st.set_manual_volume(v);
+                // A stop clears any pending-pause intent (the deck is stopping, not
+                // paused): the reported state must not stick at Paused.
+                st.pending_pause = false;
+            })
+            .await;
+        let _ = self.player.stop().await;
+        let v = self.state.lock().unwrap().target_volume;
+        let _ = self.player.set_volume(v).await;
+        self.notify_change();
     }
 
     // ── smooth-restart (resume) ─────────────────────────────────────────────
@@ -1535,16 +1798,16 @@ impl HypodjHandler {
     /// by the caller from the lockless live-elapsed atomic - never queried from
     /// mpv, so it is safe during a SIGTERM race.
     pub fn resume_snapshot(&self, elapsed_secs: f64) -> ResumeState {
-        let st = self.state.lock().unwrap();
-        // Belt-and-suspenders: a checkpoint can NEVER claim Playing/Paused with
-        // no current song. Map through the idle guard so an honest Stopped is
-        // persisted whenever nothing is loaded (never a phantom Playing + []).
-        let has_current = st.current.and_then(|i| st.queue.get(i)).is_some();
-        let play_state = match effective_play_state(self.player.state(), has_current) {
+        // The pending-pause-aware, idle-guarded reported state: a checkpoint taken
+        // mid-pause-fade persists Paused (never a stale Playing that would make a
+        // crash-resume auto-play), and never claims Playing/Paused with no current
+        // song. Computed BEFORE locking `State` (it locks internally).
+        let play_state = match self.reported_play_state() {
             PlayState::Playing => ResumePlayState::Playing,
             PlayState::Paused => ResumePlayState::Paused,
             PlayState::Stopped => ResumePlayState::Stopped,
         };
+        let st = self.state.lock().unwrap();
         let queue = st
             .queue
             .iter()
@@ -1674,7 +1937,7 @@ impl HypodjHandler {
             // Silence BEFORE the first buffer: mpv volume 0 persists across the
             // loadfile so the wake ramp owns the rise.
             let _ = self.player.set_volume(0).await;
-            if let Err(e) = self.play_index(idx).await {
+            if let Err(e) = self.play_index_from_silence(idx).await {
                 return Err(e);
             }
             // A library song seeks to the saved elapsed; a raw Stream restarts from
@@ -1842,18 +2105,46 @@ impl HypodjHandler {
         };
         match next {
             Some(idx) => {
-                let _ = self.play_index(idx).await;
+                // A natural EOF advance is NOT a user gesture: it must NOT cancel an
+                // in-flight fade or snap mpv's gain back to the baseline. A slow ramp
+                // (winddown/sleep) has to survive across the track boundary (mpv
+                // `volume` persists across loadfile replace), so play WITHOUT the
+                // resync that play_index performs for fresh-play gestures.
+                let _ = self.play_index_inner(idx, false).await;
             }
             None => {
-                self.state.lock().unwrap().current = None;
+                let mut st = self.state.lock().unwrap();
+                st.current = None;
+                // End of queue: no pending pause can survive a stopped deck.
+                st.pending_pause = false;
+                drop(st);
                 self.notify_change();
             }
         }
     }
 
     /// Resolve and start playing the queue item at `idx`. Returns an ACK-style
-    /// error string on failure.
+    /// error string on failure. A fresh-play gesture (`next`/`play`/`prev`/Eof
+    /// advance) resyncs mpv's gain to the baseline first - see
+    /// [`Self::play_index_inner`].
     async fn play_index(&self, idx: usize) -> Result<(), String> {
+        self.play_index_inner(idx, true).await
+    }
+
+    /// As [`Self::play_index`] but WITHOUT resyncing mpv's gain: the caller
+    /// (`wake_now` / `restore`) has deliberately forced start-from-silence
+    /// (`live_gain_db = synth_floor`, `player.set_volume(0)`) before the first
+    /// buffer and owns the rise via a following wake ramp. Resyncing here would
+    /// clobber that silence and defeat the ramp.
+    async fn play_index_from_silence(&self, idx: usize) -> Result<(), String> {
+        self.play_index_inner(idx, false).await
+    }
+
+    /// Resolve and start playing the queue item at `idx`. When `resync_volume` is
+    /// set, any in-flight fade is cancelled and mpv's gain re-asserted to the
+    /// baseline BEFORE loading, so a fresh-play gesture supersedes a pause/fade in
+    /// progress (see the two failure modes documented at the cancel below).
+    async fn play_index_inner(&self, idx: usize, resync_volume: bool) -> Result<(), String> {
         let item = {
             let st = self.state.lock().unwrap();
             st.queue.get(idx).cloned()
@@ -1870,6 +2161,32 @@ impl HypodjHandler {
         // (TimePos/StateChanged/Eof) is attributed to THIS entry even after an
         // off-spine next/prev/delete repoints the current index.
         let qid = Some(QueueId(item.id));
+        if resync_volume {
+            // A fresh-play gesture supersedes any in-flight fade (e.g. a PauseOut
+            // ramp from a pause-then-next gesture, or a plain fade-out): atomically
+            // cancel it and settle the baseline, THEN re-assert the real mpv gain to
+            // the baseline BEFORE loading. Otherwise a surviving PauseOut fade would
+            // drive the freshly started track down to silence and its
+            // Terminal::Pause would freeze the deck Paused on the new track; and
+            // even an already-completed pause fade leaves mpv's volume at ~0 (it
+            // persists across loadfile), so without this the new track would play
+            // inaudible while getvol/MPRIS report the baseline. Mirrors the stop
+            // path (`stop_playback`).
+            self.fade
+                .cancel_with(|| {
+                    let mut st = self.state.lock().unwrap();
+                    let v = st.target_volume;
+                    st.set_manual_volume(v);
+                    // A fresh-play gesture supersedes any pending pause: the deck is
+                    // playing a track now, so the reported state must be Playing, and
+                    // a superseded PauseOut fade must never freeze this new track
+                    // Paused.
+                    st.pending_pause = false;
+                })
+                .await;
+            let baseline = self.state.lock().unwrap().target_volume;
+            let _ = self.player.set_volume(baseline).await;
+        }
         match &item.entry {
             QueueEntry::Song(song) => {
                 let url = self
@@ -2059,14 +2376,9 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Ping => MpdResponse::ok(),
 
             MpdCommand::Status => {
-                let (state, vol, qlen, cur, ver) = {
+                let (vol, qlen, cur, ver) = {
                     let st = self.state.lock().unwrap();
-                    // A current pointer only counts if it resolves to a real queue
-                    // item; with nothing loaded the reported state MUST be Stopped
-                    // even if the raw backend claims otherwise (idle mpv guard).
-                    let has_current = st.current.and_then(|i| st.queue.get(i)).is_some();
                     (
-                        effective_play_state(self.player.state(), has_current),
                         // Derived from the live gain so status tracks an in-flight
                         // fade and never desyncs from the envelope.
                         st.reported_volume(),
@@ -2075,6 +2387,9 @@ impl MpdHandler for HypodjHandler {
                         st.playlist_version,
                     )
                 };
+                // The pending-pause-aware, idle-guarded reported state (Paused the
+                // instant a pause is requested, not only once the fade freezes mpv).
+                let state = self.reported_play_state();
                 let state_str = match state {
                     PlayState::Playing => "play",
                     PlayState::Paused => "pause",
@@ -2166,16 +2481,10 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::Pause(want) => {
-                let res = match want {
-                    Some(true) => self.player.pause().await,
-                    Some(false) => self.player.resume().await,
-                    None => match self.player.state() {
-                        PlayState::Playing => self.player.pause().await,
-                        _ => self.player.resume().await,
-                    },
-                };
-                self.notify_change();
-                match res {
+                // Startle-safe transport: PAUSE fades to silence THEN pauses; RESUME
+                // unpauses from silence THEN fades in. set_pause notifies on the
+                // transition (the pause edge fires from the fade terminal).
+                match self.set_pause(want).await {
                     Ok(()) => MpdResponse::ok(),
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "pause", &e.to_string()),
                 }
@@ -2183,22 +2492,9 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Stop => {
                 // Manual wins ATOMICALLY: cancel (abort+join) any fade AND drop the
                 // stale live-fade level back to the baseline under the SAME slot
-                // lock, so no concurrent `fade` can slip in between. The stop and
-                // the mpv re-assert are sequenced after.
-                self.fade
-                    .cancel_with(|| {
-                        let mut st = self.state.lock().unwrap();
-                        let v = st.target_volume;
-                        st.set_manual_volume(v);
-                    })
-                    .await;
-                let _ = self.player.stop().await;
-                let v = self.state.lock().unwrap().target_volume;
-                // Re-assert the real mpv gain to the baseline so the cancelled
-                // fade's faded-down level does not linger under a baseline report
-                // (F4): the next play starts at the reported volume, not silence.
-                let _ = self.player.set_volume(v).await;
-                self.notify_change();
+                // lock, so no concurrent `fade` can slip in between (see
+                // stop_playback: the stop and the mpv re-assert are sequenced after).
+                self.stop_playback().await;
                 MpdResponse::ok()
             }
             MpdCommand::Fade(args) => {
@@ -3912,6 +4208,58 @@ mod tests {
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
     }
 
+    // A `next` issued DURING the pause-out fade supersedes it: the fresh track
+    // plays audibly instead of being ramped to silence and frozen Paused by the
+    // PauseOut Terminal::Pause. Covers the pause-then-next gesture.
+    #[tokio::test(start_paused = true)]
+    async fn next_during_pause_fade_plays_the_new_track() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Pause installs a PauseOut fade to silence (mpv still Playing during the
+        // ramp). Let a couple of ticks apply so the fade is genuinely in flight.
+        h.set_pause(Some(true)).await.unwrap();
+        assert!(h.fade_active().await, "pause installs an in-flight fade");
+        pump(20, 2).await;
+
+        // `next` mid-fade must cancel the PauseOut fade and start track B audibly.
+        h.handle(MpdCommand::Next).await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+        assert_eq!(h.player.state(), PlayState::Playing, "next must NOT end Paused");
+        assert!(!h.fade_active().await, "the PauseOut fade must be superseded");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
+    }
+
+    // A `play`/`next` issued AFTER the pause-out fade has fully completed (mpv
+    // volume stuck at ~0, player Paused) re-asserts the baseline gain, so the new
+    // track is audible rather than silent-while-reporting-baseline.
+    #[tokio::test(start_paused = true)]
+    async fn play_after_completed_pause_fade_restores_audible_gain() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.set_pause(Some(true)).await.unwrap();
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Paused);
+        // The pause terminal RESTORES mpv's volume to the baseline while paused (F4)
+        // so no later play path can start silent - the live gain is back at baseline,
+        // not the floor.
+        assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0, "paused deck restored to baseline gain");
+
+        // A fresh play (not resume) plays at the baseline so the track is audible.
+        h.handle(MpdCommand::Play(Some(1))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+        assert!(!h.fade_active().await);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0, "gain restored to audible");
+    }
+
     // A manual setvol mid-fade cancels (abort+join) the fade FIRST, then applies
     // the manual value: manual wins, strictly ordered, no trailing fade tick.
     #[tokio::test(start_paused = true)]
@@ -4179,6 +4527,247 @@ mod tests {
         assert_eq!(h.player.state(), PlayState::Stopped);
     }
 
+    // Issue 1 (pause): a transport PAUSE fades to silence FIRST, THEN pauses mpv -
+    // so the audio is already muted at the freeze (no click). Under paused time the
+    // fade is driven to completion; at the terminal the player is Paused and the
+    // baseline volume is both preserved and re-asserted on mpv (F4), so the live
+    // gain sits back at the baseline rather than stuck at the faded-down silence.
+    #[tokio::test(start_paused = true)]
+    async fn pause_fades_to_silence_then_pauses() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Pause: installs the fade-to-silence; the pause runs in its terminal.
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        assert!(h.fade_active().await, "pause installs a fade to silence");
+        // While the fade ramps down the player is STILL playing (fade THEN pause).
+        assert_eq!(h.player.state(), PlayState::Playing, "not paused until silence");
+
+        h.wait_for_fade().await;
+        // Now paused, baseline preserved for the eventual resume. The pause terminal
+        // RESTORES the live gain to the baseline (F4) - the deck is silent because it
+        // is paused, not because the volume is stuck at 0 - so a later fresh play is
+        // never silent.
+        assert_eq!(h.player.state(), PlayState::Paused, "paused after the fade");
+        assert!(
+            h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0,
+            "paused deck gain restored to baseline, not stuck at silence"
+        );
+        assert_eq!(h.state.lock().unwrap().target_volume, 100, "baseline preserved");
+    }
+
+    // Issue 1 (resume): a transport RESUME unpauses from silence THEN sub-JND ramps
+    // the live gain back UP to the pre-pause baseline (monotone, never overshoot).
+    #[tokio::test(start_paused = true)]
+    async fn resume_fades_in_from_silence() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // Pause and settle to silence.
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Paused);
+
+        // Resume: unpauses immediately (Playing edge), then ramps from silence.
+        h.handle(MpdCommand::Pause(Some(false))).await;
+        assert_eq!(h.player.state(), PlayState::Playing, "unpaused before the ramp");
+        assert!(h.fade_active().await, "resume installs a fade-in");
+        // The ramp starts from silence (forced), not the prior level.
+        assert!(
+            h.live_gain_db() <= h.fade_cfg.synth_floor_db + 1e-9,
+            "resume ramp starts from silence"
+        );
+
+        h.wait_for_fade().await;
+        // Ramp restored the pre-pause baseline.
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+    }
+
+    // Issue 2 (MPRIS): after a pause the reported play state is Paused AND the shared
+    // `changed` signal fires on the transition - that signal is exactly what the
+    // MPRIS run_property_updates loop awaits before re-emitting PropertiesChanged, so
+    // asserting it fires proves the desktop-widget-refresh path is wired. Before the
+    // fix the MPRIS pause bypassed notify_change and no signal ever fired.
+    #[tokio::test(start_paused = true)]
+    async fn pause_reports_paused_and_signals_change() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let h = Arc::new(h);
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // A background subscriber counts change signals (the run_property_updates
+        // wake source). Prime it before pausing so we only count the pause edge.
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let h = h.clone();
+            let count = count.clone();
+            tokio::spawn(async move {
+                loop {
+                    h.changed().await;
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+        tokio::task::yield_now().await;
+        let before = count.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Pause via the MPRIS-facing entry point (same one PlayerInterface::pause
+        // calls), then drive the fade to completion so the pause terminal runs.
+        h.set_pause(Some(true)).await.unwrap();
+        h.wait_for_fade().await;
+        tokio::task::yield_now().await;
+
+        // The raw player state is Paused, so effective_play_state (current.is_some())
+        // reports Paused -> MPRIS PlaybackStatus = Paused.
+        assert_eq!(h.player.state(), PlayState::Paused);
+        let has_current = h.current_item().is_some();
+        assert_eq!(
+            effective_play_state(h.player.state(), has_current),
+            PlayState::Paused,
+            "MPRIS PlaybackStatus source reports Paused"
+        );
+        // And a change signal fired on the transition (the PropertiesChanged path).
+        let after = count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(after > before, "a change signal must fire on the pause edge");
+    }
+
+    // F2: the instant a pause is REQUESTED the reported state flips to Paused -
+    // BEFORE the fade to silence completes and freezes mpv. Asserts it at all three
+    // outward surfaces (MPD status, the MPRIS/status source, and a resume checkpoint)
+    // while mpv is still raw-Playing mid-fade.
+    #[tokio::test(start_paused = true)]
+    async fn pause_reports_paused_immediately_before_fade_completes() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // Request the pause and let only a tick or two elapse - the fade is still in
+        // flight and mpv is still raw-Playing.
+        h.set_pause(Some(true)).await.unwrap();
+        pump(20, 2).await;
+        assert!(h.fade_active().await, "the pause fade is still running");
+        assert_eq!(h.player.state(), PlayState::Playing, "mpv not frozen yet");
+
+        // MPD status reports pause immediately.
+        assert_eq!(
+            pair(&h.handle(MpdCommand::Status).await, "state"),
+            Some("pause"),
+            "MPD status must report pause the instant it is requested"
+        );
+        // The MPRIS/status source (reported_play_state) reports Paused immediately.
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+        // A checkpoint taken mid-fade persists Paused, never a stale Playing (so a
+        // crash-resume would not auto-play).
+        let snap = h.resume_snapshot(1.0);
+        assert_eq!(snap.play_state, ResumePlayState::Paused);
+    }
+
+    // F1: the pause fade is a SHORT DELIBERATE fade (3 dB/step cap), NOT the long
+    // ~20s sub-JND fade to silence. From full volume the whole span (0 -> -60 dB)
+    // needs ceil(60/3)+1 = 21 steps, not the 80+ sub-JND steps.
+    #[tokio::test(start_paused = true)]
+    async fn pause_fade_is_short_deliberate_not_sub_jnd() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // Count the distinct live-gain steps the pause fade applies by sampling as it
+        // runs. A deliberate fade lands in ~21 steps (5s at 250ms); a sub-JND fade
+        // would take 80+ steps (~20s). Assert it completes well under the sub-JND
+        // count by driving a bounded number of ticks and checking it finished.
+        h.set_pause(Some(true)).await.unwrap();
+        // 30 ticks of 250ms = 7.5s: enough for the ~21-step deliberate fade to fully
+        // land (and reach the Pause terminal), but far short of a 20s sub-JND fade.
+        pump(250, 30).await;
+        assert_eq!(
+            h.player.state(),
+            PlayState::Paused,
+            "a deliberate pause fade must have completed and paused within ~7.5s"
+        );
+    }
+
+    // F5: a Play/Resume issued DURING the pause-out fade window aborts the pause and
+    // keeps playing, rather than being dropped or re-pausing. Keys off the pending-
+    // pause intent, not the stale raw-Playing state.
+    #[tokio::test(start_paused = true)]
+    async fn resume_during_pause_fade_keeps_playing() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.set_pause(Some(true)).await.unwrap();
+        pump(20, 2).await;
+        assert!(h.fade_active().await);
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "pending pause");
+
+        // Resume (MPRIS Play / PlayPause path) mid-fade: must take the resume branch
+        // off the pending intent, abort the pause, and stay Playing.
+        h.set_pause(Some(false)).await.unwrap();
+        assert_eq!(h.player.state(), PlayState::Playing);
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "no longer pending");
+        h.wait_for_fade().await;
+        // The resume ramp restored the baseline; the deck is audibly playing.
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0);
+    }
+
+    // F4: after a pause, a STOP then PLAY (or a fresh queue) starts at the baseline
+    // volume, never silent - the pause left mpv restored to the baseline, and the
+    // fresh play re-asserts it.
+    #[tokio::test(start_paused = true)]
+    async fn stop_then_play_after_pause_starts_at_baseline() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.set_pause(Some(true)).await.unwrap();
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Paused);
+
+        // Stop clears the pending pause and settles the baseline.
+        h.handle(MpdCommand::Stop).await;
+        assert_eq!(h.reported_play_state(), PlayState::Stopped);
+
+        // A fresh play starts audible at the baseline, not silent.
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0, "fresh play not silent");
+    }
+
+    // A natural EOF advance must NOT cancel an in-flight fade or snap mpv's gain back
+    // to the baseline: a slow winddown/sleep ramp has to continue across the track
+    // boundary (it is not a user gesture).
+    #[tokio::test(start_paused = true)]
+    async fn eof_advance_preserves_in_flight_fade() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // Arm a wind-down (ToFloor) ramp; let it drop the gain a bit.
+        h.start_fade(fade_args(FadeKind::ToFloor, 30)).await.unwrap();
+        pump(250, 6).await;
+        assert!(h.fade_active().await, "winddown running");
+        let mid = h.live_gain_db();
+        assert!(mid < -1.0, "gain has started descending (was {mid})");
+
+        // Natural EOF advance to the next track: the fade must survive, not be wiped
+        // and the gain re-asserted to the baseline.
+        h.advance_on_eof().await;
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "advanced to next track");
+        assert!(h.fade_active().await, "winddown must survive the track boundary");
+        assert!(
+            h.live_gain_db() <= mid + 1e-6,
+            "gain must not snap back to the baseline at EOF"
+        );
+    }
+
     // C2: a manual setvol against a running fade must leave NO surviving fade task
     // and report EXACTLY the manual value - the cancel + the state mutation happen
     // atomically under the slot lock, so there is no window a concurrent fade
@@ -4201,6 +4790,30 @@ mod tests {
         assert!(!st.fading, "fading switch cleared");
         assert_eq!(st.target_volume, 42);
         assert_eq!(st.reported_volume(), 42);
+    }
+
+    // A setvol that supersedes an in-flight PauseOut fade (before its Terminal::Pause
+    // freezes mpv) must clear the pending-pause intent: otherwise reported_play_state
+    // lies Paused forever while mpv keeps playing at the new volume.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_during_pause_fade_clears_pending_pause() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.set_pause(Some(true)).await.unwrap();
+        pump(20, 2).await;
+        assert!(h.fade_active().await, "pause fade still running");
+        assert_eq!(h.player.state(), PlayState::Playing, "mpv not frozen yet");
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "pending pause");
+
+        // setvol supersedes the pause fade before it froze mpv.
+        h.handle(MpdCommand::SetVol(80)).await;
+        assert!(!h.fade_active().await, "no surviving fade");
+        assert_eq!(h.player.state(), PlayState::Playing, "mpv still playing");
+        // The deck must report Playing, not stuck Paused, since audio is audible.
+        assert_eq!(h.reported_play_state(), PlayState::Playing);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 80);
     }
 
     // C2: even when a `fade` from a second logical caller races a setvol, the end
@@ -4367,7 +4980,7 @@ mod tests {
         let saved_vol = 60u8;
         let target = mpv_volume_to_db(saved_vol as f64);
         let intent = FadeIntent::WakeTo { target_db: target, vol: saved_vol };
-        let (t, sub_jnd, terminal) = intent.resolve(SYNTH_FLOOR_DB, 0.0, -45.0);
+        let (t, sub_jnd, terminal, _clamp) = intent.resolve(SYNTH_FLOOR_DB, 0.0, -45.0);
         match t {
             FadeTarget::Db(db) => assert!((db - target).abs() < 1e-9),
             _ => panic!("WakeTo must target a specific Db, not Silence"),
@@ -4384,7 +4997,7 @@ mod tests {
     #[test]
     fn to_floor_resolves_to_floor_sub_jnd_playback_continues() {
         let floor = -45.0;
-        let (t, sub_jnd, terminal) = FadeIntent::ToFloor.resolve(0.0, 0.0, floor);
+        let (t, sub_jnd, terminal, _clamp) = FadeIntent::ToFloor.resolve(0.0, 0.0, floor);
         match t {
             FadeTarget::Db(db) => assert!((db - floor).abs() < 1e-9, "targets the floor level"),
             FadeTarget::Silence => panic!("ToFloor must NOT reach Silence (playback continues)"),
@@ -4476,7 +5089,7 @@ mod tests {
     // checkpoint() writes a real resume.toml to disk that loads back equal, and a
     // paused state records ResumePlayState::Paused; a queue mutation bumps the
     // persisted playlist_version.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn checkpoint_writes_loadable_state_to_disk() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         let dir = std::env::temp_dir().join(format!("hypodj-cp-{}", std::process::id()));
@@ -4486,7 +5099,11 @@ mod tests {
 
         h.enqueue_stream_for_test(NTS).await;
         h.play_for_test(0).await;
+        // Pause now fades to silence THEN pauses (in the fade terminal); drive the
+        // fade to completion under paused time so the Paused edge lands before the
+        // checkpoint reads it.
         h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await;
         h.checkpoint(12.0).await;
 
         let loaded = crate::resume::load(&path).expect("checkpoint wrote a loadable file");

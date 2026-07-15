@@ -111,6 +111,15 @@ pub struct FadeConfig {
     /// into `[min_slew_s, max_dur_secs]`.
     #[serde(default = "d_shutdown_fade_s")]
     pub shutdown_fade_secs: u64,
+    /// Duration of the startle-safe transport pause/resume fade, SECONDS (a float,
+    /// unlike the coarse `*_secs` knobs, so a sub-second nominal is expressible).
+    /// On PAUSE the transport runs a short sub-JND fade to silence THEN pauses mpv
+    /// (silent at the freeze, no click); on RESUME it unpauses from silence THEN
+    /// ramps back to the prior level. Kept SHORT so pause feels responsive; the
+    /// fade primitive still extends it as far as sub-JND startle safety requires.
+    /// Normalized into `[min_slew_s, max_dur_secs]`.
+    #[serde(default = "d_pause_fade_s")]
+    pub pause_fade_secs: f64,
 }
 
 // Research-backed defaults (memory 01kxhjqr). Exposed as `pub const` so the fade
@@ -126,6 +135,7 @@ pub const DEFAULT_WINDDOWN_FADE_SECS: u64 = 300;
 pub const DEFAULT_WAKE_RAMP_SECS: u64 = 480;
 pub const DEFAULT_MAX_DUR_SECS: u64 = 1800;
 pub const DEFAULT_SHUTDOWN_FADE_SECS: u64 = 6;
+pub const DEFAULT_PAUSE_FADE_SECS: f64 = 0.5;
 
 /// Positive minimum for `step_size_db`. A `0` (or negative) step would divide by
 /// zero in [`crate::fade::FadeSpec::new`]'s sub-JND path (`range / step_size` ->
@@ -151,6 +161,7 @@ fn d_winddown_s() -> u64 { DEFAULT_WINDDOWN_FADE_SECS }
 fn d_wake_s() -> u64 { DEFAULT_WAKE_RAMP_SECS }
 fn d_max_dur_s() -> u64 { DEFAULT_MAX_DUR_SECS }
 fn d_shutdown_fade_s() -> u64 { DEFAULT_SHUTDOWN_FADE_SECS }
+fn d_pause_fade_s() -> f64 { DEFAULT_PAUSE_FADE_SECS }
 
 impl FadeConfig {
     /// Clamp every knob into its safe range at LOAD time, logging any correction,
@@ -279,6 +290,16 @@ impl FadeConfig {
         ] {
             *d = (*d).clamp(min_s, self.max_dur_secs);
         }
+        // The pause fade is a FLOAT-second knob; a sub-second nominal is allowed
+        // down to the per-millisecond min_slew. Sanitize non-finite first (TOML
+        // permits nan/inf), then clamp into [min_slew_s, max_dur_secs]. The lower
+        // bound uses the exact min_slew in seconds (not the ceil'd `min_s`) so a
+        // 0.25s min_slew stays a 0.25s floor, keeping the pause genuinely short.
+        if !self.pause_fade_secs.is_finite() {
+            self.pause_fade_secs = DEFAULT_PAUSE_FADE_SECS;
+        }
+        let pause_lo = self.min_slew_ms as f64 / 1000.0;
+        self.pause_fade_secs = self.pause_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
     }
 }
 
@@ -296,6 +317,7 @@ impl Default for FadeConfig {
             wake_ramp_secs: DEFAULT_WAKE_RAMP_SECS,
             max_dur_secs: DEFAULT_MAX_DUR_SECS,
             shutdown_fade_secs: DEFAULT_SHUTDOWN_FADE_SECS,
+            pause_fade_secs: DEFAULT_PAUSE_FADE_SECS,
         }
     }
 }
@@ -428,6 +450,7 @@ mod tests {
         assert_eq!(cfg.fade.step_size_db, 0.75);
         assert_eq!(cfg.fade.synth_floor_db, -60.0);
         assert_eq!(cfg.fade.max_dur_secs, 1800);
+        assert_eq!(cfg.fade.pause_fade_secs, 0.5, "pause fade defaults to a short 0.5s");
 
         // A partial [fade] section overrides only the named knobs.
         let cfg = Config::from_str(
