@@ -118,6 +118,51 @@ struct State {
     /// position-based `playlistdelete Starred <pos>` can map back to a song id
     /// for unstar (MPD playlist deletes are position-based, not uri-based).
     last_starred_order: Vec<SongId>,
+    /// MPD `random` flag: pick the next entry at random instead of sequentially.
+    random: bool,
+    /// MPD `repeat` flag: at the end of the queue, loop back to the first entry
+    /// instead of stopping (repeat-all). Combined with `single`, repeats the one
+    /// current track.
+    repeat: bool,
+    /// MPD `single` flag: after the current track, stop (or, with `repeat`,
+    /// replay the same track) instead of advancing.
+    single: bool,
+    /// MPD `consume` flag: remove each entry from the queue once it has played.
+    consume: bool,
+    /// Deterministic RNG state for `random` next-track selection (splitmix64). A
+    /// plain u64 (not a heavyweight RNG) so it is trivially seedable from tests
+    /// via [`State::seed_rng`], keeping `random` advance assertions non-flaky.
+    rng_state: u64,
+}
+
+impl State {
+    /// One splitmix64 step: advance `rng_state` and return a well-mixed u64. The
+    /// deterministic source for `random` next-track selection; seedable in tests.
+    fn next_rand(&mut self) -> u64 {
+        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.rng_state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Pick a random in-range next index for `random` playback, avoiding an
+    /// immediate repeat of `current` when the queue has more than one entry.
+    fn random_next_index(&mut self, current: Option<usize>) -> Option<usize> {
+        let len = self.queue.len();
+        if len == 0 {
+            return None;
+        }
+        if len == 1 {
+            return Some(0);
+        }
+        let pick = (self.next_rand() % len as u64) as usize;
+        match current {
+            // Avoid an immediate repeat: rotate off the current index by one.
+            Some(c) if pick == c => Some((pick + 1) % len),
+            _ => Some(pick),
+        }
+    }
 }
 
 impl Default for State {
@@ -135,6 +180,13 @@ impl Default for State {
             playlist_version: 0,
             binary_limit: 8192,
             last_starred_order: Vec::new(),
+            random: false,
+            repeat: false,
+            single: false,
+            consume: false,
+            // A fixed non-zero default seed; production is seeded from the wall
+            // clock at handler construction, tests override via `seed_rng`.
+            rng_state: 0x243F_6A88_85A3_08D3,
         }
     }
 }
@@ -712,10 +764,19 @@ impl HypodjHandler {
         // hand-constructed FadeConfig (not only Config::load) is still clamped to
         // the startle-safe invariants (F7).
         fade_cfg.normalize();
+        // Seed the random-play RNG from the wall clock so a fresh daemon does not
+        // always shuffle the same order across restarts (tests override via
+        // `seed_rng`). Any non-zero seed is fine for splitmix64.
+        let mut init_state = State::default();
+        init_state.rng_state = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x243F_6A88_85A3_08D3)
+            | 1;
         Self {
             client,
             player,
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(init_state)),
             changed: Arc::new(Notify::new()),
             snapshot_tx: OnceLock::new(),
             fade: Arc::new(FadeSlot::new()),
@@ -1846,6 +1907,16 @@ impl HypodjHandler {
         let path = self.state_path.lock().unwrap().clone();
         let Some(path) = path else { return };
         let snap = self.resume_snapshot(elapsed_secs);
+        // NEVER clobber a good saved session with an empty-stopped snapshot. An
+        // empty queue with a Stopped deck carries nothing worth persisting, and is
+        // exactly the state a failed/aborted restore (backend not yet up) leaves in
+        // memory - writing it would permanently delete the on-disk queue. Skipping
+        // the write here breaks the "transient backend outage deletes the queue"
+        // chain even if resolution stays flaky across several restarts.
+        if snap.queue.is_empty() && snap.play_state == ResumePlayState::Stopped {
+            tracing::debug!(path = %path.display(), "resume checkpoint skipped (empty stopped deck; preserving saved queue)");
+            return;
+        }
         if let Err(e) = store_atomic(&path, &snap) {
             tracing::warn!(error = %e, path = %path.display(), "resume checkpoint write failed");
         }
@@ -1874,8 +1945,23 @@ impl HypodjHandler {
     /// Restore from a loaded [`ResumeState`]: rebuild the queue (re-resolving each
     /// library song from Subsonic), reassign ids, and either WAKE back into
     /// playback (a `Playing` snapshot) or stay stopped (`Paused`/`Stopped` - an
-    /// explicit stop survives the rebuild). A song whose metadata can no longer be
-    /// resolved is SKIPPED (the current pointer is adjusted), never fatal.
+    /// explicit stop survives the rebuild).
+    ///
+    /// Failure handling distinguishes the TWO reasons a persisted song fails to
+    /// re-resolve, by error KIND (not a count heuristic):
+    ///
+    /// - A TRANSIENT failure ([`SubsonicError::Request`] surfaced as a non-
+    ///   NotFound error - the backend not yet reachable at daemon start, a
+    ///   transport error) ABORTS the WHOLE restore with Err WITHOUT mutating
+    ///   State, leaving resume.toml intact so the next start retries once the
+    ///   backend is up. A transient outage must never drop entries and let the
+    ///   checkpoint loop clobber the saved session with an empty queue.
+    /// - A PERMANENT NotFound ([`SubsonicError::NotFound`], Subsonic API code 70
+    ///   - the song was authoritatively deleted from the library) SKIPS just that
+    ///   one entry and keeps rebuilding the rest. All-or-nothing here would let a
+    ///   single deleted song abort every restart forever, self-perpetuating (the
+    ///   empty-stopped checkpoint guard refuses to rewrite resume.toml, so the
+    ///   dead id is never pruned), permanently losing the whole saved session.
     pub async fn restore(&self, s: &ResumeState) -> Result<(), String> {
         // 1. Rebuild the queue entries. A raw Stream is verbatim; a Song is
         //    re-resolved from Subsonic (we persisted only its id). Track how the
@@ -1892,9 +1978,34 @@ impl HypodjHandler {
                 ResumeItem::Song { id } => {
                     match self.client.song(&SongId(id.clone())).await {
                         Ok(song) => QueueEntry::Song(song),
-                        Err(e) => {
-                            tracing::warn!(id, error = %e, "resume: song no longer resolvable; skipping");
+                        Err(SubsonicError::NotFound(e)) => {
+                            // The song was authoritatively deleted from the
+                            // library (API code 70). Dropping just this entry can
+                            // never be confused with a transient outage, so skip
+                            // it and keep the rest of the saved session. If this
+                            // was the saved current index, playback falls through
+                            // to the next surviving entry (or stops if none).
+                            tracing::warn!(id, error = %e, "resume: song permanently gone (not found); skipping and keeping the rest of the queue");
+                            if Some(i) == s.current {
+                                // Point current at the slot the next surviving
+                                // entry will occupy; clamped to None after the
+                                // loop if nothing follows.
+                                new_current = Some(entries.len());
+                                current_is_song = false;
+                            }
                             continue;
+                        }
+                        Err(e) => {
+                            // A TRANSIENT re-resolution failure (backend not yet
+                            // reachable when the daemon restarts before Navidrome
+                            // is up, a transport error) MUST NOT drop the song:
+                            // dropping entries yields a short/empty queue that the
+                            // checkpoint loop then writes back over the good
+                            // resume.toml. Abort the WHOLE restore without mutating
+                            // State so the on-disk file survives for the next start
+                            // (a retry once the backend is up).
+                            tracing::warn!(id, error = %e, "resume: song not resolvable (transient); aborting restore to preserve saved queue");
+                            return Err(format!("resume: song {id} unresolvable: {e}"));
                         }
                     }
                 }
@@ -1904,6 +2015,16 @@ impl HypodjHandler {
                 current_is_song = matches!(entry, QueueEntry::Song(_));
             }
             entries.push(entry);
+        }
+
+        // If the saved current index was a permanently-deleted song and nothing
+        // survives after it, there is no slot to resume into: fall back to no
+        // current (playback stays stopped rather than pointing past the end).
+        if let Some(c) = new_current {
+            if c >= entries.len() {
+                new_current = None;
+                current_is_song = false;
+            }
         }
 
         let synth_floor = self.fade_cfg.synth_floor_db;
@@ -2102,13 +2223,76 @@ impl HypodjHandler {
             .map(|(idx, it)| (idx, entry_snapshot(it)))
     }
 
-    /// Called by the daemon when the player reports a natural EOF: advance to the
-    /// next queue entry, or leave the state stopped at the end of the queue.
-    pub async fn advance_on_eof(&self) {
-        let next = {
-            let st = self.state.lock().unwrap();
-            st.current.map(|c| c + 1).filter(|&i| i < st.queue.len())
+    /// Compute the next queue index honoring the `random`/`repeat`/`single`
+    /// flags, and apply `consume` (removing the just-finished entry from the
+    /// queue and remapping the computed index over the shrink). Returns `Some(idx)`
+    /// to play next or `None` to stop. `auto` distinguishes an EOF auto-advance
+    /// (where `single` stops after the current track) from a manual `next` gesture
+    /// (which always advances; `single` only governs auto-advance in MPD).
+    ///
+    /// Takes and DROPS the `std` `Mutex<State>` internally with no await inside, so
+    /// no lock is held across an `.await` at the call sites. The seeded RNG
+    /// ([`State::random_next_index`]) makes the `random` choice deterministic and
+    /// unit-testable.
+    fn plan_next(&self, auto: bool) -> Option<usize> {
+        let mut st = self.state.lock().unwrap();
+        let cur = st.current?;
+        let len = st.queue.len();
+        if len == 0 {
+            return None;
+        }
+        // The next index in PRE-consume terms.
+        let mut next: Option<usize> = if auto && st.single {
+            // single: stop after the current track, or (with repeat) replay it.
+            if st.repeat {
+                Some(cur)
+            } else {
+                None
+            }
+        } else if st.random {
+            st.random_next_index(Some(cur))
+        } else if cur + 1 < len {
+            Some(cur + 1)
+        } else if st.repeat {
+            // repeat-all at the end of the queue: wrap to the first entry.
+            Some(0)
+        } else {
+            None
         };
+        if st.consume {
+            // Remove the just-finished entry, then remap the target index over the
+            // shrink: indices AFTER the removed slot shift down by one; a target at
+            // or before it is unchanged; anything now out of range stops (or wraps
+            // when repeat is set and entries remain).
+            if cur < st.queue.len() {
+                st.queue.remove(cur);
+                st.playlist_version += 1;
+            }
+            let new_len = st.queue.len();
+            next = match next {
+                Some(n) if n > cur => Some(n - 1),
+                other => other,
+            };
+            next = match next {
+                _ if new_len == 0 => None,
+                Some(n) if n >= new_len => {
+                    if st.repeat {
+                        Some(0)
+                    } else {
+                        None
+                    }
+                }
+                other => other,
+            };
+        }
+        next
+    }
+
+    /// Called by the daemon when the player reports a natural EOF: advance to the
+    /// next queue entry (honoring random/repeat/single/consume via
+    /// [`Self::plan_next`]), or leave the state stopped at the end of the queue.
+    pub async fn advance_on_eof(&self) {
+        let next = self.plan_next(true);
         match next {
             Some(idx) => {
                 // A natural EOF advance is NOT a user gesture: it must NOT cancel an
@@ -2382,7 +2566,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Ping => MpdResponse::ok(),
 
             MpdCommand::Status => {
-                let (vol, qlen, cur, ver) = {
+                let (vol, qlen, cur, ver, random, repeat, single, consume) = {
                     let st = self.state.lock().unwrap();
                     (
                         // Derived from the live gain so status tracks an in-flight
@@ -2391,8 +2575,13 @@ impl MpdHandler for HypodjHandler {
                         st.queue.len(),
                         st.current,
                         st.playlist_version,
+                        st.random,
+                        st.repeat,
+                        st.single,
+                        st.consume,
                     )
                 };
+                let flag = |b: bool| if b { "1" } else { "0" };
                 // The pending-pause-aware, idle-guarded reported state (Paused the
                 // instant a pause is requested, not only once the fade freezes mpv).
                 let state = self.reported_play_state();
@@ -2403,10 +2592,10 @@ impl MpdHandler for HypodjHandler {
                 };
                 let mut b = MpdResponse::pairs()
                     .pair("volume", vol.to_string())
-                    .pair("repeat", "0")
-                    .pair("random", "0")
-                    .pair("single", "0")
-                    .pair("consume", "0")
+                    .pair("repeat", flag(repeat))
+                    .pair("random", flag(random))
+                    .pair("single", flag(single))
+                    .pair("consume", flag(consume))
                     .pair("playlist", ver.to_string())
                     .pair("playlistlength", qlen.to_string())
                     .pair("state", state_str);
@@ -2520,11 +2709,9 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Winddown(cmd) => self.handle_winddown(cmd),
             MpdCommand::Wake(cmd) => self.handle_wake(cmd),
             MpdCommand::Next => {
-                let next = {
-                    let st = self.state.lock().unwrap();
-                    st.current.map(|c| c + 1).filter(|&i| i < st.queue.len())
-                };
-                match next {
+                // A manual `next` always advances (single governs only auto-advance);
+                // random/repeat/consume are honored via plan_next.
+                match self.plan_next(false) {
                     Some(idx) => match self.play_index(idx).await {
                         Ok(()) => MpdResponse::ok(),
                         Err(e) => ack(ACK_ERROR_NO_EXIST, "next", &e),
@@ -2572,6 +2759,26 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::GetVol => {
                 let v = self.state.lock().unwrap().reported_volume();
                 MpdResponse::pairs().pair("volume", v.to_string()).build()
+            }
+            MpdCommand::Random(on) => {
+                self.state.lock().unwrap().random = on;
+                self.notify_change();
+                MpdResponse::ok()
+            }
+            MpdCommand::Repeat(on) => {
+                self.state.lock().unwrap().repeat = on;
+                self.notify_change();
+                MpdResponse::ok()
+            }
+            MpdCommand::Single(on) => {
+                self.state.lock().unwrap().single = on;
+                self.notify_change();
+                MpdResponse::ok()
+            }
+            MpdCommand::Consume(on) => {
+                self.state.lock().unwrap().consume = on;
+                self.notify_change();
+                MpdResponse::ok()
             }
 
             // ── queue ─────────────────────────────────────────────────────
@@ -2926,11 +3133,9 @@ impl HypodjHandler {
     /// Advance to the next queue entry (MPRIS `Next` / desktop control). No-op at
     /// the end of the queue.
     pub async fn mpris_next(&self) {
-        let next = {
-            let st = self.state.lock().unwrap();
-            st.current.map(|c| c + 1).filter(|&i| i < st.queue.len())
-        };
-        if let Some(idx) = next {
+        // Mirror the MPD `next` gesture: always advance, honoring
+        // random/repeat/consume (single governs only EOF auto-advance).
+        if let Some(idx) = self.plan_next(false) {
             let _ = self.play_index(idx).await;
         }
     }
@@ -5125,5 +5330,153 @@ mod tests {
         assert!(loaded2.playlist_version > v1, "queue mutation bumps playlist_version");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // BUG 1 (waq4th1) drain regression: a Playing snapshot whose song ids can no
+    // longer resolve (the offline client at 127.0.0.1:1 fails every song()) must
+    // (a) ABORT restore with Err WITHOUT installing a partial/empty queue, and
+    // (b) a checkpoint taken in the resulting empty+stopped state must NOT clobber
+    // a pre-written good resume.toml. This reproduces the exact drain (all songs
+    // skipped -> empty queue -> checkpoint overwrites the saved file) and proves
+    // the two guards fix it.
+    #[tokio::test(start_paused = true)]
+    async fn restore_abort_and_checkpoint_preserve_saved_queue() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let s = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            queue: vec![
+                ResumeItem::Song { id: "s1".into() },
+                ResumeItem::Song { id: "s2".into() },
+                ResumeItem::Song { id: "s3".into() },
+            ],
+            current: Some(0),
+            elapsed_secs: 10.0,
+            volume: 50,
+            play_state: ResumePlayState::Playing,
+            playlist_version: 9,
+            saved_at_unix: 1,
+        };
+        // (a) restore aborts and leaves State untouched (no drain to empty, no
+        // partial install).
+        assert!(h.restore(&s).await.is_err(), "an unresolvable song must abort restore");
+        assert_eq!(
+            h.state.lock().unwrap().queue.len(),
+            0,
+            "restore must not install a partial/empty queue"
+        );
+
+        // (b) a pre-written GOOD file survives a checkpoint taken while the deck is
+        // empty + stopped (the failed-restore aftermath).
+        let dir = std::env::temp_dir().join(format!("hypodj-drain-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("resume.toml");
+        let good = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            queue: vec![
+                ResumeItem::Stream { url: NTS.into(), title: "a".into() },
+                ResumeItem::Stream { url: NTS.into(), title: "b".into() },
+                ResumeItem::Stream { url: NTS.into(), title: "c".into() },
+            ],
+            current: Some(1),
+            elapsed_secs: 5.0,
+            volume: 50,
+            play_state: ResumePlayState::Playing,
+            playlist_version: 9,
+            saved_at_unix: 1,
+        };
+        crate::resume::store_atomic(&path, &good).expect("seed the good file");
+        h.set_state_path(path.clone());
+        // Empty + Stopped snapshot -> the checkpoint MUST skip the write.
+        h.checkpoint(0.0).await;
+        let loaded = crate::resume::load(&path).expect("good file still present");
+        assert_eq!(
+            loaded.queue.len(),
+            3,
+            "checkpoint must not clobber the saved queue with an empty one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // BUG 2 (g94y41b): random/repeat/single/consume are HONORED by the advance
+    // logic (plan_next). Deterministic - the seeded RNG makes `random` reproducible.
+    #[tokio::test]
+    async fn advance_honors_playback_mode_flags() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..3 {
+            h.enqueue_stream_for_test(NTS).await;
+        }
+        let set = |cur: Option<usize>, r: bool, rp: bool, si: bool, co: bool| {
+            let mut st = h.state.lock().unwrap();
+            st.current = cur;
+            st.random = r;
+            st.repeat = rp;
+            st.single = si;
+            st.consume = co;
+        };
+
+        // Sequential (all flags off): advance, then stop at the end.
+        set(Some(1), false, false, false, false);
+        assert_eq!(h.plan_next(true), Some(2));
+        set(Some(2), false, false, false, false);
+        assert_eq!(h.plan_next(true), None, "end of queue stops when not repeating");
+
+        // repeat-all: wrap from the last entry to the first.
+        set(Some(2), false, true, false, false);
+        assert_eq!(h.plan_next(true), Some(0), "repeat wraps to the head");
+
+        // single (auto EOF): stop after the current track.
+        set(Some(0), false, false, true, false);
+        assert_eq!(h.plan_next(true), None, "single stops after the current track");
+        // single + repeat: replay the same index.
+        set(Some(1), false, true, true, false);
+        assert_eq!(h.plan_next(true), Some(1), "single+repeat replays the current track");
+        // single is ignored for a manual next (auto == false): it advances.
+        set(Some(0), false, false, true, false);
+        assert_eq!(h.plan_next(false), Some(1), "manual next ignores single");
+
+        // random: a seeded pick, in range and avoiding an immediate repeat. Also
+        // deterministic (same seed -> same pick).
+        set(Some(0), true, false, false, false);
+        h.state.lock().unwrap().rng_state = 0xDEAD_BEEF_CAFE_F00D;
+        let a = h.plan_next(true).expect("random picks an entry");
+        assert!(a < 3 && a != 0, "random pick is in range and not an immediate repeat");
+        set(Some(0), true, false, false, false);
+        h.state.lock().unwrap().rng_state = 0xDEAD_BEEF_CAFE_F00D;
+        let b = h.plan_next(true).expect("random picks an entry");
+        assert_eq!(a, b, "the seeded RNG is deterministic");
+    }
+
+    // consume removes the just-finished entry and remaps the next index over the
+    // shrink (the entry that was at old idx 2 is now the target at idx 1).
+    #[tokio::test]
+    async fn advance_consume_removes_and_reindexes() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for _ in 0..3 {
+            h.enqueue_stream_for_test(NTS).await;
+        }
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(1);
+            st.consume = true;
+        }
+        let next = h.plan_next(true);
+        assert_eq!(next, Some(1), "old idx 2 shifts down into idx 1 after removing idx 1");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "consume removed the played entry");
+    }
+
+    // The flags round-trip through status: a random/repeat/single/consume toggle
+    // is reflected truthfully (not the old hardcoded zeros).
+    #[tokio::test]
+    async fn status_reports_playback_mode_flags() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Random(true)).await;
+        h.handle(MpdCommand::Repeat(true)).await;
+        h.handle(MpdCommand::Single(true)).await;
+        h.handle(MpdCommand::Consume(true)).await;
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "random"), Some("1"));
+        assert_eq!(pair(&resp, "repeat"), Some("1"));
+        assert_eq!(pair(&resp, "single"), Some("1"));
+        assert_eq!(pair(&resp, "consume"), Some("1"));
     }
 }
