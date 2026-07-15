@@ -704,6 +704,7 @@ name = "hypodj-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "libmpv2",
  "mpris-server",
  "opensubsonic",

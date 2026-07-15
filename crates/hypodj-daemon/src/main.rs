@@ -115,6 +115,30 @@ async fn main() -> anyhow::Result<()> {
         player_events,
     );
 
+    // P2 plan executor. It consumes the LOSSLESS edge/WallClock trigger stream +
+    // the lossy `Tick` broadcast (for live TimeRemaining arming), owns the shared
+    // wall-clock timer source, and maps a fired plan action onto the P0 fade
+    // primitive + the handler. Registered on the handler so the `plan` MPD command
+    // arms/lists/cancels through it. The task runs for the daemon lifetime.
+    {
+        use hypodj_core::executor::Executor;
+        use hypodj_core::plan::PlanId;
+        let triggers = runtime.subscribe_triggers();
+        let ticks = runtime.events.subscribe();
+        let (imm_tx, imm_rx) = tokio::sync::mpsc::unbounded_channel::<PlanId>();
+        handler.set_plan_timers(runtime.timers.clone());
+        handler.set_plan_immediate_sink(imm_tx);
+        Executor::spawn(
+            handler.clone(),
+            runtime.timers.clone(),
+            hypodj_core::clock::TokioClock,
+            triggers,
+            ticks,
+            imm_rx,
+        );
+        tracing::info!("P2 plan executor started");
+    }
+
     // MPRIS (org.mpris.MediaPlayer2.hypodj) on the session bus: desktops get
     // now-playing + cover art + controls. Registered under the `.hypodj` bus name
     // so it NEVER conflicts with a running mopidy's `.mopidy`. If mpris.enable is

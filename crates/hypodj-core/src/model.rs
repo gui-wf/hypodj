@@ -7,10 +7,13 @@
 
 /// Opaque server-side id for a song/album/artist. Kept as a newtype so we can
 /// never accidentally cross-use an album id where a song id is expected.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// `Serialize`/`Deserialize` so the P2 plan IR ([`crate::plan`]) can carry a
+/// concrete song id in a `Selector` (append-only enqueue) across the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SongId(pub String);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct AlbumId(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
