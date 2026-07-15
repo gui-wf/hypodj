@@ -35,7 +35,7 @@ use mpris_server::{
 
 use crate::handler::{CurrentItem, HypodjHandler};
 use crate::model::{QueueEntry, Song};
-use crate::player::{PlayState, PlayerHandle};
+use crate::player::{effective_play_state, PlayState, PlayerHandle};
 use crate::subsonic::SubsonicClient;
 
 /// The MPRIS implementation object served on the bus. Cheap to hold: three Arc/
@@ -97,7 +97,11 @@ pub fn spawn_raise(raise_command: Option<&[String]>) {
 
 impl HypodjMpris {
     fn playback_status(&self) -> PlaybackStatus {
-        state_to_status(self.player.state())
+        // Idle guard: with nothing loaded the status MUST be Stopped so the
+        // GNOME media widget disappears rather than showing a phantom
+        // "playing nothing". Mirrors the MPD `status` source of truth.
+        let raw = effective_play_state(self.player.state(), self.handler.current_item().is_some());
+        state_to_status(raw)
     }
 
     fn metadata(&self) -> Metadata {
@@ -476,6 +480,22 @@ mod tests {
         assert_eq!(state_to_status(PlayState::Playing), PlaybackStatus::Playing);
         assert_eq!(state_to_status(PlayState::Paused), PlaybackStatus::Paused);
         assert_eq!(state_to_status(PlayState::Stopped), PlaybackStatus::Stopped);
+    }
+
+    // Idle guard for the GNOME widget: with nothing loaded the MPRIS
+    // PlaybackStatus is Stopped even if the raw player state is Playing, so the
+    // desktop stops showing a phantom "playing nothing". This is the exact
+    // composition playback_status() applies.
+    #[test]
+    fn idle_playback_status_is_stopped() {
+        assert_eq!(
+            state_to_status(effective_play_state(PlayState::Playing, false)),
+            PlaybackStatus::Stopped
+        );
+        assert_eq!(
+            state_to_status(effective_play_state(PlayState::Playing, true)),
+            PlaybackStatus::Playing
+        );
     }
 
     #[test]

@@ -40,6 +40,20 @@ pub enum PlayState {
     Paused,
 }
 
+/// The play state to REPORT outward (MPD `status`, MPRIS `PlaybackStatus`,
+/// resume checkpoints). A media player with nothing loaded is Stopped, never
+/// Playing/Paused, regardless of the raw backend state: an mpv started under
+/// `--idle` can report not-paused before any file is loaded, and that must not
+/// leak out as a phantom Playing. `has_current` is whether a current queue item
+/// actually exists. This is the single source of truth for the idle guard.
+pub fn effective_play_state(raw: PlayState, has_current: bool) -> PlayState {
+    if has_current {
+        raw
+    } else {
+        PlayState::Stopped
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlayerError {
     #[error("player backend: {0}")]
@@ -719,6 +733,19 @@ mod tests {
     // through the `&self` PlayerHandle, state is observable via the watch, and
     // play/pause/resume/stop transition as expected. This proves the actor
     // boundary is usable headless before the mpv backend exists.
+    // The idle guard: with nothing loaded the reported state is always Stopped,
+    // no matter what the raw backend claims; with a current song the raw state
+    // passes through unchanged.
+    #[test]
+    fn effective_state_forces_stop_without_current() {
+        assert_eq!(effective_play_state(PlayState::Playing, false), PlayState::Stopped);
+        assert_eq!(effective_play_state(PlayState::Paused, false), PlayState::Stopped);
+        assert_eq!(effective_play_state(PlayState::Stopped, false), PlayState::Stopped);
+        assert_eq!(effective_play_state(PlayState::Playing, true), PlayState::Playing);
+        assert_eq!(effective_play_state(PlayState::Paused, true), PlayState::Paused);
+        assert_eq!(effective_play_state(PlayState::Stopped, true), PlayState::Stopped);
+    }
+
     #[tokio::test]
     async fn null_player_transitions_via_handle() {
         let (player, _events) = NullPlayer::spawn();

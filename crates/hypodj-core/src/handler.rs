@@ -51,7 +51,9 @@ use crate::mpd::{
     FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, SleepCmd, StickerCmd,
     WakeCmd, WakeWhen, WinddownCmd,
 };
-use crate::player::{db_to_mpv_volume, mpv_volume_to_db, PlayState, PlayerHandle};
+use crate::player::{
+    db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerHandle,
+};
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
     RESUME_SCHEMA_VERSION,
@@ -1437,12 +1439,16 @@ impl HypodjHandler {
     /// by the caller from the lockless live-elapsed atomic - never queried from
     /// mpv, so it is safe during a SIGTERM race.
     pub fn resume_snapshot(&self, elapsed_secs: f64) -> ResumeState {
-        let play_state = match self.player.state() {
+        let st = self.state.lock().unwrap();
+        // Belt-and-suspenders: a checkpoint can NEVER claim Playing/Paused with
+        // no current song. Map through the idle guard so an honest Stopped is
+        // persisted whenever nothing is loaded (never a phantom Playing + []).
+        let has_current = st.current.and_then(|i| st.queue.get(i)).is_some();
+        let play_state = match effective_play_state(self.player.state(), has_current) {
             PlayState::Playing => ResumePlayState::Playing,
             PlayState::Paused => ResumePlayState::Paused,
             PlayState::Stopped => ResumePlayState::Stopped,
         };
-        let st = self.state.lock().unwrap();
         let queue = st
             .queue
             .iter()
@@ -1959,8 +1965,12 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Status => {
                 let (state, vol, qlen, cur, ver) = {
                     let st = self.state.lock().unwrap();
+                    // A current pointer only counts if it resolves to a real queue
+                    // item; with nothing loaded the reported state MUST be Stopped
+                    // even if the raw backend claims otherwise (idle mpv guard).
+                    let has_current = st.current.and_then(|i| st.queue.get(i)).is_some();
                     (
-                        self.player.state(),
+                        effective_play_state(self.player.state(), has_current),
                         // Derived from the live gain so status tracks an in-flight
                         // fade and never desyncs from the envelope.
                         st.reported_volume(),
@@ -3668,6 +3678,38 @@ mod tests {
         // stream item.
         let status = render(h.handle(MpdCommand::Status).await);
         assert!(status.iter().any(|(k, v)| k == "state" && v == "play"));
+    }
+
+    // Idle guard: a running daemon with an empty queue and no current song MUST
+    // report state:stop, never a phantom play (an idle mpv can report not-paused).
+    #[tokio::test]
+    async fn status_reports_stop_when_idle() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Fresh handler: nothing loaded.
+        assert_eq!(pair(&h.handle(MpdCommand::Status).await, "state"), Some("stop"));
+
+        // Force the pathological case the guard exists for: the raw player state
+        // is Playing but there is no current song. Status must still say stop.
+        h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+        h.state.lock().unwrap().current = None;
+        assert_eq!(pair(&h.handle(MpdCommand::Status).await, "state"), Some("stop"));
+    }
+
+    // resume_snapshot with no current song records Stopped even if the raw player
+    // state is Playing, so a checkpoint can never claim Playing with an empty queue.
+    #[tokio::test]
+    async fn resume_snapshot_no_current_is_stopped() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+        // Drop the current pointer while the raw state is still Playing.
+        h.state.lock().unwrap().current = None;
+        let snap = h.resume_snapshot(0.0);
+        assert_eq!(snap.play_state, ResumePlayState::Stopped);
+        assert_eq!(snap.current, None);
     }
 
     #[tokio::test]
