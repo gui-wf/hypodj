@@ -65,7 +65,33 @@ const STARTLE_HARD_MIN_SLEW: Duration = Duration::from_millis(STARTLE_HARD_MIN_S
 
 /// Ceiling on a DELIBERATE (`sub_jnd = false`) per-step dB delta. Above this even
 /// a "noticeable cue" fade is a startle risk, so [`FadeSpec::new`] rejects it.
-const DELIBERATE_STEP_CAP_DB: f64 = 3.0;
+/// Exposed so a caller that wants a deliberate fade to SUCCEED (e.g. the pause /
+/// resume transport ramp) can compute the shortest duration that stays under the
+/// cap via [`min_deliberate_dur`], rather than being rejected as `StepTooLarge`.
+pub const DELIBERATE_STEP_CAP_DB: f64 = 3.0;
+
+/// The shortest duration for which a DELIBERATE (`sub_jnd = false`) fade spanning
+/// `from_db -> target` at `min_slew` per step stays at or under the 3 dB/step
+/// startle cap - i.e. the smallest `dur` for which [`FadeSpec::new`] will NOT
+/// return [`FadeError::StepTooLarge`]. Used by the pause/resume path to clamp a
+/// too-short requested duration UP (never a hard cut). `min_slew` is the per-step
+/// interval floor; `synth_floor_db` resolves a `Silence` target to its ramp end.
+pub fn min_deliberate_dur(
+    from_db: f64,
+    target: FadeTarget,
+    min_slew: Duration,
+    synth_floor_db: f64,
+) -> Duration {
+    let t_db = match target {
+        FadeTarget::Db(x) => x,
+        FadeTarget::Silence => synth_floor_db,
+    };
+    let range = (t_db - from_db.max(synth_floor_db)).abs();
+    // ceil(range / cap) steps keeps every per-step delta <= cap; at least one.
+    let steps = (range / DELIBERATE_STEP_CAP_DB).ceil().max(1.0);
+    let steps = steps.min(MAX_SCHEDULE_STEPS as f64) as u32;
+    min_slew.saturating_mul(steps)
+}
 
 /// Hard cap on the number of scheduled steps. Belt-and-suspenders against a
 /// pathological (`dur`, `tick`, `step_size`) combination producing an enormous

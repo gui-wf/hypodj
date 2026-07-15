@@ -35,7 +35,7 @@ use mpris_server::{
 
 use crate::handler::{CurrentItem, HypodjHandler};
 use crate::model::{QueueEntry, Song};
-use crate::player::{effective_play_state, PlayState, PlayerHandle};
+use crate::player::{PlayState, PlayerHandle};
 use crate::subsonic::SubsonicClient;
 
 /// The MPRIS implementation object served on the bus. Cheap to hold: three Arc/
@@ -97,11 +97,11 @@ pub fn spawn_raise(raise_command: Option<&[String]>) {
 
 impl HypodjMpris {
     fn playback_status(&self) -> PlaybackStatus {
-        // Idle guard: with nothing loaded the status MUST be Stopped so the
-        // GNOME media widget disappears rather than showing a phantom
-        // "playing nothing". Mirrors the MPD `status` source of truth.
-        let raw = effective_play_state(self.player.state(), self.handler.current_item().is_some());
-        state_to_status(raw)
+        // The handler's single source of truth: idle-guarded (nothing loaded ->
+        // Stopped so the GNOME widget disappears) AND pending-pause-aware (Paused the
+        // instant a pause is requested, so the widget flips to a play symbol without
+        // waiting for the fade to freeze mpv). Mirrors the MPD `status` source.
+        state_to_status(self.handler.reported_play_state())
     }
 
     fn metadata(&self) -> Metadata {
@@ -380,6 +380,7 @@ impl PlayerInterface for HypodjMpris {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::player::effective_play_state;
     use crate::config::ServerConfig;
     use crate::model::SongId;
 
