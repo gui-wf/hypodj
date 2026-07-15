@@ -225,7 +225,27 @@ impl TuiState {
                 });
                 None
             }
+            Action::FavoriteCurrent => self.favorite_current(),
             Action::Nl(phrase) => Some(Intent::Nl(phrase)),
+        }
+    }
+
+    /// Favorite (star) the current track from a typed `fav`/`favorite` phrase. Needs
+    /// the current song uri (`song/<id>`); a raw stream or nothing playing is a
+    /// friendly status, not a command.
+    fn favorite_current(&mut self) -> Option<Intent> {
+        match self.now.file.as_deref() {
+            Some(uri) if uri.starts_with("song/") => {
+                Some(Intent::Command(format!("playlistadd Starred {uri}")))
+            }
+            Some(_) => {
+                self.status_msg = Some("the current track is a stream, can't favorite".into());
+                None
+            }
+            None => {
+                self.status_msg = Some("nothing is playing to favorite".into());
+                None
+            }
         }
     }
 
