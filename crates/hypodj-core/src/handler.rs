@@ -1945,8 +1945,11 @@ impl HypodjHandler {
             if current_is_song && elapsed > 0.0 {
                 let _ = self.player.seek(elapsed).await;
             }
-            // Wake ramp UP from silence to the user's SAVED level (not vol 100).
-            let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.wake_ramp_secs));
+            // Smooth-restart ramp-IN: a QUICK deliberate ramp from silence to the
+            // user's SAVED level, using restart_fade_secs - the counterpart to the
+            // shutdown fade-OUT. NOT the long alarm wake_ramp_secs (8 min), which
+            // would leave the music barely audible for minutes after a rebuild.
+            let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.restart_fade_secs));
             let intent = FadeIntent::WakeTo {
                 target_db: mpv_volume_to_db(saved_vol as f64),
                 vol: saved_vol,

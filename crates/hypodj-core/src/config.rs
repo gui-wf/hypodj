@@ -107,10 +107,18 @@ pub struct FadeConfig {
     /// Duration of the DELIBERATE sleep-fade-out run on SIGTERM/SIGINT before the
     /// daemon exits, seconds. This is a deliberate (not sub-JND) fade at the 3
     /// dB/step cap, kept SHORT so it never slows a nixos-rebuild / service
-    /// restart; the wake-ramp on the next start uses `wake_ramp_secs`. Normalized
-    /// into `[min_slew_s, max_dur_secs]`.
+    /// restart; the smooth-restart ramp-IN on the next start uses
+    /// `restart_fade_secs` (NOT the long alarm `wake_ramp_secs`). Normalized into
+    /// `[min_slew_s, max_dur_secs]`.
     #[serde(default = "d_shutdown_fade_s")]
     pub shutdown_fade_secs: u64,
+    /// Duration of the smooth-restart ramp-IN, seconds: the counterpart to
+    /// `shutdown_fade_secs`, run when the daemon RESTORES playback after a restart.
+    /// A restart resume must come back QUICKLY, so this is short and DISTINCT from
+    /// the gentle alarm `wake_ramp_secs` (8 min) - reusing that would leave the
+    /// music barely audible for minutes after a rebuild.
+    #[serde(default = "d_restart_fade_s")]
+    pub restart_fade_secs: u64,
     /// Duration of the startle-safe transport pause/resume fade, SECONDS (a float,
     /// unlike the coarse `*_secs` knobs, so a sub-second nominal is expressible).
     /// On PAUSE the transport runs a short sub-JND fade to silence THEN pauses mpv
@@ -135,6 +143,7 @@ pub const DEFAULT_WINDDOWN_FADE_SECS: u64 = 300;
 pub const DEFAULT_WAKE_RAMP_SECS: u64 = 480;
 pub const DEFAULT_MAX_DUR_SECS: u64 = 1800;
 pub const DEFAULT_SHUTDOWN_FADE_SECS: u64 = 6;
+pub const DEFAULT_RESTART_FADE_SECS: u64 = 5;
 pub const DEFAULT_PAUSE_FADE_SECS: f64 = 0.5;
 
 /// Positive minimum for `step_size_db`. A `0` (or negative) step would divide by
@@ -161,6 +170,7 @@ fn d_winddown_s() -> u64 { DEFAULT_WINDDOWN_FADE_SECS }
 fn d_wake_s() -> u64 { DEFAULT_WAKE_RAMP_SECS }
 fn d_max_dur_s() -> u64 { DEFAULT_MAX_DUR_SECS }
 fn d_shutdown_fade_s() -> u64 { DEFAULT_SHUTDOWN_FADE_SECS }
+fn d_restart_fade_s() -> u64 { DEFAULT_RESTART_FADE_SECS }
 fn d_pause_fade_s() -> f64 { DEFAULT_PAUSE_FADE_SECS }
 
 impl FadeConfig {
@@ -287,6 +297,7 @@ impl FadeConfig {
             &mut self.winddown_fade_secs,
             &mut self.wake_ramp_secs,
             &mut self.shutdown_fade_secs,
+            &mut self.restart_fade_secs,
         ] {
             *d = (*d).clamp(min_s, self.max_dur_secs);
         }
@@ -317,6 +328,7 @@ impl Default for FadeConfig {
             wake_ramp_secs: DEFAULT_WAKE_RAMP_SECS,
             max_dur_secs: DEFAULT_MAX_DUR_SECS,
             shutdown_fade_secs: DEFAULT_SHUTDOWN_FADE_SECS,
+            restart_fade_secs: DEFAULT_RESTART_FADE_SECS,
             pause_fade_secs: DEFAULT_PAUSE_FADE_SECS,
         }
     }
