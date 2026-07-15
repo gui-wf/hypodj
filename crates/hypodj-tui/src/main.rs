@@ -104,14 +104,20 @@ fn execute(conn: &mut MpdConn, state: &mut TuiState, intent: Intent) {
         Intent::Nl(phrase) => match conn.command(&nl_request(&phrase)) {
             Ok(pairs) => match token_from_pairs(&pairs) {
                 Some(token) => {
-                    let (steps, note) = match echo_from_pairs(&pairs) {
+                    let (trust, steps, note) = match echo_from_pairs(&pairs) {
                         Some(echo) => {
                             let parts = split_echo(&echo);
-                            (parts.steps, parts.note)
+                            (parts.trust, parts.steps, parts.note)
                         }
-                        None => (Vec::new(), None),
+                        None => (None, Vec::new(), None),
                     };
-                    state.enter_confirm(Pending { token: Some(token), command: None, steps, note });
+                    state.enter_confirm(Pending {
+                        token: Some(token),
+                        command: None,
+                        trust,
+                        steps,
+                        note,
+                    });
                 }
                 None => state.status_msg = Some("the server returned no plan to confirm".into()),
             },

@@ -31,6 +31,8 @@ pub struct Pending {
     pub command: Option<String>,
     pub steps: Vec<String>,
     pub note: Option<String>,
+    /// The "via rules" / "via local model" trust footnote from the nl echo.
+    pub trust: Option<String>,
 }
 
 /// The side-effecting request handle_key emits for the event loop to run. IO lives
@@ -118,6 +120,8 @@ impl TuiState {
 
     /// Map a key to an Intent (or pure state change). The dispatch is per-mode.
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Intent> {
+        // Any keypress dismisses a stale banner; the action below may set a new one.
+        self.status_msg = None;
         match self.mode {
             Mode::Normal => self.key_normal(key),
             Mode::Command => self.key_command(key),
@@ -217,6 +221,7 @@ impl TuiState {
                     token: None,
                     steps: vec!["clear the whole queue".to_string()],
                     note: None,
+                    trust: None,
                 });
                 None
             }
@@ -346,6 +351,7 @@ mod tests {
             command: None,
             steps: vec!["[1] fade out".into()],
             note: Some("NOTE: caveat".into()),
+            trust: None,
         });
         assert_eq!(s.mode, Mode::Confirm);
         assert_eq!(s.pending.as_ref().unwrap().steps, vec!["[1] fade out".to_string()]);

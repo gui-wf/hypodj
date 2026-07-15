@@ -115,6 +115,12 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
         Mode::Confirm => {
             let mut ls = Vec::new();
             if let Some(p) = &state.pending {
+                if let Some(trust) = &p.trust {
+                    ls.push(Line::from(Span::styled(
+                        trust.clone(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                }
                 for step in &p.steps {
                     ls.push(Line::from(step.clone()));
                 }
