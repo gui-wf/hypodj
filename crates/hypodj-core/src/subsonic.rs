@@ -42,6 +42,27 @@ pub enum SubsonicError {
     Init(String),
     #[error("subsonic request: {0}")]
     Request(String),
+    /// The server answered, authoritatively, that the requested data does not
+    /// exist (Subsonic API error code 70). Distinct from [`Request`] (a
+    /// transport / transient failure) because a permanent NotFound means the
+    /// item is gone for good - a resume restore skips it rather than aborting
+    /// and retrying forever.
+    #[error("subsonic not found: {0}")]
+    NotFound(String),
+}
+
+/// Map an upstream `opensubsonic::Error` into our flattened [`SubsonicError`],
+/// preserving the ONE distinction restore cares about: an authoritative
+/// "not found" (API code 70) becomes [`SubsonicError::NotFound`]; everything
+/// else (transport, parse, other API codes) stays [`SubsonicError::Request`].
+fn map_request_error(e: opensubsonic::Error) -> SubsonicError {
+    use opensubsonic::SubsonicErrorCode;
+    if let opensubsonic::Error::Api(ref api) = e {
+        if api.error_code() == Some(SubsonicErrorCode::NotFound) {
+            return SubsonicError::NotFound(e.to_string());
+        }
+    }
+    SubsonicError::Request(e.to_string())
 }
 
 pub struct SubsonicClient {
@@ -213,7 +234,7 @@ impl SubsonicClient {
             .inner
             .get_song(&id.0)
             .await
-            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+            .map_err(map_request_error)?;
         Ok(map_song(child))
     }
 
@@ -649,6 +670,34 @@ mod tests {
     // wire->model mappers. This exercises the boundary honestly: if the crate's
     // field names/shapes drift, deserialization fails here, not silently in
     // production. It does not need a live server (the wire shape is fixed).
+
+    #[test]
+    fn map_request_error_distinguishes_notfound_from_transient() {
+        // API code 70 (the item was authoritatively deleted) -> NotFound, so a
+        // resume restore skips just that song instead of aborting forever.
+        let not_found = opensubsonic::Error::Api(opensubsonic::SubsonicApiError {
+            code: 70,
+            message: "song not found".into(),
+            help_url: None,
+        });
+        assert!(matches!(
+            map_request_error(not_found),
+            SubsonicError::NotFound(_)
+        ));
+
+        // Any other API code stays a (retryable) Request error.
+        let generic = opensubsonic::Error::Api(opensubsonic::SubsonicApiError {
+            code: 0,
+            message: "generic".into(),
+            help_url: None,
+        });
+        assert!(matches!(map_request_error(generic), SubsonicError::Request(_)));
+
+        // A transport-level failure (backend not reachable) stays a Request
+        // error, so restore aborts and preserves the saved queue for a retry.
+        let other = opensubsonic::Error::Other("connection refused".into());
+        assert!(matches!(map_request_error(other), SubsonicError::Request(_)));
+    }
 
     #[test]
     fn map_artist_flattens_optional_count_and_starred() {

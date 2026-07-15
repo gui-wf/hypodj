@@ -91,6 +91,15 @@ pub enum MpdCommand {
     SetVol(u8),
     /// `getvol` - current volume.
     GetVol,
+    /// `random <0|1>` - toggle shuffled playback order.
+    Random(bool),
+    /// `repeat <0|1>` - toggle looping the queue at its end.
+    Repeat(bool),
+    /// `single <0|1|oneshot>` - stop (or repeat one) after the current track.
+    /// `oneshot` is accepted (ncmpcpp sends it) and mapped to `true`.
+    Single(bool),
+    /// `consume <0|1>` - remove each entry from the queue once it has played.
+    Consume(bool),
 
     // ── queue ──────────────────────────────────────────────────────────
     Add(String),
@@ -874,6 +883,29 @@ pub fn parse(line: &str) -> MpdCommand {
             None => MpdCommand::Unsupported(line.to_string()),
         },
         "getvol" => MpdCommand::GetVol,
+        // random/repeat/single/consume: `<flag> 1` on, `<flag> 0` off. `single`
+        // additionally accepts ncmpcpp's `oneshot` (mapped to on). A missing/bad
+        // arg is a no-op-safe Unsupported ACK rather than a silent wrong toggle.
+        "random" => match arg(0).as_deref() {
+            Some("1") => MpdCommand::Random(true),
+            Some("0") => MpdCommand::Random(false),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "repeat" => match arg(0).as_deref() {
+            Some("1") => MpdCommand::Repeat(true),
+            Some("0") => MpdCommand::Repeat(false),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "single" => match arg(0).as_deref() {
+            Some("1") | Some("oneshot") => MpdCommand::Single(true),
+            Some("0") => MpdCommand::Single(false),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
+        "consume" => match arg(0).as_deref() {
+            Some("1") => MpdCommand::Consume(true),
+            Some("0") => MpdCommand::Consume(false),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         "add" => MpdCommand::Add(arg(0).unwrap_or_default()),
         "addid" => MpdCommand::AddId(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok())),
         "clear" => MpdCommand::Clear,
@@ -939,6 +971,23 @@ mod parse_tests {
         let (name, args) = tokenize(r#"add "song/al 1/track 2""#).unwrap();
         assert_eq!(name, "add");
         assert_eq!(args, vec!["song/al 1/track 2".to_string()]);
+    }
+
+    #[test]
+    fn parses_playback_mode_toggles() {
+        assert!(matches!(parse("random 1"), MpdCommand::Random(true)));
+        assert!(matches!(parse("random 0"), MpdCommand::Random(false)));
+        assert!(matches!(parse("repeat 1"), MpdCommand::Repeat(true)));
+        assert!(matches!(parse("repeat 0"), MpdCommand::Repeat(false)));
+        assert!(matches!(parse("single 1"), MpdCommand::Single(true)));
+        assert!(matches!(parse("single 0"), MpdCommand::Single(false)));
+        // ncmpcpp's oneshot maps to on.
+        assert!(matches!(parse("single oneshot"), MpdCommand::Single(true)));
+        assert!(matches!(parse("consume 1"), MpdCommand::Consume(true)));
+        assert!(matches!(parse("consume 0"), MpdCommand::Consume(false)));
+        // A missing/garbage arg is an Unsupported ACK, never a silent wrong toggle.
+        assert!(matches!(parse("random"), MpdCommand::Unsupported(_)));
+        assert!(matches!(parse("repeat blah"), MpdCommand::Unsupported(_)));
     }
 
     #[test]
