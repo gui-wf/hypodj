@@ -1,4 +1,4 @@
-//! hjq - the hypodj jukebox CLI. Human-native + natural-language-first: say what
+//! dj - the hypodj jukebox CLI. Human-native + natural-language-first: say what
 //! you want. A bare control verb (play/pause/stop/next/prev/vol/clear/queue/now)
 //! runs directly; anything else is sent to the daemon as `nl "<phrase>"`, echoed,
 //! and confirmed y/N. Blocking, one-shot, ONE persistent socket per invocation.
@@ -13,17 +13,18 @@ use hypodj_client::route::{self, Action};
 use hypodj_client::{model, nl};
 
 const HELP: &str = "\
-hjq - hypodj jukebox
+dj - hypodj jukebox
 
 USAGE:
-  hjq                      show the now-playing card
-  hjq now | status         show the now-playing card
-  hjq queue                list the queue
-  hjq play | pause | stop  playback control
-  hjq next | prev          skip / go back
-  hjq vol <0-100>          set volume
-  hjq clear                clear the queue (asks first)
-  hjq <anything else>      natural language: e.g. \"fade out\", \"stop after this
+  dj                      show the now-playing card
+  dj now | status         show the now-playing card
+  dj queue                list the queue
+  dj play | pause | stop  playback control
+  dj next | prev          skip / go back (also \"next song\", \"skip this\")
+  dj fav | favorite       favorite the current track (also \"fav current\")
+  dj vol <0-100>          set volume
+  dj clear                clear the queue (asks first)
+  dj <anything else>      natural language: e.g. \"fade out\", \"stop after this
                            album\", \"wake me at 7 with jazz\" - echoed + confirmed
 
 OPTIONS:
@@ -41,7 +42,7 @@ fn main() {
     match run(raw) {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("hjq: {e}");
+            eprintln!("dj: {e}");
             std::process::exit(1);
         }
     }
@@ -119,8 +120,39 @@ fn run(raw: Vec<String>) -> Result<(), MpdError> {
                 println!("cancelled");
             }
         }
+        Action::FavoriteCurrent => favorite_current(&mut conn)?,
         Action::Nl(phrase) => nl_handshake(&mut conn, &phrase)?,
         Action::Help => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Star the currently playing track. The server exposes only
+/// `playlistadd Starred <uri>` (no favorite-current shorthand), so resolve the
+/// current song's uri from `currentsong` first. A raw stream has no star surface.
+fn favorite_current(conn: &mut MpdConn) -> Result<(), MpdError> {
+    let current = conn.command("currentsong")?;
+    let np = model::now_playing(&[], &current);
+    let uri = match np.file.as_deref() {
+        Some(u) => u,
+        None => {
+            println!("nothing is playing to favorite");
+            return Ok(());
+        }
+    };
+    if !uri.starts_with("song/") {
+        // A stream (http(s) URL) is not a library song - no Subsonic star.
+        println!("the current track is a stream, which can't be favorited");
+        return Ok(());
+    }
+    match conn.command(&format!("playlistadd Starred {uri}")) {
+        Ok(_) => {
+            let label = np.title.as_deref().unwrap_or(uri);
+            println!("favorited: {label}");
+            print_card(conn)?;
+        }
+        Err(MpdError::Ack(msg)) => println!("could not favorite: {msg}"),
+        Err(e) => return Err(e),
     }
     Ok(())
 }

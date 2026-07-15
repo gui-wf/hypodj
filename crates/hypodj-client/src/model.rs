@@ -15,6 +15,10 @@ pub struct NowPlaying {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// The current song's uri from `currentsong` `file` (`song/<id>` for a library
+    /// track, an `http(s)://...` URL for a raw stream). Needed to favorite the
+    /// current track (`playlistadd Starred <uri>`); a stream has no star surface.
+    pub file: Option<String>,
 }
 
 fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -31,6 +35,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         title: find(current, "Title").map(str::to_string),
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
+        file: find(current, "file").map(str::to_string),
     }
 }
 
@@ -106,6 +111,7 @@ mod tests {
         assert_eq!(np.title.as_deref(), Some("Blue in Green"));
         assert_eq!(np.artist.as_deref(), Some("Miles Davis"));
         assert_eq!(np.album.as_deref(), Some("Kind of Blue"));
+        assert_eq!(np.file.as_deref(), Some("song/42"));
     }
 
     #[test]
