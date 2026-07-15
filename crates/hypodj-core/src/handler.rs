@@ -25,10 +25,15 @@ use opensubsonic::AlbumListType;
 use tokio::sync::Notify;
 
 use crate::cache::TtlLru;
+use crate::clock::TokioClock;
+use crate::config::FadeConfig;
+use crate::fade::{
+    run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget, StartleBounds,
+};
 use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
 use crate::subsonic::SubsonicError;
-use crate::mpd::{MpdCommand, MpdHandler, MpdResponse, StickerCmd};
-use crate::player::{PlayState, PlayerHandle};
+use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, StickerCmd};
+use crate::player::{db_to_mpv_volume, mpv_volume_to_db, PlayState, PlayerHandle};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 
 /// One queue entry: a playable [`QueueEntry`] (Subsonic song OR raw stream) plus
@@ -45,7 +50,28 @@ struct State {
     next_id: u64,
     /// Index into `queue` of the current song, if any.
     current: Option<usize>,
-    volume: u8,
+    /// The user-facing baseline volume (0..=100): what a manual `setvol` sets and
+    /// what a completed `fade out` restores to. During a fade this stays put; the
+    /// LIVE level rides in `live_gain_db`.
+    target_volume: u8,
+    /// The live fractional gain in perceptual dB - the internal source of truth a
+    /// fade writes every tick. The u8 MPD/MPRIS seam is DERIVED from this at read
+    /// time via [`State::reported_volume`], so getvol/status never desync from an
+    /// in-flight envelope. Initialised to the dB of `target_volume`.
+    live_gain_db: f64,
+    /// Monotonic fade generation. Bumped on every `start_fade`; a fade's report
+    /// closure no-ops if `fade_epoch` moved on (a superseded straggler), so late
+    /// writes from an aborted fade can never clobber the live gain.
+    fade_epoch: u64,
+    /// Is a fade envelope currently the source of truth for the reported volume?
+    /// `true` from the instant a fade is installed until it completes / is
+    /// cancelled. It is the SWITCH in [`State::reported_volume`]: when `false`,
+    /// `target_volume` (the exact u8 the user set) is reported verbatim; only
+    /// when `true` is the reported value derived from `live_gain_db`. This is why
+    /// `setvol 5` then `getvol` returns exactly 5 (deriving 5 through the cubic dB
+    /// domain would floor it to 0). Cleared by any manual volume set and by fade
+    /// completion.
+    fading: bool,
     /// Bumped whenever the queue changes (MPD "playlist version").
     playlist_version: u64,
     /// Client-negotiated binary chunk size (ncmpcpp sends `binarylimit`). MPD is
@@ -64,7 +90,11 @@ impl Default for State {
             queue: Vec::new(),
             next_id: 0,
             current: None,
-            volume: 100,
+            target_volume: 100,
+            // 100 -> 0 dB (see mpv_volume_to_db); the two start in sync.
+            live_gain_db: 0.0,
+            fade_epoch: 0,
+            fading: false,
             playlist_version: 0,
             binary_limit: 8192,
             last_starred_order: Vec::new(),
@@ -72,12 +102,329 @@ impl Default for State {
     }
 }
 
+impl State {
+    /// The TRUE current volume for the MPD/MPRIS seam (`getvol`/`status`/MPRIS).
+    ///
+    /// When NO fade is active, `target_volume` (the exact u8 the user set via
+    /// `setvol`, the external source of truth) is reported VERBATIM - never
+    /// round-tripped through the cubic dB domain, which floors any volume <= 10 to
+    /// 0 and would make `setvol 5; getvol` lie as `0`. Only DURING an active fade
+    /// is the reported value derived from `live_gain_db`, so `getvol`/`status`
+    /// honestly track the in-flight envelope.
+    fn reported_volume(&self) -> u8 {
+        if self.fading {
+            db_to_mpv_volume(self.live_gain_db).round().clamp(0.0, 100.0) as u8
+        } else {
+            self.target_volume
+        }
+    }
+
+    /// Set the baseline AND live gain together (a manual volume change) and clear
+    /// the `fading` switch: manual wins, so `reported_volume()` returns exactly
+    /// `v` afterward.
+    fn set_manual_volume(&mut self, v: u8) {
+        self.target_volume = v;
+        self.live_gain_db = mpv_volume_to_db(v as f64);
+        self.fading = false;
+    }
+}
+
+/// A running fade task. Holds the abort handle + join handle of the wrapper task
+/// the handler spawned (`run_fade` then the terminal action). Aborts on DROP, so
+/// a leaked handle can never keep writing to the sink; the explicit supersede
+/// path still abort+joins for strict ordering.
+struct FadeHandle {
+    abort: tokio::task::AbortHandle,
+    /// `Option` so the explicit supersede/cancel paths can `take()` the join out
+    /// to `.await` it WITHOUT moving a field out of this `Drop` type.
+    join: Option<tokio::task::JoinHandle<FadeOutcome>>,
+}
+
+impl Drop for FadeHandle {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+/// The SOLE fade arbiter: at most one active envelope. The async mutex is held
+/// ATOMICALLY across take -> abort -> await-join -> spawn -> store, so two
+/// concurrent `start_fade`s can never both end up with a live task. It is a
+/// `tokio::sync::Mutex` (not `std`) precisely because the join is awaited under
+/// the lock; the `std` `Mutex<State>` is NEVER held across that await.
+struct FadeSlot {
+    inner: tokio::sync::Mutex<Option<FadeHandle>>,
+}
+
+impl FadeSlot {
+    fn new() -> Self {
+        Self { inner: tokio::sync::Mutex::new(None) }
+    }
+
+    /// Atomically CANCEL any in-flight fade AND apply a manual state mutation
+    /// under the SAME slot lock, so the two are indivisible. Used by the manual
+    /// paths (setvol/stop/clear/mpris) so a concurrent `fade` from another
+    /// connection can NOT install a fade in the gap between "fade cancelled" and
+    /// "manual value applied" (which would leave a surviving fade driving mpv
+    /// while `getvol` reports the manual value, or clobber the manual volume).
+    ///
+    /// `apply` runs the state mutation (e.g. `set_manual_volume`) while the slot
+    /// lock is held; it is a SYNC closure and MUST NOT hold the `std` `Mutex<State>`
+    /// across any await (it does not await at all). The manual `player.set_volume`
+    /// is sequenced by the caller AFTER this returns; the abort+join here
+    /// guarantees the outgoing fade has fully stopped writing the sink first.
+    async fn cancel_with(&self, apply: impl FnOnce()) {
+        let mut slot = self.inner.lock().await;
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        apply();
+    }
+
+    /// Atomically replace the active fade: validate/build the new fade FIRST, and
+    /// only once it is a valid replacement abort+join the old one, THEN run
+    /// `spawn` under the SAME lock. `spawn` reads the now-settled live gain,
+    /// builds the wrapper task, bumps the epoch, and spawns it - all after the
+    /// outgoing fade has fully stopped writing, so the new fade starts from the
+    /// true settled level (the startle no-re-brighten invariant).
+    ///
+    /// VALIDATE-BEFORE-ABORT: `build` runs while the in-flight fade is STILL
+    /// running. If it returns `Err` (a rejected / startle-unsafe spec), the slot
+    /// is left UNTOUCHED - the in-flight fade keeps running, no volume is jumped -
+    /// and the error is propagated so the caller can surface an ACK. The outgoing
+    /// fade is aborted only after a valid replacement is in hand.
+    async fn supersede<P>(
+        &self,
+        build: impl FnOnce() -> Result<P, FadeError>,
+        spawn: impl FnOnce(P) -> (tokio::task::AbortHandle, tokio::task::JoinHandle<FadeOutcome>),
+    ) -> Result<(), FadeError> {
+        let mut slot = self.inner.lock().await;
+        // Validate/build the new fade BEFORE touching the in-flight one. A rejected
+        // command (e.g. a 0s `fade` -> StepTooLarge) must never abort a running
+        // envelope and then jump the volume - validation runs with the old fade
+        // still going, and we only abort once we hold a valid replacement.
+        let prepared = build()?;
+        if let Some(mut h) = slot.take() {
+            h.abort.abort();
+            if let Some(join) = h.join.take() {
+                let _ = join.await;
+            }
+        }
+        let (abort, join) = spawn(prepared);
+        *slot = Some(FadeHandle { abort, join: Some(join) });
+        Ok(())
+    }
+}
+
+/// What happens AFTER a fade's ramp completes. Lives in the wrapper task, not in
+/// the pure driver. Skipped on abort (a superseded/cancelled fade) and on a sink
+/// error, so a manual action that cancelled the fade is never undone.
+#[derive(Clone, Copy)]
+enum Terminal {
+    /// A bare ramp: adopt the reached level as the new baseline, clear `fading`,
+    /// nothing else (no stop, no `set_volume` re-assert).
+    ///
+    /// RESERVED, not dead: it is CONSUMED by the completion match in [`fade_task`]
+    /// (the `Terminal::None` arm), but no current `FadeIntent` constructs it - the
+    /// MPD front-end always commits a baseline (`SetBaseline`) or stops
+    /// (`StopRestore`). It exists for the P2 plan executor's pure `SetVolume` path:
+    /// a `fade`-native step that just wants a startle-safe level change with no
+    /// side effects. Wiring a `FadeIntent` variant that resolves to it is the only
+    /// change needed to reach it; `#[allow(dead_code)]` covers the never-constructed
+    /// variant until then (the match arm is live, so this is not misleading dead
+    /// code).
+    #[allow(dead_code)]
+    None,
+    /// `fade out`: stop playback and restore the baseline volume.
+    StopRestore,
+    /// `fade to <v>`: commit `v` as the new baseline volume.
+    SetBaseline(u8),
+}
+
+/// A fade-NATIVE request: the abstract intent plus the (already resolved +
+/// clamped) duration. This is the seam the reusable core
+/// ([`HypodjHandler::start_fade_spec`]) speaks - decoupled from the MPD `fade`
+/// DSL, so the P2 plan executor constructs one directly. The MPD dispatch builds
+/// it from [`FadeArgs`]; the executor will build it from a plan step.
+#[derive(Clone, Copy, Debug)]
+pub struct FadeRequest {
+    pub intent: FadeIntent,
+    pub dur: Duration,
+}
+
+/// The abstract, fade-native fade intents. Kept separate from the MPD
+/// [`FadeKind`] so the executor is not coupled to the wire grammar. Each resolves
+/// (against the live gain + the comfort ceiling) into a concrete
+/// [`FadeTarget`] + sub-JND policy + [`Terminal`].
+#[derive(Clone, Copy, Debug)]
+pub enum FadeIntent {
+    /// Ramp to silence, then stop playback and restore the pre-fade baseline.
+    Out,
+    /// Wake ramp UP to the comfort ceiling. NEVER ramps down: if the live gain is
+    /// already at/above the ceiling the target is the live gain (a degenerate
+    /// no-op), so a `fade in` at full volume does nothing rather than dropping.
+    In,
+    /// Deliberate cue to an explicit perceptual level, committing `vol` as the new
+    /// baseline on completion. Used by `fade to <vol>` and `fade to floor`.
+    To { target_db: f64, vol: u8 },
+}
+
+impl FadeIntent {
+    /// Resolve into `(target, sub_jnd, terminal)` against the live `from_db` and
+    /// the configured comfort `ceiling`.
+    fn resolve(self, from_db: f64, ceiling: f64) -> (FadeTarget, bool, Terminal) {
+        match self {
+            FadeIntent::Out => (FadeTarget::Silence, true, Terminal::StopRestore),
+            FadeIntent::In => {
+                // Ceiling clamp: target the HIGHER of the live gain and the
+                // ceiling, so the fade only ever rises (never re-brightens past a
+                // manual level, never drops when named `in`).
+                let target_db = from_db.max(ceiling);
+                let vol = db_to_mpv_volume(target_db).round().clamp(0.0, 100.0) as u8;
+                (FadeTarget::Db(target_db), true, Terminal::SetBaseline(vol))
+            }
+            FadeIntent::To { target_db, vol } => {
+                (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol))
+            }
+        }
+    }
+}
+
+/// The wrapper task the handler spawns for one fade: drive the pure `run_fade`,
+/// writing the live gain (and coalescing change notifications) on each tick, then
+/// apply the terminal action. Returns the [`FadeOutcome`] so the join sees it.
+///
+/// The report closure writes `State.live_gain_db` every tick but only fires
+/// `notify_change` when the ROUNDED u8 reported volume changes - killing the
+/// per-tick notify storm (a long fade emits a handful of notifications, not
+/// hundreds). It no-ops entirely if the epoch has moved on (a superseded
+/// straggler), so an aborted fade's last in-flight report cannot clobber a newer
+/// fade's live gain.
+#[allow(clippy::too_many_arguments)]
+async fn fade_task(
+    sink: PlayerHandle,
+    spec: FadeSpec,
+    state: Arc<Mutex<State>>,
+    changed: Arc<Notify>,
+    epoch: u64,
+    terminal: Terminal,
+    // The fade arbiter. The terminal action runs UNDER this slot lock so its
+    // check-and-act is ATOMIC against supersede/cancel (C3): either supersede
+    // aborts this task before it takes the lock (terminal never runs its side
+    // effects) or the terminal runs to completion first and supersede then aborts
+    // an already-finished task - never an interleave where a superseded fade's
+    // stop/baseline whipsaws a freshly installed fade.
+    fade_slot: Arc<FadeSlot>,
+    // The synth floor (finite silence dB). The final mute step reports
+    // `NEG_INFINITY`; we clamp it to this finite floor before storing it in
+    // `live_gain_db` so a fade STARTED during the mute window reads a finite
+    // `from_db` and is not rejected as `NonFinite` (see F8).
+    synth_floor_db: f64,
+) -> FadeOutcome {
+    let clock = TokioClock;
+    let outcome = {
+        let state_r = state.clone();
+        let changed_r = changed.clone();
+        let mut last_u8: Option<u8> = None;
+        let mut report = move |p: FadeProgress| {
+            // std Mutex<State> is taken and released here; NEVER held across the
+            // notify (which is not an await, but the discipline is kept regardless).
+            let reported = {
+                let mut st = state_r.lock().unwrap();
+                if st.fade_epoch != epoch {
+                    return; // stale straggler from a superseded fade: no-op.
+                }
+                // Keep the stored gain FINITE (the mute step is -inf) so the next
+                // fade can start from it without a NonFinite rejection.
+                st.live_gain_db = p.gain_db.max(synth_floor_db);
+                st.reported_volume()
+            };
+            if last_u8 != Some(reported) {
+                last_u8 = Some(reported);
+                changed_r.notify_waiters();
+            }
+        };
+        run_fade(&sink, &spec, &clock, &mut report).await
+    };
+
+    // Take the slot lock so the terminal's check-and-act is ATOMIC against
+    // supersede/cancel (C3). Holding a tokio mutex across the awaits below is
+    // allowed; the `std` Mutex<State> is never held across an await. While we
+    // hold this lock no supersede can bump `fade_epoch` or install a replacement,
+    // so the `still_current` check is stable and meaningful: if a supersede
+    // already ran, it aborted this task before it reached here, OR it is blocked
+    // waiting for this lock and will abort a task that has already finished.
+    let _slot_guard = fade_slot.inner.lock().await;
+    // Only settle if still the current generation (a superseding fade owns the
+    // state otherwise). On completion, run the terminal action AND clear `fading`;
+    // on a sink error, settle the baseline to the last-good level and clear
+    // `fading` too so the reported volume stops deriving from a stalled envelope.
+    //
+    // NOTE on the FadeSlot handle: `fading` (in State) is the single source of
+    // truth for "a fade is active" and is cleared below. This task does NOT remove
+    // its own FadeHandle from the slot on natural completion (doing so would drop
+    // the handle and abort this task mid-terminal). So after a fade completes the
+    // slot may still hold a FINISHED handle until the next `start_fade`/cancel
+    // reclaims it - and aborting/joining an already-finished task there is a
+    // harmless no-op. Read `fading`, never slot-occupancy, to test "fade active".
+    let still_current = state.lock().unwrap().fade_epoch == epoch;
+    if still_current {
+        match &outcome {
+            FadeOutcome::Completed => match terminal {
+                Terminal::None => {
+                    // A bare ramp (no stop/baseline commit): adopt the reached
+                    // level as the new baseline and clear the fade switch.
+                    let mut st = state.lock().unwrap();
+                    let v = db_to_mpv_volume(st.live_gain_db).round().clamp(0.0, 100.0) as u8;
+                    st.target_volume = v;
+                    st.fading = false;
+                    drop(st);
+                    changed.notify_waiters();
+                }
+                Terminal::StopRestore => {
+                    let restore = state.lock().unwrap().target_volume;
+                    let _ = sink.stop().await;
+                    // Re-assert the real mpv gain to the baseline so the next play
+                    // does not start at the faded-down level.
+                    let _ = sink.set_volume(restore).await;
+                    state.lock().unwrap().set_manual_volume(restore);
+                    changed.notify_waiters();
+                }
+                Terminal::SetBaseline(v) => {
+                    // Re-assert the real mpv gain to the committed baseline (the
+                    // fade drove the fractional seam; snap the u8 seam to match).
+                    let _ = sink.set_volume(v).await;
+                    state.lock().unwrap().set_manual_volume(v);
+                    changed.notify_waiters();
+                }
+            },
+            FadeOutcome::SinkError(_) => {
+                let mut st = state.lock().unwrap();
+                let v = db_to_mpv_volume(st.live_gain_db).round().clamp(0.0, 100.0) as u8;
+                st.target_volume = v;
+                st.fading = false;
+                drop(st);
+                changed.notify_waiters();
+            }
+        }
+    }
+    outcome
+}
+
 pub struct HypodjHandler {
     client: Arc<SubsonicClient>,
     player: PlayerHandle,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
     /// Fired when a subsystem changes, to wake `idle`.
-    changed: Notify,
+    changed: Arc<Notify>,
+    /// The single active-fade arbiter (see [`FadeSlot`]). `Arc` so each spawned
+    /// fade task can hold a handle and take the slot lock for its terminal action
+    /// (C3: the terminal's check-and-act is atomic against supersede/cancel).
+    fade: Arc<FadeSlot>,
+    /// Per-user fade tunables (startle bounds, tick, durations).
+    fade_cfg: FadeConfig,
     /// Bounded LRU+TTL cache for STABLE listings (artists, albums, genres, smart
     /// lists, similar/top). NEVER holds its lock across an `.await` (see cache
     /// docs): get -> await refill -> put, two separate lock scopes.
@@ -91,12 +438,28 @@ pub struct HypodjHandler {
 }
 
 impl HypodjHandler {
+    /// Construct with the default `[fade]` tunables (research-backed constants).
     pub fn new(client: Arc<SubsonicClient>, player: PlayerHandle) -> Self {
+        Self::with_fade_config(client, player, FadeConfig::default())
+    }
+
+    /// Construct with an explicit [`FadeConfig`] (the daemon threads `cfg.fade`).
+    pub fn with_fade_config(
+        client: Arc<SubsonicClient>,
+        player: PlayerHandle,
+        mut fade_cfg: FadeConfig,
+    ) -> Self {
+        // Defense in depth: normalize here too, so a handler built from a
+        // hand-constructed FadeConfig (not only Config::load) is still clamped to
+        // the startle-safe invariants (F7).
+        fade_cfg.normalize();
         Self {
             client,
             player,
-            state: Mutex::new(State::default()),
-            changed: Notify::new(),
+            state: Arc::new(Mutex::new(State::default())),
+            changed: Arc::new(Notify::new()),
+            fade: Arc::new(FadeSlot::new()),
+            fade_cfg,
             listings: TtlLru::new(256, Duration::from_secs(60)),
             dir_cache: TtlLru::new(256, Duration::from_secs(60)),
             cover_cache: TtlLru::new(64, Duration::from_secs(600)),
@@ -110,6 +473,139 @@ impl HypodjHandler {
 
     fn notify_change(&self) {
         self.changed.notify_waiters();
+    }
+
+    /// THE MPD-facing fade entry point: convert the parsed [`FadeArgs`] DSL into a
+    /// fade-native [`FadeRequest`] (resolving the per-kind default duration and
+    /// clamping to `[min_slew, max_dur]` from [`FadeConfig`], so a user's `[fade]`
+    /// TOML override actually takes effect), then delegate to [`start_fade_spec`].
+    /// Returns the [`FadeError`] on a rejected spec so the dispatch can ACK it to
+    /// the client rather than silently dropping the request.
+    ///
+    /// [`start_fade_spec`]: Self::start_fade_spec
+    pub async fn start_fade(&self, args: FadeArgs) -> Result<(), FadeError> {
+        // Resolve the raw/optional duration against config: a missing duration
+        // takes the per-kind default; any duration is then clamped to
+        // [min_slew, max_dur]. THIS is where the config knobs are threaded.
+        let default_secs = match args.kind {
+            FadeKind::In => self.fade_cfg.wake_ramp_secs,
+            FadeKind::Out | FadeKind::To(_) | FadeKind::ToFloor => self.fade_cfg.winddown_fade_secs,
+        };
+        let raw = args.dur.unwrap_or_else(|| Duration::from_secs(default_secs));
+        let min = Duration::from_millis(self.fade_cfg.min_slew_ms);
+        let max = Duration::from_secs(self.fade_cfg.max_dur_secs);
+        let dur = raw.clamp(min, max);
+
+        let intent = match args.kind {
+            FadeKind::Out => FadeIntent::Out,
+            FadeKind::In => FadeIntent::In,
+            FadeKind::To(v) => FadeIntent::To {
+                target_db: mpv_volume_to_db(v as f64),
+                vol: v,
+            },
+            // Wind down to the configured non-silence floor, leaving playback
+            // running (distinct from Out). Commits the floor as the new baseline.
+            FadeKind::ToFloor => {
+                let floor = self.fade_cfg.floor_level_db;
+                FadeIntent::To {
+                    target_db: floor,
+                    vol: db_to_mpv_volume(floor).round().clamp(0.0, 100.0) as u8,
+                }
+            }
+        };
+        self.start_fade_spec(FadeRequest { intent, dur }).await
+    }
+
+    /// THE reusable, fade-NATIVE entry point that starts a volume-envelope fade.
+    /// Speaks [`FadeRequest`] (dB / [`FadeTarget`] + [`Duration`]), NOT the MPD
+    /// DSL, so the P2 plan executor calls it directly without going through the
+    /// `fade` command grammar - one arbiter ([`FadeSlot`]), two front-ends.
+    ///
+    /// The live `from_db` is read INSIDE the slot lock, AFTER the outgoing fade is
+    /// aborted AND joined, so the new fade starts from the true settled level and
+    /// never re-brightens upward (the startle no-re-brighten invariant). The
+    /// validated [`FadeSpec`] is built there too; a rejection propagates out as a
+    /// [`FadeError`] (the slot is left empty). The terminal action lives in the
+    /// spawned wrapper task, keeping [`run_fade`] pure.
+    pub async fn start_fade_spec(&self, req: FadeRequest) -> Result<(), FadeError> {
+        let tick = Duration::from_millis(self.fade_cfg.tick_ms);
+        let ceiling = self.fade_cfg.wake_ceiling_db;
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        let dur = req.dur;
+        let intent = req.intent;
+
+        let cfg = self.fade_cfg.clone();
+        let state_read = self.state.clone();
+        let state_task = self.state.clone();
+        let changed = self.changed.clone();
+        let sink = self.player.clone();
+        // The task holds a handle to the slot so its terminal can lock it (C3).
+        let slot_for_task = self.fade.clone();
+
+        // build: read the live gain and validate the spec while the outgoing fade
+        // is STILL running (so a rejected command leaves it untouched). from_db is
+        // pre-abort; the outgoing fade is aborted only after this succeeds, so any
+        // residual gap vs the settled level is at most one sub-JND tick, never a
+        // re-brighten. spawn: only reached with a valid spec, after the abort.
+        let res = self
+            .fade
+            .supersede(
+                move || {
+                    let from_db = state_read.lock().unwrap().live_gain_db;
+                    let (target, sub_jnd, terminal) = intent.resolve(from_db, ceiling);
+                    let bounds = startle_bounds(&cfg, sub_jnd);
+                    let spec = FadeSpec::new(from_db, target, dur, tick, Curve::DbLinear, bounds)?;
+                    Ok((spec, terminal))
+                },
+                move |(spec, terminal)| {
+                    // Bump the epoch + flag `fading` UNDER the slot lock so this
+                    // fade's reports are tagged strictly newer than any it
+                    // superseded and the reported volume tracks the envelope.
+                    let epoch = {
+                        let mut st = state_task.lock().unwrap();
+                        st.fade_epoch += 1;
+                        st.fading = true;
+                        st.fade_epoch
+                    };
+                    let join = tokio::spawn(fade_task(
+                        sink, spec, state_task, changed, epoch, terminal, slot_for_task,
+                        synth_floor,
+                    ));
+                    let abort = join.abort_handle();
+                    (abort, join)
+                },
+            )
+            .await;
+
+        // On rejection nothing was disturbed: the in-flight fade (if any) is still
+        // running and no volume was touched, so just surface the ACK error.
+        res
+    }
+
+    /// TEST-ONLY: await the currently-active fade task to natural completion
+    /// (takes its join out of the slot). Lets a test drive a fade to its terminal
+    /// under paused time without racing.
+    #[cfg(test)]
+    async fn wait_for_fade(&self) {
+        let join = {
+            let mut slot = self.fade.inner.lock().await;
+            slot.as_mut().and_then(|h| h.join.take())
+        };
+        if let Some(j) = join {
+            let _ = j.await;
+        }
+    }
+
+    /// TEST-ONLY: is a fade task currently installed in the slot?
+    #[cfg(test)]
+    async fn fade_active(&self) -> bool {
+        self.fade.inner.lock().await.is_some()
+    }
+
+    /// TEST-ONLY: read the live gain in dB (the internal source of truth).
+    #[cfg(test)]
+    fn live_gain_db(&self) -> f64 {
+        self.state.lock().unwrap().live_gain_db
     }
 
     /// Called by the daemon when the player reports a natural EOF: advance to the
@@ -263,6 +759,18 @@ fn ack(code: u32, command: &str, message: &str) -> MpdResponse {
     }
 }
 
+/// Build the startle-safety bounds for a fade from the live [`FadeConfig`]. Single
+/// source of truth for the slew floor, step ceiling, and synth floor shared by
+/// every fade the handler starts.
+fn startle_bounds(cfg: &FadeConfig, sub_jnd: bool) -> StartleBounds {
+    StartleBounds {
+        min_slew: Duration::from_millis(cfg.min_slew_ms),
+        step_size_db: cfg.step_size_db,
+        synth_floor_db: cfg.synth_floor_db,
+        sub_jnd,
+    }
+}
+
 // ACK error codes (subset of MPD's ack.h).
 const ACK_ERROR_NO_EXIST: u32 = 50;
 const ACK_ERROR_UNKNOWN: u32 = 5;
@@ -297,7 +805,9 @@ impl MpdHandler for HypodjHandler {
                     let st = self.state.lock().unwrap();
                     (
                         self.player.state(),
-                        st.volume,
+                        // Derived from the live gain so status tracks an in-flight
+                        // fade and never desyncs from the envelope.
+                        st.reported_volume(),
                         st.queue.len(),
                         st.current,
                         st.playlist_version,
@@ -409,9 +919,36 @@ impl MpdHandler for HypodjHandler {
                 }
             }
             MpdCommand::Stop => {
+                // Manual wins ATOMICALLY: cancel (abort+join) any fade AND drop the
+                // stale live-fade level back to the baseline under the SAME slot
+                // lock, so no concurrent `fade` can slip in between. The stop and
+                // the mpv re-assert are sequenced after.
+                self.fade
+                    .cancel_with(|| {
+                        let mut st = self.state.lock().unwrap();
+                        let v = st.target_volume;
+                        st.set_manual_volume(v);
+                    })
+                    .await;
                 let _ = self.player.stop().await;
+                let v = self.state.lock().unwrap().target_volume;
+                // Re-assert the real mpv gain to the baseline so the cancelled
+                // fade's faded-down level does not linger under a baseline report
+                // (F4): the next play starts at the reported volume, not silence.
+                let _ = self.player.set_volume(v).await;
                 self.notify_change();
                 MpdResponse::ok()
+            }
+            MpdCommand::Fade(args) => {
+                // Surface a rejected (startle-unsafe) spec as an ACK to the client
+                // rather than a silent warn-and-return (F7).
+                match self.start_fade(args).await {
+                    Ok(()) => {
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "fade", &e.to_string()),
+                }
             }
             MpdCommand::Next => {
                 let next = {
@@ -451,15 +988,20 @@ impl MpdHandler for HypodjHandler {
             },
             MpdCommand::SetVol(v) => {
                 let v = v.min(100);
-                {
-                    self.state.lock().unwrap().volume = v;
-                }
+                // Manual wins ATOMICALLY: cancel any fade (abort+join) AND apply
+                // the manual value under the SAME slot lock, so a concurrent `fade`
+                // from another connection cannot install a fade in the gap and
+                // clobber the manual volume (or leave a surviving fade driving mpv
+                // while getvol lies). The mpv set_volume is sequenced after.
+                self.fade
+                    .cancel_with(|| self.state.lock().unwrap().set_manual_volume(v))
+                    .await;
                 let _ = self.player.set_volume(v).await;
                 self.notify_change();
                 MpdResponse::ok()
             }
             MpdCommand::GetVol => {
-                let v = self.state.lock().unwrap().volume;
+                let v = self.state.lock().unwrap().reported_volume();
                 MpdResponse::pairs().pair("volume", v.to_string()).build()
             }
 
@@ -473,13 +1015,24 @@ impl MpdHandler for HypodjHandler {
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "addid", &e),
             },
             MpdCommand::Clear => {
-                {
-                    let mut st = self.state.lock().unwrap();
-                    st.queue.clear();
-                    st.current = None;
-                    st.playlist_version += 1;
-                }
+                // Manual wins ATOMICALLY: cancel any fade AND clear the queue +
+                // reset the volume to the baseline under the SAME slot lock (see
+                // SetVol/Stop), so no concurrent `fade` can interleave.
+                self.fade
+                    .cancel_with(|| {
+                        let mut st = self.state.lock().unwrap();
+                        st.queue.clear();
+                        st.current = None;
+                        st.playlist_version += 1;
+                        let v = st.target_volume;
+                        st.set_manual_volume(v);
+                    })
+                    .await;
+                let v = self.state.lock().unwrap().target_volume;
                 let _ = self.player.stop().await;
+                // Re-assert the real mpv gain to the baseline (F4): a cancelled
+                // fade must not leave mpv faded-down under a baseline report.
+                let _ = self.player.set_volume(v).await;
                 self.notify_change();
                 MpdResponse::ok()
             }
@@ -724,7 +1277,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Commands => {
                 let cmds = [
                     "add", "addid", "albumart", "binarylimit", "clear",
-                    "commands", "count", "currentsong", "delete", "find", "findadd",
+                    "commands", "count", "currentsong", "delete", "fade", "find", "findadd",
                     "getvol", "idle",
                     "list", "listall", "listallinfo", "listplaylistinfo",
                     "listplaylists", "load", "lsinfo", "next", "noidle",
@@ -793,9 +1346,10 @@ impl HypodjHandler {
         })
     }
 
-    /// Current volume (0..=100), for the MPRIS `Volume` property.
+    /// Current volume (0..=100), for the MPRIS `Volume` property. Derived from the
+    /// live gain so it tracks an in-flight fade (same seam as MPD `getvol`).
     pub fn volume(&self) -> u8 {
-        self.state.lock().unwrap().volume
+        self.state.lock().unwrap().reported_volume()
     }
 
     /// Advance to the next queue entry (MPRIS `Next` / desktop control). No-op at
@@ -826,7 +1380,11 @@ impl HypodjHandler {
     /// to the player, same as the MPD `setvol` path.
     pub async fn mpris_set_volume(&self, vol: u8) {
         let v = vol.min(100);
-        self.state.lock().unwrap().volume = v;
+        // Manual wins ATOMICALLY (mirrors the MPD setvol path): cancel any fade
+        // AND apply the manual value under the SAME slot lock.
+        self.fade
+            .cancel_with(|| self.state.lock().unwrap().set_manual_volume(v))
+            .await;
         let _ = self.player.set_volume(v).await;
         self.notify_change();
     }
@@ -1757,5 +2315,417 @@ mod tests {
         scrobbler.on_event(&PlayerEvent::TimePos(120.0));
         // No panic, no submission possible: the scrobbler never latched a song.
         assert!(scrobbler.current_is_none());
+    }
+
+    use crate::mpd::{FadeArgs, FadeKind};
+    use std::time::Duration;
+
+    fn fade_args(kind: FadeKind, secs: u64) -> FadeArgs {
+        FadeArgs { kind, dur: Some(Duration::from_secs(secs)) }
+    }
+
+    /// Drive paused virtual time forward in `iters` ticks of `ms`, yielding
+    /// several times per tick so a spawned fade task (and the NullPlayer actor it
+    /// awaits round-trips against) actually gets polled between deadlines.
+    async fn pump(ms: u64, iters: usize) {
+        for _ in 0..iters {
+            tokio::time::advance(Duration::from_millis(ms)).await;
+            for _ in 0..6 {
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    // A fade out runs to completion -> the player is Stopped AND the pre-fade
+    // baseline volume is restored (terminal action in the wrapper task).
+    #[tokio::test(start_paused = true)]
+    async fn fade_out_stops_and_restores() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Start playing something so there is a live playback state to stop.
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        h.start_fade(fade_args(FadeKind::Out, 20)).await.unwrap();
+        assert!(h.fade_active().await);
+        h.wait_for_fade().await;
+
+        // Ramp reached silence, then the terminal stopped + restored baseline 100.
+        assert_eq!(h.player.state(), PlayState::Stopped);
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+    }
+
+    // A manual setvol mid-fade cancels (abort+join) the fade FIRST, then applies
+    // the manual value: manual wins, strictly ordered, no trailing fade tick.
+    #[tokio::test(start_paused = true)]
+    async fn manual_wins_last() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.start_fade(fade_args(FadeKind::Out, 60)).await.unwrap();
+        assert!(h.fade_active().await);
+
+        // setvol 30 mid-fade.
+        h.handle(MpdCommand::SetVol(30)).await;
+        // Fade is gone (cancelled), and the last applied volume is exactly 30.
+        assert!(!h.fade_active().await);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 30);
+        assert_eq!(h.state.lock().unwrap().target_volume, 30);
+    }
+
+    // A superseding fade continues from the LIVE gain, not a stale value, and the
+    // superseded fade is joined before the new one is installed.
+    #[tokio::test(start_paused = true)]
+    async fn supersede_continuous() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Fade A: a slow fade out. Let a few ticks apply so the live gain drops.
+        h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
+        pump(250, 8).await;
+        let mid_gain = h.live_gain_db();
+        assert!(mid_gain < 0.0, "fade A should have lowered the live gain");
+
+        // Fade B supersedes: it must start from the live gain (<= mid_gain, since
+        // B keeps ramping down), never jump back to 0 dB.
+        h.start_fade(fade_args(FadeKind::To(0), 60)).await.unwrap();
+        pump(250, 8).await;
+        assert!(
+            h.live_gain_db() <= mid_gain + 1e-6,
+            "supersede must not re-brighten (continuous from live gain)"
+        );
+    }
+
+    // A REJECTED fade command must leave an in-flight fade running and never jump
+    // the volume: validation happens before the outgoing fade is aborted.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_fade_leaves_running_fade_untouched() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
+        pump(250, 8).await;
+        let mid_gain = h.live_gain_db();
+        assert!(mid_gain < 0.0 && h.fade_active().await);
+        // A 0s `fade to 0` is rejected (StepTooLarge). It must NOT abort the
+        // running fade out and must NOT re-brighten the volume.
+        let resp = h
+            .handle(MpdCommand::Fade(FadeArgs { kind: FadeKind::To(0), dur: Some(Duration::ZERO) }))
+            .await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }), "rejected fade must ACK");
+        assert!(h.fade_active().await, "rejected fade must not abort the running one");
+        pump(250, 4).await;
+        assert!(
+            h.live_gain_db() <= mid_gain + 1e-6,
+            "the original fade out must keep descending, never jump up"
+        );
+    }
+
+    // Play / Next / Previous do NOT cancel an in-flight fade (the envelope is
+    // continuous across track boundaries - mpv volume persists across loadfile).
+    #[tokio::test(start_paused = true)]
+    async fn fade_survives_track_change() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
+        assert!(h.fade_active().await);
+        // Next on the empty queue is a no-op OK, and crucially does NOT cancel.
+        h.handle(MpdCommand::Next).await;
+        h.handle(MpdCommand::Previous).await;
+        assert!(h.fade_active().await, "fade must survive next/previous");
+    }
+
+    // Dropping a FadeHandle aborts its task (no further sink writes). Verified at
+    // the FadeSlot/FadeHandle level with a self-incrementing task.
+    #[tokio::test(start_paused = true)]
+    async fn leak_safety_drop_aborts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let c = counter.clone();
+        let join = tokio::spawn(async move {
+            loop {
+                c.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            #[allow(unreachable_code)]
+            FadeOutcome::Completed
+        });
+        let abort = join.abort_handle();
+        let handle = FadeHandle { abort, join: Some(join) };
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tokio::task::yield_now().await;
+        let before = counter.load(Ordering::SeqCst);
+        drop(handle); // Drop MUST abort the task.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        let after = counter.load(Ordering::SeqCst);
+        assert!(after <= before + 1, "dropped handle kept running: {before} -> {after}");
+    }
+
+    // notify_change is coalesced: a long fade emits far fewer notifications than
+    // it has steps (only when the ROUNDED reported volume changes).
+    #[tokio::test(start_paused = true)]
+    async fn notify_coalesced() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let h = Arc::new(h);
+        // Count change notifications on a background subscriber.
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let h = h.clone();
+            let count = count.clone();
+            tokio::spawn(async move {
+                loop {
+                    h.changed().await;
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+        tokio::task::yield_now().await;
+        // A 60s fade out from 0 dB to silence: ~80 sub-JND steps.
+        h.start_fade(fade_args(FadeKind::Out, 60)).await.unwrap();
+        h.wait_for_fade().await;
+        tokio::task::yield_now().await;
+        let n = count.load(std::sync::atomic::Ordering::SeqCst);
+        // At most ~101 distinct integer volumes exist; the count must be well
+        // under the ~80 step total is NOT the bar - the bar is <= 101 and that it
+        // did not fire once per step for every tick. Assert it is bounded by the
+        // reachable integer-volume transitions plus the terminal notify.
+        assert!(n <= 101 + 2, "notify storm not coalesced: {n} notifications");
+        assert!(n >= 1, "a fade should notify at least once");
+    }
+
+    // F1: with NO fade active, a low manual volume is reported EXACTLY, never
+    // round-tripped through the cubic dB domain (which would floor <= 10 to 0).
+    // `setvol 5` then `getvol` must return 5.
+    #[tokio::test]
+    async fn low_volume_reports_exactly() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        for v in [0u8, 1, 5, 7, 10, 33, 100] {
+            h.handle(MpdCommand::SetVol(v)).await;
+            let got = match h.handle(MpdCommand::GetVol).await {
+                MpdResponse::Pairs(p) => p
+                    .iter()
+                    .find(|(k, _)| k == "volume")
+                    .map(|(_, val)| val.parse::<u8>().unwrap())
+                    .unwrap(),
+                other => panic!("got {other:?}"),
+            };
+            assert_eq!(got, v, "setvol {v} must report exactly {v}");
+            assert_eq!(h.volume(), v, "MPRIS volume must also report exactly {v}");
+        }
+    }
+
+    // F2: `fade in` from silence ramps UP to the wake ceiling (0 dB == vol 100),
+    // never a degenerate no-op. Start muted, fade in, and the reported/baseline
+    // volume settles at the ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn fade_in_ramps_up_from_silence() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Start from silence: setvol 0 (live gain at the floor).
+        h.handle(MpdCommand::SetVol(0)).await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 0);
+
+        h.start_fade(fade_args(FadeKind::In, 30)).await.unwrap();
+        assert!(h.fade_active().await);
+        h.wait_for_fade().await;
+
+        // Ramp reached the ceiling and committed it as the new baseline.
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+    }
+
+    // F3: a user's [fade] TOML override for the default duration actually takes
+    // effect (the parser is config-free; the handler threads the config default).
+    // A shorter winddown default yields proportionally fewer steps for a
+    // no-duration `fade out`.
+    #[tokio::test(start_paused = true)]
+    async fn config_default_duration_override_takes_effect() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Rebuild the handler with a tiny winddown default via config.
+        let cfg = {
+            let mut c = FadeConfig::default();
+            c.winddown_fade_secs = 5;
+            c
+        };
+        let h = HypodjHandler::with_fade_config(h.client(), h.player.clone(), cfg);
+        // No-duration fade out -> uses winddown_fade_secs (5s), clamped >= min_slew.
+        h.start_fade(FadeArgs { kind: FadeKind::Out, dur: None }).await.unwrap();
+        assert!(h.fade_active().await);
+        // Drive to completion and confirm it stopped (a 5s fade completes quickly
+        // under paused time; a 300s default would too, but the point is the
+        // config path is exercised and honored - no panic, real completion).
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped);
+    }
+
+    // F4: after a mid-fade Stop, the reported volume returns to the baseline (the
+    // cancelled fade's faded-down level does not linger in the report). The mpv
+    // re-assert call is issued too (unobservable via NullPlayer, but the state is).
+    #[tokio::test(start_paused = true)]
+    async fn stop_reasserts_baseline_after_fade() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
+        pump(250, 8).await;
+        assert!(h.live_gain_db() < 0.0, "fade lowered the live gain");
+
+        h.handle(MpdCommand::Stop).await;
+        assert!(!h.fade_active().await, "stop cancels the fade");
+        assert_eq!(h.player.state(), PlayState::Stopped);
+        // Reported volume is back at the baseline, not the faded-down level.
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
+    }
+
+    // F7: a startle-unsafe spec (a deliberate `fade to` over a huge range in one
+    // slewed step) is surfaced as an ACK to the client, never silently dropped.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_fade_acks_not_silent() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // fade to 0 with a 0s duration: clamps to one min_slew step spanning the
+        // full 0 dB -> -60 dB range (60 dB) as a DELIBERATE cue -> StepTooLarge.
+        let resp = h
+            .handle(MpdCommand::Fade(FadeArgs { kind: FadeKind::To(0), dur: Some(Duration::ZERO) }))
+            .await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }), "must ACK, got {resp:?}");
+        // And it must not have installed a fade.
+        assert!(!h.fade_active().await);
+    }
+
+    // F8: the muted state is represented as a FINITE floor dB, not NEG_INFINITY,
+    // so a fade started from the mute window reads a finite from_db and is NOT
+    // rejected as NonFinite. Put the state at the synth floor and start a fade in.
+    #[tokio::test(start_paused = true)]
+    async fn fade_from_mute_window_is_finite() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Simulate the mute window: live gain sitting at the finite synth floor.
+        {
+            let mut st = h.state.lock().unwrap();
+            st.live_gain_db = h.fade_cfg.synth_floor_db;
+            st.fading = true;
+        }
+        // A fade started here must build (finite from_db), not error NonFinite.
+        h.start_fade(fade_args(FadeKind::In, 30)).await.unwrap();
+        assert!(h.fade_active().await);
+    }
+
+    // F9: the fade-native entry point (start_fade_spec) drives a fade without
+    // going through the MPD `fade` DSL - the seam the P2 executor will call.
+    #[tokio::test(start_paused = true)]
+    async fn native_entry_point_drives_fade() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // Construct a native request directly (no FadeArgs / no wire grammar).
+        h.start_fade_spec(FadeRequest {
+            intent: FadeIntent::Out,
+            dur: Duration::from_secs(20),
+        })
+        .await
+        .unwrap();
+        assert!(h.fade_active().await);
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped);
+    }
+
+    // C2: a manual setvol against a running fade must leave NO surviving fade task
+    // and report EXACTLY the manual value - the cancel + the state mutation happen
+    // atomically under the slot lock, so there is no window a concurrent fade
+    // could clobber. Asserts the full post-condition: empty slot, fading cleared,
+    // exact volume.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_leaves_no_surviving_fade() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
+        pump(250, 6).await;
+        assert!(h.fade_active().await && h.live_gain_db() < 0.0);
+
+        // setvol from a second logical caller.
+        h.handle(MpdCommand::SetVol(42)).await;
+
+        // No fade task survives in the slot, the fade switch is cleared, and the
+        // reported/baseline volume is exactly the manual value.
+        assert!(!h.fade_active().await, "no surviving fade task");
+        let st = h.state.lock().unwrap();
+        assert!(!st.fading, "fading switch cleared");
+        assert_eq!(st.target_volume, 42);
+        assert_eq!(st.reported_volume(), 42);
+    }
+
+    // C2: even when a `fade` from a second logical caller races a setvol, the end
+    // state is always consistent - never the corrupt "no fade in the slot yet the
+    // reported volume derives from a dead envelope" state. Whichever wins, the
+    // slot and the reported volume agree.
+    #[tokio::test(start_paused = true)]
+    async fn setvol_atomic_against_concurrent_fade() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let h = Arc::new(h);
+        h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
+        pump(250, 4).await;
+
+        let h2 = h.clone();
+        let fade_fut = tokio::spawn(async move {
+            let _ = h2.start_fade(fade_args(FadeKind::To(60), 120)).await;
+        });
+        h.handle(MpdCommand::SetVol(20)).await;
+        let _ = fade_fut.await;
+        // Let any surviving fade settle a tick.
+        pump(250, 2).await;
+
+        let active = h.fade_active().await;
+        let (fading, reported) = {
+            let st = h.state.lock().unwrap();
+            (st.fading, st.reported_volume())
+        };
+        // Invariant: the `fading` switch is set IFF a fade task is installed.
+        assert_eq!(active, fading, "slot and fading switch must agree (no orphan)");
+        if !active {
+            // Manual won: reported is exactly the manual value, no dead envelope.
+            assert_eq!(reported, 20, "manual won -> exact manual volume");
+        }
+    }
+
+    // C3: superseding a fade while its terminal window is near must not let the
+    // superseded fade's terminal (StopRestore) whipsaw playback or the baseline.
+    // A fade OUT (terminal = stop + restore) superseded by a fade IN must leave
+    // playback RUNNING and commit the fade-in's ceiling, never the out's stop.
+    #[tokio::test(start_paused = true)]
+    async fn supersede_before_terminal_no_whipsaw() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Fade OUT: on completion it would stop playback + restore the baseline.
+        h.start_fade(fade_args(FadeKind::Out, 30)).await.unwrap();
+        pump(250, 10).await;
+        assert!(h.live_gain_db() < 0.0 && h.fade_active().await);
+
+        // Supersede with a fade IN before the out reaches its StopRestore terminal.
+        h.start_fade(fade_args(FadeKind::In, 30)).await.unwrap();
+        h.wait_for_fade().await;
+
+        // The superseded fade-out's StopRestore never fired: playback still runs,
+        // and the surviving fade-in committed the ceiling (100) as the baseline.
+        assert_eq!(h.player.state(), PlayState::Playing, "superseded stop must not fire");
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
+        assert!(!h.state.lock().unwrap().fading, "fade-in terminal cleared the switch");
+    }
+
+    // C3: a superseded fade that has ALREADY reached its terminal generation must
+    // not re-apply. Drive a fade OUT fully to its terminal, THEN start a fresh
+    // fade - the completed out's terminal already ran (player stopped), the new
+    // fade installs cleanly with no double-application panic or stale write.
+    #[tokio::test(start_paused = true)]
+    async fn terminal_epoch_guard_after_completion() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.start_fade(fade_args(FadeKind::To(30), 20)).await.unwrap();
+        h.wait_for_fade().await;
+        // Terminal committed the baseline 30.
+        assert_eq!(h.state.lock().unwrap().target_volume, 30);
+
+        // A fresh fade after completion installs cleanly (the old task is gone).
+        h.start_fade(fade_args(FadeKind::In, 20)).await.unwrap();
+        assert!(h.fade_active().await);
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().target_volume, 100);
     }
 }

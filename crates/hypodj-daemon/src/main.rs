@@ -91,7 +91,11 @@ async fn main() -> anyhow::Result<()> {
     };
     let (player, mut player_events) = MpvPlayer::spawn(audio);
 
-    let handler = Arc::new(HypodjHandler::new(client.clone(), player.clone()));
+    let handler = Arc::new(HypodjHandler::with_fade_config(
+        client.clone(),
+        player.clone(),
+        cfg.fade.clone(),
+    ));
 
     // The background scrobbler (feature 1) shares the SAME client. It is fed
     // every player event alongside queue-advance.

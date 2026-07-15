@@ -90,6 +90,44 @@ enum PlayerCommand {
         vol: u8,
         reply: oneshot::Sender<Result<(), PlayerError>>,
     },
+    /// Fractional volume set, used by the sub-dB fade envelope (see
+    /// [`crate::fade`]). Distinct from `SetVolume(u8)` because mpv's softvol is
+    /// CUBIC (gain = (vol/100)^3), so a fade must step in equal-dB and invert the
+    /// cube to fractional mpv volume - a u8 step 0..=100 is the fast-then-plunge
+    /// startle curve the fade design forbids. This is the seam BELOW the dB sink.
+    SetVolumeF64 {
+        vol: f64,
+        reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
+}
+
+/// Perceptual floor of the mpv softvol curve, in dB. At or below this the fade
+/// driver treats the signal as silence (mpv volume 0). Keeping the domain
+/// bottomed at a finite -60 dB (rather than -inf) is what lets the schedule math
+/// stay finite: `mpv_volume_to_db(0)` returns this, never negative infinity.
+pub(crate) const SYNTH_FLOOR_DB: f64 = -60.0;
+
+/// Invert the cubic softvol curve: perceptual dB -> mpv `volume` (0..=100).
+///
+/// mpv softvol applies gain = (volume/100)^3, so dB = 60*log10(volume/100) and
+/// the inverse is volume = 100 * 10^(dB/60). At or below [`SYNTH_FLOOR_DB`] we
+/// snap to 0 (true silence); above 0 dB we clamp to 100 (no boost). Sanity:
+/// 0 dB -> 100, -18.06 dB -> ~50, -36.12 dB -> ~25, floor -> 0.
+pub(crate) fn db_to_mpv_volume(db: f64) -> f64 {
+    if db <= SYNTH_FLOOR_DB {
+        return 0.0;
+    }
+    (100.0 * 10f64.powf(db / 60.0)).clamp(0.0, 100.0)
+}
+
+/// The forward cubic softvol mapping: mpv `volume` (0..=100) -> perceptual dB.
+/// `vol <= 0` maps to [`SYNTH_FLOOR_DB`] (a finite floor, NOT -inf) so a fade
+/// resumed from silence never feeds negative infinity into the schedule math.
+pub(crate) fn mpv_volume_to_db(vol: f64) -> f64 {
+    if vol <= 0.0 {
+        return SYNTH_FLOOR_DB;
+    }
+    60.0 * (vol / 100.0).log10()
 }
 
 /// The cloneable handle every other layer holds. Cheap to clone (just channel
@@ -131,8 +169,24 @@ impl PlayerHandle {
     }
 
     /// Set volume; `0..=100` to match MPD's range.
+    ///
+    /// This is the EXTERNAL (MPD/MPRIS) volume seam: its integer 0..=100 IS the
+    /// cubic softvol control, exactly what a user's `setvol` expects. Sub-dB fade
+    /// envelopes must NOT step this integer (that is the fast-then-plunge startle
+    /// curve); they use [`set_volume_f64`](Self::set_volume_f64) with
+    /// [`db_to_mpv_volume`] instead. Manual `setvol` cancels any in-flight fade
+    /// first (see the handler), so the two never fight.
     pub async fn set_volume(&self, vol: u8) -> Result<(), PlayerError> {
         self.request(|reply| PlayerCommand::SetVolume { vol, reply })
+            .await
+    }
+
+    /// Set a FRACTIONAL mpv volume (0.0..=100.0). The fade envelope drives this
+    /// through the [`VolumeSink`](crate::fade::VolumeSink) impl so it can invert
+    /// the cubic softvol curve and step in equal perceptual dB. Not for external
+    /// callers - use [`set_volume`](Self::set_volume) for user-facing volume.
+    pub async fn set_volume_f64(&self, vol: f64) -> Result<(), PlayerError> {
+        self.request(|reply| PlayerCommand::SetVolumeF64 { vol, reply })
             .await
     }
 
@@ -214,6 +268,9 @@ impl NullPlayer {
                         let _ = reply.send(Ok(()));
                     }
                     PlayerCommand::SetVolume { vol: _, reply } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    PlayerCommand::SetVolumeF64 { vol: _, reply } => {
                         let _ = reply.send(Ok(()));
                     }
                 }
@@ -524,6 +581,15 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             let _ = reply.send(res);
         }
+        PlayerCommand::SetVolumeF64 { vol, reply } => {
+            // The fractional fade seam: mpv's `volume` property accepts a double,
+            // so a sub-integer envelope step lands without rounding to the u8
+            // grid. The caller (the dB sink) has already inverted the cube.
+            let res = mpv
+                .set_property("volume", vol)
+                .map_err(|e| PlayerError::Backend(e.to_string()));
+            let _ = reply.send(res);
+        }
     }
     false
 }
@@ -562,6 +628,7 @@ mod tests {
         assert_eq!(player.state(), PlayState::Playing);
 
         player.set_volume(80).await.unwrap();
+        player.set_volume_f64(63.5).await.unwrap();
         player.seek(12.5).await.unwrap();
 
         player.stop().await.unwrap();
@@ -582,6 +649,63 @@ mod tests {
         assert!(!advances(MPV_END_FILE_REASON_QUIT));
         assert!(!advances(MPV_END_FILE_REASON_REDIRECT));
         assert!(!advances(999));
+    }
+
+    // The cubic softvol dB<->volume helpers round-trip and honor the boundaries
+    // the fade math depends on: vol0 -> floor -> vol0, vol100 -> 0 dB -> vol100,
+    // and the sanity points (vol50 ~ -18.06 dB, vol25 ~ -36.12 dB). A finite
+    // floor (never -inf) is the invariant that keeps the schedule math finite.
+    #[test]
+    fn db_volume_round_trip_and_boundaries() {
+        // Boundaries.
+        assert_eq!(db_to_mpv_volume(0.0), 100.0);
+        assert_eq!(db_to_mpv_volume(SYNTH_FLOOR_DB), 0.0);
+        assert_eq!(db_to_mpv_volume(f64::NEG_INFINITY), 0.0);
+        assert_eq!(mpv_volume_to_db(0.0), SYNTH_FLOOR_DB);
+        assert_eq!(mpv_volume_to_db(100.0), 0.0);
+        // Positive dB never boosts past 100.
+        assert_eq!(db_to_mpv_volume(12.0), 100.0);
+
+        // Sanity points from the design.
+        assert!((mpv_volume_to_db(50.0) - (-18.061)).abs() < 0.01);
+        assert!((mpv_volume_to_db(25.0) - (-36.123)).abs() < 0.01);
+
+        // Round-trip holds for every volume ABOVE the -60 dB synth floor. The
+        // cubic maps vol 10 -> exactly -60 dB (100*10^(-1)), so volumes 0..=10 sit
+        // at or below the floor and collapse to 0 (the intended practical-silence
+        // floor); 11..=100 round-trip losslessly.
+        for v in 11..=100u8 {
+            let back = db_to_mpv_volume(mpv_volume_to_db(v as f64));
+            assert!((back - v as f64).abs() < 1e-6, "vol {v} round-trip -> {back}");
+        }
+        // At/below the floor (vol <= 10, i.e. <= -60 dB) collapses to silence.
+        for v in 0..=10u8 {
+            assert_eq!(db_to_mpv_volume(mpv_volume_to_db(v as f64)), 0.0, "vol {v}");
+        }
+    }
+
+    // LIVE empirical confirmation (task 06nr729): on THIS libmpv2 build, the
+    // `volume` property accepts and returns a fractional f64 set/get round-trip.
+    // Ignored by default because it constructs a real Mpv (needs libmpv at
+    // runtime, absent in the network/link-isolated build sandbox). Run manually
+    // with `cargo test -p hypodj-core -- --ignored live_mpv_fractional_volume`
+    // to lock the cubic-curve assumption before trusting the helpers in the wild.
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm softvol"]
+    fn live_mpv_fractional_volume_round_trip() {
+        use libmpv2::Mpv;
+        let mpv = Mpv::with_initializer(|init| {
+            init.set_property("vid", "no")?;
+            init.set_property("ao", "null")?;
+            init.set_property("terminal", "no")?;
+            Ok(())
+        })
+        .expect("construct mpv");
+        for target in [50.0f64, 25.0] {
+            mpv.set_property("volume", target).expect("set volume");
+            let got: f64 = mpv.get_property("volume").expect("get volume");
+            assert!((got - target).abs() < 1e-6, "vol {target} read back as {got}");
+        }
     }
 
     // The handle is cloneable and shared: a second clone sees the same state,
