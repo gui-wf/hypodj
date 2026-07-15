@@ -72,6 +72,14 @@ pub struct Song {
     pub comment: Option<String>,
     /// The current user's 0..=5 rating (wire `Child.user_rating`).
     pub user_rating: Option<u8>,
+    /// Composer display string (OpenSubsonic). Prefer wire `Child.display_composer`;
+    /// fall back to the `Child.contributors` entries whose role is "composer".
+    /// Plain-Subsonic servers omit this - `None` then matches nothing (honest).
+    pub composer: Option<String>,
+    /// Performer display string (OpenSubsonic). There is no `display_performer`
+    /// wire field; derived from `Child.contributors` entries whose role is
+    /// "performer". Plain-Subsonic servers omit contributors - `None` then.
+    pub performer: Option<String>,
 }
 
 /// One thing that can sit in the play queue: either a resolved Subsonic [`Song`]

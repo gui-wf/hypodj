@@ -132,6 +132,12 @@ pub enum MpdCommand {
     /// the tag->value pairs verbatim (lowercased tag).
     FindAdd(Vec<(String, String)>),
     SearchAdd(Vec<(String, String)>),
+    /// `count <filter...>` -> the same Subsonic search3 + client-side exact
+    /// tag post-filter as [`MpdCommand::Find`], but instead of listing the
+    /// songs it returns their tally and total playtime (`songs:`/`playtime:`).
+    /// Carries the tag->value pairs verbatim (lowercased tag). The `count group
+    /// <tag>` form is not modeled here (see the parser note); a plain filter is.
+    Count(Vec<(String, String)>),
     /// `list <tag> [filter]` -> Subsonic list/browse (e.g. `list genre`). The
     /// optional filter narrows the listing (e.g. `list album artist "Tosca"` or
     /// the modern `list album "(artist == \"Tosca\")"`); `tag` is the thing to
@@ -330,6 +336,11 @@ pub fn parse(line: &str) -> MpdCommand {
         "search" => MpdCommand::Search(parse_filter(&args)),
         "findadd" => MpdCommand::FindAdd(parse_filter(&args)),
         "searchadd" => MpdCommand::SearchAdd(parse_filter(&args)),
+        // count takes the same `TAG VALUE ...` filters as find, optionally
+        // followed by `group <tag>`. We do not tally per-group (that would need
+        // one search3 per group value), so a trailing `group <tag>` is dropped
+        // and the plain overall count is returned - honest and cheap.
+        "count" => MpdCommand::Count(parse_filter(&strip_group(&args))),
         "list" => {
             let tag = args.first().cloned().unwrap_or_default().to_lowercase();
             let filter = parse_list_filter(&args[args.len().min(1)..]);
@@ -432,6 +443,46 @@ mod parse_tests {
         match parse("searchadd kalabrese") {
             MpdCommand::SearchAdd(pairs) => {
                 assert_eq!(pairs, vec![("any".to_string(), "kalabrese".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_keeps_tag_value_pairs() {
+        // `count Artist bar Album baz` -> the same filter pairs as find, so
+        // dispatch can post-filter search3 and tally the matches.
+        match parse("count Artist bar Album baz") {
+            MpdCommand::Count(pairs) => assert_eq!(
+                pairs,
+                vec![
+                    ("artist".to_string(), "bar".to_string()),
+                    ("album".to_string(), "baz".to_string()),
+                ]
+            ),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_drops_trailing_group_clause() {
+        // `count Artist bar group album` -> the `group album` clause is dropped
+        // (we tally overall, not per-group), leaving just the filter.
+        match parse("count Artist bar group album") {
+            MpdCommand::Count(pairs) => {
+                assert_eq!(pairs, vec![("artist".to_string(), "bar".to_string())]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_keeps_group_valued_filter() {
+        // A filter VALUE that is literally "group" (odd slot) must be preserved,
+        // not mistaken for the grouping clause.
+        match parse("count Artist group") {
+            MpdCommand::Count(pairs) => {
+                assert_eq!(pairs, vec![("artist".to_string(), "group".to_string())]);
             }
             other => panic!("got {other:?}"),
         }
@@ -625,6 +676,21 @@ fn parse_filter(args: &[String]) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Drop a trailing `group <tag>` clause from a `count` arg list, returning the
+/// filter portion only. Same rule as `parse_list_filter`: `group` begins the
+/// clause only when it lands on a tag slot (even index), so a filter VALUE that
+/// is literally "group" (odd index) is preserved.
+fn strip_group(args: &[String]) -> Vec<String> {
+    let cut = args
+        .iter()
+        .enumerate()
+        .position(|(i, t)| i % 2 == 0 && t.eq_ignore_ascii_case("group"));
+    match cut {
+        Some(pos) => args[..pos].to_vec(),
+        None => args.to_vec(),
+    }
 }
 
 /// Parse the filter remainder of a `list <tag> [filter]` request into

@@ -461,6 +461,36 @@ fn map_song(c: data::Child) -> Song {
         comment: c.comment,
         // user_rating is 0..=5 on the wire; clamp into u8.
         user_rating: c.user_rating.map(|r| r.clamp(0, 5) as u8),
+        // Composer: prefer the ready-made display string, else join the
+        // "composer"-role contributors by artist name (OpenSubsonic only).
+        composer: c
+            .display_composer
+            .clone()
+            .or_else(|| contributors_by_role(&c.contributors, "composer")),
+        // Performer: no display field exists; derive from the "performer"-role
+        // contributors joined by artist name (OpenSubsonic only).
+        performer: contributors_by_role(&c.contributors, "performer"),
+    }
+}
+
+/// Join the artist names of the `contributors` whose role matches `role`
+/// (ASCII case-insensitive), into a ", "-separated display string. Returns
+/// `None` when there are no contributors or none match the role - so a
+/// plain-Subsonic server (which omits contributors) maps cleanly to `None`.
+fn contributors_by_role(
+    contributors: &Option<Vec<data::Contributor>>,
+    role: &str,
+) -> Option<String> {
+    let names: Vec<&str> = contributors
+        .as_ref()?
+        .iter()
+        .filter(|c| c.role.eq_ignore_ascii_case(role))
+        .map(|c| c.artist.name.as_str())
+        .collect();
+    if names.is_empty() {
+        None
+    } else {
+        Some(names.join(", "))
     }
 }
 
@@ -598,6 +628,44 @@ mod tests {
         assert_eq!(s.comment.as_deref(), Some("vinyl rip"));
         assert_eq!(s.user_rating, Some(5));
         assert_eq!(s.musicbrainz_id.as_deref(), Some("8f3e-abc"));
+    }
+
+    #[test]
+    fn map_song_derives_composer_and_performer_from_opensubsonic_fields() {
+        // Composer comes from the ready-made displayComposer; performer is
+        // derived from the contributors whose role is "performer" (joined by
+        // artist name). Both are OpenSubsonic-only and must round-trip through
+        // the real camelCase Child deserialization.
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-7", "title": "Air on the G String", "isDir": false,
+                 "displayComposer": "J.S. Bach",
+                 "contributors": [
+                   { "role": "composer", "artist": { "id": "ar-b", "name": "J.S. Bach" } },
+                   { "role": "performer", "subRole": "violin",
+                     "artist": { "id": "ar-v", "name": "Itzhak Perlman" } },
+                   { "role": "performer", "subRole": "cello",
+                     "artist": { "id": "ar-c", "name": "Yo-Yo Ma" } }
+                 ] }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.composer.as_deref(), Some("J.S. Bach"));
+        assert_eq!(s.performer.as_deref(), Some("Itzhak Perlman, Yo-Yo Ma"));
+    }
+
+    #[test]
+    fn map_song_composer_falls_back_to_contributors_when_no_display() {
+        // No displayComposer: fall back to the "composer"-role contributors.
+        let wire: data::Child = serde_json::from_str(
+            r#"{ "id": "so-8", "title": "Nocturne", "isDir": false,
+                 "contributors": [
+                   { "role": "COMPOSER", "artist": { "id": "ar-x", "name": "Chopin" } }
+                 ] }"#,
+        )
+        .unwrap();
+        let s = map_song(wire);
+        assert_eq!(s.composer.as_deref(), Some("Chopin"));
+        assert_eq!(s.performer, None);
     }
 
     #[test]
