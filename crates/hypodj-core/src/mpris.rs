@@ -47,6 +47,28 @@ pub struct HypodjMpris {
     /// Command to spawn on MPRIS `Raise()` (e.g. a terminal + ncmpcpp). `None`
     /// (or empty) means `CanRaise` is false and `Raise()` is a no-op.
     raise_command: Option<Vec<String>>,
+    /// The tokio runtime handle captured at [`serve`] time. LOAD-BEARING: the MPRIS
+    /// interface methods run on zbus's OWN executor thread, which is NOT a tokio
+    /// runtime context. Any transport control that reaches `tokio::spawn` (every
+    /// fade does - pause/resume/skip/volume) would panic "there is no reactor
+    /// running" if awaited directly here. Actions are dispatched onto this handle
+    /// (see [`HypodjMpris::dispatch`]) so the fade/actor work runs where a reactor
+    /// exists. Without this, GNOME's pause/play buttons crash the zbus executor and
+    /// silently do nothing.
+    tokio: tokio::runtime::Handle,
+}
+
+impl HypodjMpris {
+    /// Run a transport action on the tokio runtime (NOT the zbus executor thread).
+    /// Fire-and-forget: MPRIS controls report their outcome asynchronously via the
+    /// PropertiesChanged loop, so the D-Bus method returns immediately while the
+    /// (fade-spawning) work proceeds on the runtime that owns a reactor.
+    fn dispatch<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.tokio.spawn(fut);
+    }
 }
 
 impl HypodjMpris {
@@ -193,6 +215,9 @@ pub async fn serve(
         handler,
         client,
         raise_command,
+        // serve() is awaited from the daemon's tokio runtime, so this captures the
+        // runtime the fade tasks must be spawned onto (the zbus executor is not it).
+        tokio: tokio::runtime::Handle::current(),
     };
     Server::new("hypodj", imp).await
 }
@@ -268,32 +293,47 @@ impl RootInterface for HypodjMpris {
 
 impl PlayerInterface for HypodjMpris {
     async fn next(&self) -> fdo::Result<()> {
-        self.handler.mpris_next().await;
+        // Dispatch onto the tokio runtime: mpris_next spawns a skip-fade task, which
+        // panics if awaited on the zbus executor thread (see `tokio` field).
+        let h = self.handler.clone();
+        self.dispatch(async move { h.mpris_next().await });
         Ok(())
     }
     async fn previous(&self) -> fdo::Result<()> {
-        self.handler.mpris_previous().await;
+        let h = self.handler.clone();
+        self.dispatch(async move { h.mpris_previous().await });
         Ok(())
     }
     async fn pause(&self) -> fdo::Result<()> {
         // Route through the handler (NOT the player directly) so the startle-safe
         // pause fade runs AND the change signal fires - the latter is what makes the
         // GNOME widget re-read PlaybackStatus and flip the button to a play symbol.
-        let _ = self.handler.set_pause(Some(true)).await;
+        // Dispatched onto the tokio runtime: the pause fade uses tokio::spawn.
+        let h = self.handler.clone();
+        self.dispatch(async move {
+            let _ = h.set_pause(Some(true)).await;
+        });
         Ok(())
     }
     async fn play_pause(&self) -> fdo::Result<()> {
-        let _ = self.handler.set_pause(None).await;
+        let h = self.handler.clone();
+        self.dispatch(async move {
+            let _ = h.set_pause(None).await;
+        });
         Ok(())
     }
     async fn stop(&self) -> fdo::Result<()> {
         // Route through the handler so the stop also fires the change signal (the
         // desktop widget refresh), same reason as pause().
-        self.handler.stop_playback().await;
+        let h = self.handler.clone();
+        self.dispatch(async move { h.stop_playback().await });
         Ok(())
     }
     async fn play(&self) -> fdo::Result<()> {
-        let _ = self.handler.set_pause(Some(false)).await;
+        let h = self.handler.clone();
+        self.dispatch(async move {
+            let _ = h.set_pause(Some(false)).await;
+        });
         Ok(())
     }
     async fn seek(&self, offset: Time) -> fdo::Result<()> {
@@ -301,12 +341,18 @@ impl PlayerInterface for HypodjMpris {
         // position here, so treat the offset as a best-effort absolute nudge from
         // zero when negative-clamped. Absolute positioning is SetPosition.
         let secs = (offset.as_micros() as f64) / 1_000_000.0;
-        let _ = self.player.seek(secs.max(0.0)).await;
+        let p = self.player.clone();
+        self.dispatch(async move {
+            let _ = p.seek(secs.max(0.0)).await;
+        });
         Ok(())
     }
     async fn set_position(&self, _track_id: TrackId, position: Time) -> fdo::Result<()> {
         let secs = (position.as_micros() as f64) / 1_000_000.0;
-        let _ = self.player.seek(secs.max(0.0)).await;
+        let p = self.player.clone();
+        self.dispatch(async move {
+            let _ = p.seek(secs.max(0.0)).await;
+        });
         Ok(())
     }
     async fn open_uri(&self, _uri: String) -> fdo::Result<()> {
@@ -341,8 +387,11 @@ impl PlayerInterface for HypodjMpris {
         Ok(self.handler.volume() as f64 / 100.0)
     }
     async fn set_volume(&self, volume: f64) -> mpris_server::zbus::Result<()> {
+        // mpris_set_volume cancels any in-flight fade (tokio-mutex + spawn), so it
+        // MUST run on the tokio runtime, not the zbus executor thread.
         let v = (volume.clamp(0.0, 1.0) * 100.0).round() as u8;
-        self.handler.mpris_set_volume(v).await;
+        let h = self.handler.clone();
+        self.dispatch(async move { h.mpris_set_volume(v).await });
         Ok(())
     }
     async fn position(&self) -> fdo::Result<Time> {
