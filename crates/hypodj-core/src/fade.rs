@@ -167,6 +167,14 @@ pub enum FadeError {
 }
 
 impl FadeSpec {
+    /// The number of scheduled steps (ramp steps plus the final mute step for a
+    /// Silence target). Exposed so the shutdown-fade builder can compute the real
+    /// wall-clock length (`steps * min_slew`) and reject a fade that would exceed
+    /// the shutdown budget - without reaching into the private schedule.
+    pub fn step_count(&self) -> usize {
+        self.schedule.steps.len()
+    }
+
     /// Build a validated schedule from the fade parameters. Returns an error
     /// rather than ever producing a startle-unsafe plan.
     ///

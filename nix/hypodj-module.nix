@@ -162,6 +162,22 @@ let
       RuntimeDirectory = "hypodj";
       RuntimeDirectoryMode = "0700";
 
+      # SMOOTH-RESTART: a PERSISTENT state dir for the resume snapshot
+      # (resume.toml). systemd sets $STATE_DIRECTORY to this and the daemon reads
+      # it. With DynamicUser=true systemd backs it at /var/lib/private/hypodj and
+      # exposes it as /var/lib/hypodj; ProtectSystem=strict already permits
+      # StateDirectory writes. This is NOT the RuntimeDirectory (/run tmpfs is
+      # wiped on stop, which would defeat SIGKILL resume).
+      StateDirectory = "hypodj";
+      StateDirectoryMode = "0700";
+
+      # Give the graceful shutdown (persist -> sleep-fade-out -> exit 0) time to
+      # run before SIGKILL: TimeoutStopSec must exceed the daemon's internal fade
+      # budget (~10s) with margin. KillSignal is SIGTERM (explicit), which the
+      # daemon traps to fade out.
+      TimeoutStopSec = 15;
+      KillSignal = "SIGTERM";
+
       Restart = "on-failure";
       RestartSec = 5;
 
@@ -202,6 +218,14 @@ let
       ExecStart = "${pkgs.runtimeShell} -c ${lib.escapeShellArg execStart}";
       RuntimeDirectory = "hypodj";
       RuntimeDirectoryMode = "0700";
+      # SMOOTH-RESTART: persistent state dir for the resume snapshot. The user
+      # manager sets $STATE_DIRECTORY to %S/hypodj (~/.local/state/hypodj); the
+      # daemon reads it. NOT the RuntimeDirectory (tmpfs, wiped on stop).
+      StateDirectory = "hypodj";
+      # Let the graceful shutdown (persist -> sleep-fade-out -> exit 0) finish
+      # before SIGKILL; must exceed the internal fade budget (~10s) with margin.
+      TimeoutStopSec = 15;
+      KillSignal = "SIGTERM";
       Restart = "on-failure";
       RestartSec = 5;
       # LoadCredential is honored by recent user systemd; it stages passwordFile

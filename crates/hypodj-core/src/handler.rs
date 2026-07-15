@@ -20,6 +20,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -47,6 +48,10 @@ use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
 use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, StickerCmd};
 use crate::player::{db_to_mpv_volume, mpv_volume_to_db, PlayState, PlayerHandle};
+use crate::resume::{
+    build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
+    RESUME_SCHEMA_VERSION,
+};
 use crate::subsonic::{list_type_from_dirname, SubsonicClient};
 use crate::timer::TimerHandle;
 
@@ -283,6 +288,12 @@ pub enum FadeIntent {
     /// Deliberate cue to an explicit perceptual level, committing `vol` as the new
     /// baseline on completion. Used by `fade to <vol>` and `fade to floor`.
     To { target_db: f64, vol: u8 },
+    /// Wake ramp-in on smooth-restart: a SUB-JND ramp UP to the user's SAVED
+    /// perceptual level (`target_db`), committing `vol` as the restored baseline.
+    /// Distinct from [`FadeIntent::In`] (which targets the comfort ceiling / vol
+    /// 100): a wake must restore the EXACT volume the user had before the restart,
+    /// starting from silence. Sub-JND so the wake is imperceptibly gentle.
+    WakeTo { target_db: f64, vol: u8 },
 }
 
 impl FadeIntent {
@@ -301,6 +312,12 @@ impl FadeIntent {
             }
             FadeIntent::To { target_db, vol } => {
                 (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol))
+            }
+            // Wake ramp: sub-JND ramp to the SAVED level, committing it as the
+            // restored baseline. from_db is the synth floor (silence) at restore,
+            // so the schedule rises from silence to the user's real level.
+            FadeIntent::WakeTo { target_db, vol } => {
+                (FadeTarget::Db(target_db), true, Terminal::SetBaseline(vol))
             }
         }
     }
@@ -495,6 +512,18 @@ pub struct HypodjHandler {
     /// the monotonic counter into an UNGUESSABLE, non-sequential token. Keeps the
     /// token minter dependency-free (no rand crate) while staying unpredictable.
     nl_token_hasher: RandomState,
+
+    // ── smooth-restart (resume) ─────────────────────────────────────────────
+    /// The resolved persistent path of the resume state file (`.../resume.toml`),
+    /// or `None` when resume is disabled (no state dir). A short std-`Mutex` scope,
+    /// never held across an `.await`. Set once by the daemon via
+    /// [`Self::set_state_path`].
+    state_path: Mutex<Option<PathBuf>>,
+    /// The live media position, in MILLIS, captured LOCKLESSLY from the P1
+    /// `Tick.time_pos` and reset on a new-Playing / Stop edge. The shutdown
+    /// snapshot and the periodic checkpoint read it with a single atomic load, so
+    /// they never query mpv during a SIGTERM race.
+    last_elapsed_ms: Arc<AtomicU64>,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -546,6 +575,8 @@ impl HypodjHandler {
             nl_pending: Mutex::new(HashMap::new()),
             next_nl_token: AtomicU64::new(0),
             nl_token_hasher: RandomState::new(),
+            state_path: Mutex::new(None),
+            last_elapsed_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1041,6 +1072,202 @@ impl HypodjHandler {
         // On rejection nothing was disturbed: the in-flight fade (if any) is still
         // running and no volume was touched, so just surface the ACK error.
         res
+    }
+
+    // ── smooth-restart (resume) ─────────────────────────────────────────────
+
+    /// Register the persistent resume-state path (`.../resume.toml`). Called once
+    /// by the daemon when a state dir resolves; absent => resume disabled.
+    pub fn set_state_path(&self, p: PathBuf) {
+        *self.state_path.lock().unwrap() = Some(p);
+    }
+
+    /// Record the live media position (from a P1 `Tick.time_pos`), locklessly.
+    pub fn note_elapsed_ms(&self, ms: u64) {
+        self.last_elapsed_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Reset the live-elapsed counter (a new Playing id / a Stop edge).
+    pub fn reset_elapsed(&self) {
+        self.last_elapsed_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// The live elapsed position in seconds (the lockless atomic / 1000).
+    pub fn last_elapsed_secs(&self) -> f64 {
+        self.last_elapsed_ms.load(Ordering::Relaxed) as f64 / 1000.0
+    }
+
+    /// Snapshot the resume-relevant state into an OWNED [`ResumeState`]. The std
+    /// `Mutex<State>` is taken and DROPPED before return (no guard escapes, so an
+    /// async caller never holds it across an `.await`). `elapsed_secs` is supplied
+    /// by the caller from the lockless live-elapsed atomic - never queried from
+    /// mpv, so it is safe during a SIGTERM race.
+    pub fn resume_snapshot(&self, elapsed_secs: f64) -> ResumeState {
+        let play_state = match self.player.state() {
+            PlayState::Playing => ResumePlayState::Playing,
+            PlayState::Paused => ResumePlayState::Paused,
+            PlayState::Stopped => ResumePlayState::Stopped,
+        };
+        let st = self.state.lock().unwrap();
+        let queue = st
+            .queue
+            .iter()
+            .map(|it| match &it.entry {
+                QueueEntry::Song(s) => ResumeItem::Song { id: s.id.0.clone() },
+                QueueEntry::Stream { url, title } => ResumeItem::Stream {
+                    url: url.clone(),
+                    title: title.clone(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let snap = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            queue,
+            current: st.current,
+            elapsed_secs,
+            volume: st.target_volume,
+            play_state,
+            playlist_version: st.playlist_version,
+            saved_at_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        drop(st);
+        snap
+    }
+
+    /// Write a resume checkpoint now: [`resume_snapshot`](Self::resume_snapshot) +
+    /// [`store_atomic`]. A missing state path (resume disabled) is a silent no-op;
+    /// a write error is logged warn, NEVER fatal.
+    pub async fn checkpoint(&self, elapsed_secs: f64) {
+        let path = self.state_path.lock().unwrap().clone();
+        let Some(path) = path else { return };
+        let snap = self.resume_snapshot(elapsed_secs);
+        if let Err(e) = store_atomic(&path, &snap) {
+            tracing::warn!(error = %e, path = %path.display(), "resume checkpoint write failed");
+        }
+    }
+
+    /// Run the DELIBERATE sleep-fade-out for shutdown INLINE to completion, under
+    /// a timeout of `budget`. This BYPASSES the [`FadeSlot`] (no supersede, no join
+    /// handle) - it is the terminal act before `exit(0)`, so nothing can supersede
+    /// it. Builds a short, click-free fade via [`build_shutdown_fade`]; if the fade
+    /// would exceed the budget (or cannot be built) it is skipped and the daemon
+    /// exits immediately (no mid-fade SIGKILL click).
+    pub async fn shutdown_fade(&self, budget: Duration) {
+        let from_db = self.state.lock().unwrap().live_gain_db;
+        let Some(sf) = build_shutdown_fade(&self.fade_cfg, from_db, budget) else {
+            tracing::info!("shutdown fade skipped (over budget or already silent); exiting");
+            return;
+        };
+        let clock = TokioClock;
+        let mut report = |_p: FadeProgress| {};
+        // build_shutdown_fade already guaranteed real_dur <= budget; the timeout is
+        // a belt so a stuck sink can never block the exit path.
+        let _ = tokio::time::timeout(budget, run_fade(&self.player, &sf.spec, &clock, &mut report))
+            .await;
+    }
+
+    /// Restore from a loaded [`ResumeState`]: rebuild the queue (re-resolving each
+    /// library song from Subsonic), reassign ids, and either WAKE back into
+    /// playback (a `Playing` snapshot) or stay stopped (`Paused`/`Stopped` - an
+    /// explicit stop survives the rebuild). A song whose metadata can no longer be
+    /// resolved is SKIPPED (the current pointer is adjusted), never fatal.
+    pub async fn restore(&self, s: &ResumeState) -> Result<(), String> {
+        // 1. Rebuild the queue entries. A raw Stream is verbatim; a Song is
+        //    re-resolved from Subsonic (we persisted only its id). Track how the
+        //    saved current index maps onto the rebuilt (skip-compacted) queue.
+        let mut entries: Vec<QueueEntry> = Vec::with_capacity(s.queue.len());
+        let mut new_current: Option<usize> = None;
+        let mut current_is_song = false;
+        for (i, item) in s.queue.iter().enumerate() {
+            let entry = match item {
+                ResumeItem::Stream { url, title } => QueueEntry::Stream {
+                    url: url.clone(),
+                    title: title.clone(),
+                },
+                ResumeItem::Song { id } => {
+                    match self.client.song(&SongId(id.clone())).await {
+                        Ok(song) => QueueEntry::Song(song),
+                        Err(e) => {
+                            tracing::warn!(id, error = %e, "resume: song no longer resolvable; skipping");
+                            continue;
+                        }
+                    }
+                }
+            };
+            if Some(i) == s.current {
+                new_current = Some(entries.len());
+                current_is_song = matches!(entry, QueueEntry::Song(_));
+            }
+            entries.push(entry);
+        }
+
+        let synth_floor = self.fade_cfg.synth_floor_db;
+        let playing = s.play_state == ResumePlayState::Playing && new_current.is_some();
+
+        // 2. Install the rebuilt queue + baseline under one short state-lock scope.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.queue = entries
+                .into_iter()
+                .enumerate()
+                .map(|(idx, entry)| QueueItem { id: idx as u64, entry })
+                .collect();
+            st.next_id = st.queue.len() as u64;
+            st.current = new_current;
+            st.playlist_version = s.playlist_version;
+            st.target_volume = s.volume.min(100);
+            if playing {
+                // Start SILENT so the first buffer is inaudible; the wake ramp then
+                // rises from the synth floor to the saved level.
+                st.live_gain_db = synth_floor;
+                st.fading = false;
+            } else {
+                st.live_gain_db = mpv_volume_to_db(s.volume.min(100) as f64);
+                st.fading = false;
+            }
+        }
+        self.notify_change();
+
+        if playing {
+            let idx = new_current.expect("playing implies a current index");
+            let elapsed = s.elapsed_secs.max(0.0);
+            let saved_vol = s.volume.min(100);
+            // Silence BEFORE the first buffer: mpv volume 0 persists across the
+            // loadfile so the wake ramp owns the rise.
+            let _ = self.player.set_volume(0).await;
+            if let Err(e) = self.play_index(idx).await {
+                return Err(e);
+            }
+            // A library song seeks to the saved elapsed; a raw Stream restarts from
+            // 0 (no seek - a live stream has no seekable saved offset).
+            if current_is_song && elapsed > 0.0 {
+                let _ = self.player.seek(elapsed).await;
+            }
+            // Wake ramp UP from silence to the user's SAVED level (not vol 100).
+            let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.wake_ramp_secs));
+            let intent = FadeIntent::WakeTo {
+                target_db: mpv_volume_to_db(saved_vol as f64),
+                vol: saved_vol,
+            };
+            let _ = self.start_fade_spec(FadeRequest { intent, dur }).await;
+        } else {
+            // Paused/Stopped: restore the baseline volume, leave playback stopped.
+            let v = s.volume.min(100);
+            self.state.lock().unwrap().set_manual_volume(v);
+            let _ = self.player.set_volume(v).await;
+        }
+        Ok(())
+    }
+
+    /// Clamp a fade duration into the configured `[min_slew, max_dur]` window (the
+    /// same normalization [`start_fade`](Self::start_fade) applies to DSL fades).
+    fn clamp_fade_dur(&self, raw: Duration) -> Duration {
+        let min = Duration::from_millis(self.fade_cfg.min_slew_ms);
+        let max = Duration::from_secs(self.fade_cfg.max_dur_secs);
+        raw.clamp(min, max)
     }
 
     /// TEST-ONLY: await the currently-active fade task to natural completion
@@ -2695,7 +2922,7 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
 mod tests {
     use super::*;
     use crate::config::ServerConfig;
-    use crate::player::{NullPlayer, PlayState, PlayerEvent};
+    use crate::player::{NullPlayer, PlayState, PlayerEvent, SYNTH_FLOOR_DB};
     use crate::scrobble::Scrobbler;
 
     const NTS: &str = "https://stream-mixtape-geo.ntslive.net/mixtape5";
@@ -3536,5 +3763,156 @@ mod tests {
         assert!(h.fade_active().await);
         h.wait_for_fade().await;
         assert_eq!(h.state.lock().unwrap().target_volume, 100);
+    }
+
+    // ── SMOOTH-RESTART: resume composition (signal-free, no real process) ─────
+
+    fn mk_song(id: &str) -> Song {
+        Song {
+            id: SongId(id.to_string()),
+            title: format!("Song {id}"),
+            album: None,
+            album_id: None,
+            artist: None,
+            track: None,
+            duration_secs: Some(240),
+            cover_art: None,
+            starred: false,
+            musicbrainz_id: None,
+            disc: None,
+            year: None,
+            genre: None,
+            bitrate: None,
+            comment: None,
+            user_rating: None,
+            composer: None,
+            performer: None,
+        }
+    }
+
+    // FadeIntent::WakeTo resolves to the SAVED perceptual level (not vol 100),
+    // sub-JND, committing the saved baseline. Proves a wake restores the user's
+    // real volume rather than ramping to full.
+    #[test]
+    fn wake_to_resolves_to_saved_level_sub_jnd() {
+        let saved_vol = 60u8;
+        let target = mpv_volume_to_db(saved_vol as f64);
+        let intent = FadeIntent::WakeTo { target_db: target, vol: saved_vol };
+        let (t, sub_jnd, terminal) = intent.resolve(SYNTH_FLOOR_DB, 0.0);
+        match t {
+            FadeTarget::Db(db) => assert!((db - target).abs() < 1e-9),
+            _ => panic!("WakeTo must target a specific Db, not Silence"),
+        }
+        assert!(sub_jnd, "a wake ramp is sub-JND (imperceptibly gentle)");
+        match terminal {
+            Terminal::SetBaseline(v) => assert_eq!(v, saved_vol),
+            _ => panic!("WakeTo commits the saved baseline"),
+        }
+    }
+
+    // resume_snapshot reflects the live queue + current + volume + play state, and
+    // returns an OWNED struct with the state guard already dropped (no lock held
+    // across the await in the async callers).
+    #[tokio::test]
+    async fn resume_snapshot_reflects_queue_and_state() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(mk_song("s1")).await;
+        h.enqueue_stream_for_test(NTS).await;
+        h.enqueue_song_for_test(mk_song("s2")).await;
+        h.play_for_test(2).await;
+        h.mpris_set_volume(64).await;
+
+        let snap = h.resume_snapshot(31.5);
+        assert_eq!(snap.schema_version, RESUME_SCHEMA_VERSION);
+        assert_eq!(snap.queue.len(), 3);
+        assert_eq!(snap.queue[0], ResumeItem::Song { id: "s1".into() });
+        assert!(matches!(snap.queue[1], ResumeItem::Stream { .. }));
+        assert_eq!(snap.queue[2], ResumeItem::Song { id: "s2".into() });
+        assert_eq!(snap.current, Some(2));
+        assert_eq!(snap.volume, 64);
+        assert_eq!(snap.elapsed_secs, 31.5);
+        assert_eq!(snap.play_state, ResumePlayState::Playing);
+    }
+
+    // restore of a Playing snapshot (raw streams, so no Subsonic call) rebuilds
+    // the queue, plays the current entry, and installs a wake-ramp fade from
+    // silence. A raw Stream restarts from 0 (no seek).
+    #[tokio::test(start_paused = true)]
+    async fn restore_playing_streams_wakes_from_silence() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let s = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            queue: vec![
+                ResumeItem::Stream { url: NTS.into(), title: "NTS".into() },
+                ResumeItem::Stream { url: NTS.into(), title: "NTS2".into() },
+            ],
+            current: Some(0),
+            elapsed_secs: 90.0,
+            volume: 55,
+            play_state: ResumePlayState::Playing,
+            playlist_version: 7,
+            saved_at_unix: 1,
+        };
+        h.restore(&s).await.unwrap();
+        assert_eq!(h.player.state(), PlayState::Playing);
+        // The wake ramp is installed (a fade owns the level) and starts from the
+        // synth floor (silence).
+        assert!(h.fade_active().await, "a wake ramp must be installed");
+        assert!(h.live_gain_db() <= SYNTH_FLOOR_DB + 5.0, "wake starts near silence");
+        assert_eq!(h.state.lock().unwrap().target_volume, 55);
+    }
+
+    // restore of a Paused/Stopped snapshot rebuilds the queue + baseline volume
+    // but leaves playback STOPPED - no autoplay, no fade (an explicit stop
+    // survives the rebuild).
+    #[tokio::test(start_paused = true)]
+    async fn restore_paused_stays_stopped() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let s = ResumeState {
+            schema_version: RESUME_SCHEMA_VERSION,
+            queue: vec![ResumeItem::Stream { url: NTS.into(), title: "NTS".into() }],
+            current: Some(0),
+            elapsed_secs: 0.0,
+            volume: 42,
+            play_state: ResumePlayState::Paused,
+            playlist_version: 3,
+            saved_at_unix: 1,
+        };
+        h.restore(&s).await.unwrap();
+        assert_eq!(h.player.state(), PlayState::Stopped, "no autoplay on a paused resume");
+        assert!(!h.fade_active().await, "no wake ramp on a paused resume");
+        assert_eq!(h.state.lock().unwrap().target_volume, 42);
+        assert_eq!(h.state.lock().unwrap().queue.len(), 1);
+    }
+
+    // checkpoint() writes a real resume.toml to disk that loads back equal, and a
+    // paused state records ResumePlayState::Paused; a queue mutation bumps the
+    // persisted playlist_version.
+    #[tokio::test]
+    async fn checkpoint_writes_loadable_state_to_disk() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let dir = std::env::temp_dir().join(format!("hypodj-cp-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("resume.toml");
+        h.set_state_path(path.clone());
+
+        h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.checkpoint(12.0).await;
+
+        let loaded = crate::resume::load(&path).expect("checkpoint wrote a loadable file");
+        assert_eq!(loaded.queue.len(), 1);
+        assert_eq!(loaded.play_state, ResumePlayState::Paused);
+        let v1 = loaded.playlist_version;
+
+        // A queue mutation bumps playlist_version in the next checkpoint.
+        h.enqueue_stream_for_test(NTS).await;
+        h.checkpoint(12.0).await;
+        let loaded2 = crate::resume::load(&path).expect("re-load");
+        assert_eq!(loaded2.queue.len(), 2);
+        assert!(loaded2.playlist_version > v1, "queue mutation bumps playlist_version");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
