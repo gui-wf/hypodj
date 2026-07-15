@@ -18,7 +18,24 @@
       in
       {
         packages.hypodj = pkgs.callPackage ./nix/package.nix { };
+        # The client bins (dj + dj-gui) - libmpv-free, so a separate, lighter
+        # derivation that a workstation can install without pulling mpv.
+        packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { };
         packages.default = self.packages.${system}.hypodj;
+
+        apps.hypodj = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj}/bin/hypodj";
+        };
+        apps.dj = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj-clients}/bin/dj";
+        };
+        apps.dj-gui = {
+          type = "app";
+          program = "${self.packages.${system}.hypodj-clients}/bin/dj-gui";
+        };
+        apps.default = self.apps.${system}.dj;
 
         devShells.default = pkgs.mkShell {
           # Rust toolchain + pkg-config + the audio system lib (libmpv).

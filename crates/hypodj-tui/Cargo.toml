@@ -1,12 +1,12 @@
 [package]
-name = "hypodj-tui"
+name = "dj-gui"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hypodj-tui"
+name = "dj-gui"
 path = "src/main.rs"
 
 # The interactive jukebox TUI. IO (crossterm/ratatui) stays at the edges (main.rs

@@ -88,13 +88,13 @@ it gets, and the technical complexity is handled server-side. Any MPD client
 (ncmpcpp, mpc) works, and hypodj ships thin clients over the MPD protocol + the
 `nl` command:
 
-- **`hjq`** (renaming to `dj`) - a jukebox CLI. Bare `hjq` prints a now-playing
-  card; `hjq next` / `hjq pause` / `hjq vol 40` are quick verbs; anything else is
-  natural language routed through `nl` with an echo-before-arm confirm, e.g.
-  `hjq "play something calmer"` or `hjq "fade the 3rd track"`.
-- **`dj-gui`** (product name HypoDJ, in progress) - an interactive terminal
-  jukebox: now-playing + queue + a command line that takes verbs and natural
-  language, the same NL-first surface as the CLI.
+- **`dj`** - a jukebox CLI. Bare `dj` prints a now-playing card; `dj next` /
+  `dj pause` / `dj vol 40` are quick verbs; anything else is natural language
+  routed through `nl` with an echo-before-arm confirm, e.g.
+  `dj "play something calmer"` or `dj "fade the 3rd track"`.
+- **`dj-gui`** (product name HypoDJ) - an interactive terminal jukebox:
+  now-playing + queue + a command line that takes verbs and natural language,
+  the same NL-first surface as the CLI.
 - A GNOME Shell search provider (planned) so typing "next song" or "play
   something calmer" into Activities runs the command.
 
@@ -372,7 +372,9 @@ crates/hypodj-core/     library: config, model, subsonic, player, mpd,
                         plan/executor, event/director, fade, clock, resume
 crates/hypodj-daemon/   binaries: `hypodj` (daemon) + `probe` (slice prover)
 crates/hypodj-nl/       optional NL -> validated Plan IR (rules + feature-gated model)
-crates/hypodj-cli/      `hjq` jukebox CLI (renaming `dj`; pure MPD/TCP, no libmpv)
+crates/hypodj-client/   shared client lib (MpdConn, nl handshake, parse/route)
+crates/hypodj-cli/      `dj` jukebox CLI (pure MPD/TCP, no libmpv)
+crates/hypodj-tui/      `dj-gui` interactive TUI, product HypoDJ (no libmpv)
 flake.nix               packages.default, devShell, nixos/home-manager modules
 nix/package.nix         buildRustPackage (daemon bin, libmpv wrapped)
 nix/hypodj-module.nix   ONE shared services.hypodj module (nixos + home-manager)

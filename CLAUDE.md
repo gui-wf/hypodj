@@ -16,11 +16,13 @@ usage - this file is only what you need to work in the repo.
 - `crates/hypodj-nl` - optional natural-language to validated Plan IR translator
   (deterministic rules + a `feature = "llm"` local-model backend). The DEFAULT
   build is model-free.
-- `crates/hypodj-cli` - the `hjq` jukebox CLI (pure MPD/TCP, does NOT link libmpv).
+- `crates/hypodj-client` - the shared client lib (MpdConn, the `nl` handshake,
+  now-playing/queue parsing, verb-vs-NL routing) that both client bins use.
+- `crates/hypodj-cli` - the `dj` jukebox CLI (pure MPD/TCP, no libmpv).
+- `crates/hypodj-tui` - the `dj-gui` interactive TUI (product name HypoDJ; ratatui
+  over `hypodj-client`, no libmpv).
 
-A shared `hypodj-client` lib and a `dj-gui` TUI are in progress. Binary renames
-are planned: `hjq` -> `dj`, the TUI -> `dj-gui` (product name HypoDJ). Build or
-test one crate with `-p <crate>`.
+Build or test one crate with `-p <crate>`.
 
 ## Build, test, run
 

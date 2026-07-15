@@ -512,6 +512,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dj-gui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "hypodj-client",
+ "ratatui",
+ "thiserror",
+]
+
+[[package]]
 name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -950,16 +960,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
-]
-
-[[package]]
-name = "hypodj-tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "hypodj-client",
- "ratatui",
- "thiserror",
 ]
 
 [[package]]

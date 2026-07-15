@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "hjq"
+name = "dj"
 path = "src/main.rs"
 
 # Depends on the shared hypodj-client for the one client implementation (MpdConn,
