@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         MpvPlayer::spawn(AudioOut::File(std::path::PathBuf::from(&out_path)));
 
     player
-        .play_url(Some(SongId(song.id.0.clone())), url.as_str())
+        .play_url(Some(SongId(song.id.0.clone())), None, url.as_str())
         .await?;
     println!("[6/7] play_url issued; mpv state = {:?}", player.state());
 
@@ -100,8 +100,8 @@ async fn main() -> anyhow::Result<()> {
             _ = tokio::time::sleep_until(deadline) => break,
             ev = events.recv() => {
                 match ev {
-                    Some(hypodj_core::player::PlayerEvent::TimePos(t)) => last_pos = t,
-                    Some(hypodj_core::player::PlayerEvent::Eof(_)) => {
+                    Some(hypodj_core::player::PlayerEvent::TimePos { pos, .. }) => last_pos = pos,
+                    Some(hypodj_core::player::PlayerEvent::Eof { .. }) => {
                         println!("      track reached EOF before deadline");
                         break;
                     }

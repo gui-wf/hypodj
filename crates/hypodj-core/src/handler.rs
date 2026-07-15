@@ -19,10 +19,11 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use opensubsonic::AlbumListType;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 use crate::cache::TtlLru;
 use crate::clock::TokioClock;
@@ -30,6 +31,7 @@ use crate::config::FadeConfig;
 use crate::fade::{
     run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget, StartleBounds,
 };
+use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
 use crate::model::{AlbumId, ArtistId, Genre, QueueEntry, Song, SongId};
 use crate::subsonic::SubsonicError;
 use crate::mpd::{FadeArgs, FadeKind, MpdCommand, MpdHandler, MpdResponse, StickerCmd};
@@ -419,6 +421,13 @@ pub struct HypodjHandler {
     state: Arc<Mutex<State>>,
     /// Fired when a subsystem changes, to wake `idle`.
     changed: Arc<Notify>,
+    /// The director's level-triggered resync source. Registered once by
+    /// [`crate::director::run`] via [`Self::set_snapshot_sink`]. EVERY mutation
+    /// (queue add/delete/clear + play/stop) pushes a fresh [`QueueSnapshot`] here,
+    /// so a lagged observer always resyncs to CURRENT state, not a stale snapshot
+    /// last refreshed on a player-event edge. `OnceLock` because there is exactly
+    /// one director for the process lifetime and the handler outlives it.
+    snapshot_tx: OnceLock<watch::Sender<QueueSnapshot>>,
     /// The single active-fade arbiter (see [`FadeSlot`]). `Arc` so each spawned
     /// fade task can hold a handle and take the slot lock for its terminal action
     /// (C3: the terminal's check-and-act is atomic against supersede/cancel).
@@ -458,6 +467,7 @@ impl HypodjHandler {
             player,
             state: Arc::new(Mutex::new(State::default())),
             changed: Arc::new(Notify::new()),
+            snapshot_tx: OnceLock::new(),
             fade: Arc::new(FadeSlot::new()),
             fade_cfg,
             listings: TtlLru::new(256, Duration::from_secs(60)),
@@ -471,7 +481,21 @@ impl HypodjHandler {
         self.client.clone()
     }
 
+    /// Register the director's resync `watch` sender. Called once at director
+    /// startup; every later mutation republishes a fresh snapshot to it so the
+    /// resync source never lags the live queue (see [`Self::snapshot_tx`]).
+    pub fn set_snapshot_sink(&self, tx: watch::Sender<QueueSnapshot>) {
+        let _ = self.snapshot_tx.set(tx);
+    }
+
     fn notify_change(&self) {
+        // Republish the level-triggered resync snapshot on EVERY mutation, so a
+        // queue change made off the player-event path (add/delete/clear/move) is
+        // reflected the instant a lagged observer resyncs. `queue_snapshot` locks
+        // state fresh; no notify_change caller holds the state lock across it.
+        if let Some(tx) = self.snapshot_tx.get() {
+            let _ = tx.send(self.queue_snapshot());
+        }
         self.changed.notify_waiters();
     }
 
@@ -608,6 +632,93 @@ impl HypodjHandler {
         self.state.lock().unwrap().live_gain_db
     }
 
+    /// TEST-ONLY: queue an already-resolved song (no network), for director tests.
+    #[cfg(test)]
+    pub(crate) async fn enqueue_song_for_test(&self, song: Song) -> u64 {
+        self.enqueue_song(song).await
+    }
+
+    /// TEST-ONLY: queue a raw stream uri (no network), for director tests.
+    #[cfg(test)]
+    pub(crate) async fn enqueue_stream_for_test(&self, uri: &str) -> u64 {
+        self.enqueue_uri(uri).await.expect("stream uri enqueues offline")
+    }
+
+    /// TEST-ONLY: start playing the entry at `idx` (drives the player actor), so a
+    /// director test can close the play -> event loop headlessly.
+    #[cfg(test)]
+    pub(crate) async fn play_for_test(&self, idx: usize) {
+        let _ = self.play_index(idx).await;
+    }
+
+    /// TEST-ONLY: perform an off-spine `next` (mutates the current index while
+    /// buffered events may still be draining), for the identity-join test.
+    #[cfg(test)]
+    pub(crate) async fn next_for_test(&self) {
+        self.mpris_next().await;
+    }
+
+    /// TEST-ONLY: delete the queue entry at `pos`, mirroring the MPD `delete`
+    /// index bookkeeping, so a test can exercise the deleted-current join.
+    #[cfg(test)]
+    pub(crate) fn delete_for_test(&self, pos: usize) {
+        {
+            let mut st = self.state.lock().unwrap();
+            if pos < st.queue.len() {
+                st.queue.remove(pos);
+                st.playlist_version += 1;
+                if let Some(c) = st.current {
+                    if c == pos {
+                        st.current = None;
+                    } else if c > pos {
+                        st.current = Some(c - 1);
+                    }
+                }
+            }
+        }
+        // Mirror the real MPD `delete` path, which notifies (refreshing the
+        // director's resync snapshot) after dropping the state lock.
+        self.notify_change();
+    }
+
+    /// A whole-queue [`QueueSnapshot`] for the P1 event substrate: BOTH the
+    /// enrichment join source and the resync source. Built under ONE short state
+    /// lock scope (owned data only, no borrow held across an await). The director
+    /// caches this keyed by `playlist_version`, so a plain `Tick` never re-locks.
+    pub fn queue_snapshot(&self) -> QueueSnapshot {
+        let st = self.state.lock().unwrap();
+        let entries = st
+            .queue
+            .iter()
+            .map(entry_snapshot)
+            .collect::<Vec<_>>();
+        let current = st.current.and_then(|idx| {
+            st.queue.get(idx).map(|it| Cursor {
+                index: idx,
+                queue_id: QueueId(it.id),
+            })
+        });
+        QueueSnapshot {
+            playlist_version: st.playlist_version,
+            current,
+            entries,
+        }
+    }
+
+    /// Hot-path enrichment join: locate an entry by its STABLE identity, returning
+    /// its current index + row, or `None` if it has left the queue (delete/move).
+    /// Anchored on the queue id, never the mutable current index, so attribution
+    /// stays exact across an off-spine advance and disambiguates duplicate
+    /// [`SongId`]s. One source of truth (mirrors [`QueueSnapshot::find`]).
+    pub fn snapshot_by_queue_id(&self, id: QueueId) -> Option<(usize, EntrySnapshot)> {
+        let st = self.state.lock().unwrap();
+        st.queue
+            .iter()
+            .enumerate()
+            .find(|(_, it)| it.id == id.0)
+            .map(|(idx, it)| (idx, entry_snapshot(it)))
+    }
+
     /// Called by the daemon when the player reports a natural EOF: advance to the
     /// next queue entry, or leave the state stopped at the end of the queue.
     pub async fn advance_on_eof(&self) {
@@ -641,6 +752,10 @@ impl HypodjHandler {
         // (scrobbled). A raw stream plays its URL verbatim with no id (never
         // scrobbled). Either way a bad/unreachable URL surfaces as a player
         // error here and, at worst, an idle/stopped state - never a panic.
+        // Latch the entry's stable identity so every downstream player event
+        // (TimePos/StateChanged/Eof) is attributed to THIS entry even after an
+        // off-spine next/prev/delete repoints the current index.
+        let qid = Some(QueueId(item.id));
         match &item.entry {
             QueueEntry::Song(song) => {
                 let url = self
@@ -648,13 +763,13 @@ impl HypodjHandler {
                     .stream_url(&song.id)
                     .map_err(|e| e.to_string())?;
                 self.player
-                    .play_url(Some(song.id.clone()), url.as_str())
+                    .play_url(Some(song.id.clone()), qid, url.as_str())
                     .await
                     .map_err(|e| e.to_string())?;
             }
             QueueEntry::Stream { url, .. } => {
                 self.player
-                    .play_url(None, url)
+                    .play_url(None, qid, url)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -742,6 +857,28 @@ fn song_pairs(item: &QueueItem, pos: usize) -> Vec<(String, String)> {
     p.push(("Pos".to_string(), pos.to_string()));
     p.push(("Id".to_string(), item.id.to_string()));
     p
+}
+
+/// Build the join-relevant [`EntrySnapshot`] for one queue item. A raw stream
+/// has no album and no known duration (both `None`, honestly - never `0`). A
+/// duration-less song is `None` too, never `0`-as-unknown.
+fn entry_snapshot(it: &QueueItem) -> EntrySnapshot {
+    let (song, album_id, duration) = match &it.entry {
+        QueueEntry::Song(s) => (
+            Some(s.id.clone()),
+            s.album_id.clone(),
+            s.duration_secs
+                .filter(|&d| d > 0)
+                .map(|d| Duration::from_secs(d as u64)),
+        ),
+        QueueEntry::Stream { .. } => (None, None, None),
+    };
+    EntrySnapshot {
+        queue_id: QueueId(it.id),
+        song,
+        album_id,
+        duration,
+    }
 }
 
 /// Is `uri` an absolute HTTP(S) stream URL (internet radio) rather than a
@@ -2257,7 +2394,7 @@ mod tests {
         // raw stream (so nothing downstream can scrobble it).
         assert_eq!(h.player.state(), PlayState::Playing);
         match events.recv().await.expect("a player event") {
-            PlayerEvent::StateChanged(PlayState::Playing, song) => {
+            PlayerEvent::StateChanged(PlayState::Playing, song, _) => {
                 assert!(song.is_none(), "raw stream must carry no scrobble-able id");
             }
             other => panic!("expected Playing StateChanged, got {other:?}"),
@@ -2311,8 +2448,8 @@ mod tests {
         };
         let scrobbler = Scrobbler::new(client);
         // Feeding the exact event a raw stream produces is a no-op (no id).
-        scrobbler.on_event(&PlayerEvent::StateChanged(PlayState::Playing, None));
-        scrobbler.on_event(&PlayerEvent::TimePos(120.0));
+        scrobbler.on_event(&PlayerEvent::StateChanged(PlayState::Playing, None, None));
+        scrobbler.on_event(&PlayerEvent::TimePos { pos: 120.0, queue_id: None });
         // No panic, no submission possible: the scrobbler never latched a song.
         assert!(scrobbler.current_is_none());
     }

@@ -123,9 +123,11 @@ impl Scrobbler {
     /// Feed one player event. Non-blocking: any network call is spawned.
     pub fn on_event(&self, ev: &PlayerEvent) {
         match ev {
-            PlayerEvent::StateChanged(PlayState::Playing, Some(id)) => self.on_playing(id.clone()),
-            PlayerEvent::TimePos(t) => self.on_timepos(*t),
-            PlayerEvent::Eof(id) => self.on_eof(id.clone()),
+            PlayerEvent::StateChanged(PlayState::Playing, Some(id), _) => self.on_playing(id.clone()),
+            PlayerEvent::TimePos { pos, .. } => self.on_timepos(*pos),
+            // A raw stream ends with `song: None` and must never scrobble; only a
+            // library track (Some id) is submitted.
+            PlayerEvent::Eof { song: Some(id), .. } => self.on_eof(id.clone()),
             // Pause/Stop: no scrobble action. A pause just stops accumulation
             // because no TimePos advances; resume re-enters Playing on the same
             // id and is debounced (not a new song).
