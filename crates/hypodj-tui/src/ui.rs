@@ -308,9 +308,24 @@ fn render_browse(f: &mut Frame, area: ratatui::layout::Rect, browse: &Browse) {
 
 fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     let block = Block::default().borders(Borders::ALL);
+    // Draw a visible caret in the input box only in Command/Search mode; a stray
+    // block cursor in Normal/Confirm would sit over the hint line. Inner coords
+    // skip the 1-cell border (area.x+1, area.y+1); prompt_len = 2 for "> ", 1 for
+    // "/"; chars().count() (not len()) so multibyte input is not mis-placed.
+    let caret: Option<(u16, usize)> = match state.mode {
+        Mode::Command => Some((2, state.input.chars().count())),
+        Mode::Search => Some((1, state.input.chars().count())),
+        _ => None,
+    };
+    if let Some((prompt_len, input_chars)) = caret {
+        f.set_cursor_position((
+            area.x + 1 + prompt_len + input_chars as u16,
+            area.y + 1,
+        ));
+    }
     let lines: Vec<Line> = match state.mode {
         Mode::Normal => {
-            let hint = "keys: space/bksp=scrub p=pause </>=prev/next ^s=stop j/k=move g/G=top/bot f=fav 9/0=vol enter=play/open 1/2/3=view h=back  /=command  q=quit";
+            let hint = "keys: space=add ^f/^b=scrub ^s=fav-cur s=fav o=open enter=play p=pause </>=prev/next j/k=move g/G=top/bot 9/0=vol 1/2/3=view h/esc=back /=search :=cmd q=quit";
             match &state.status_msg {
                 Some(msg) => vec![Line::from(msg.replace('\n', " "))],
                 None => vec![Line::from(Span::styled(
@@ -320,6 +335,7 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
             }
         }
         Mode::Command => vec![Line::from(format!("> {}", state.input))],
+        Mode::Search => vec![Line::from(format!("/{}", state.input))],
         Mode::Confirm => {
             let mut ls = Vec::new();
             if let Some(p) = &state.pending {
