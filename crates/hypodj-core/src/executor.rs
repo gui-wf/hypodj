@@ -352,21 +352,24 @@ async fn recv_mpsc(rx: &mut Option<mpsc::UnboundedReceiver<PlanId>>) -> Option<P
 fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
     let dur = |s: f64| std::time::Duration::try_from_secs_f64(s).unwrap_or(std::time::Duration::from_millis(250));
     match ir {
-        FadeIntentIr::Out { secs } => FadeRequest { intent: FadeIntent::Out, dur: dur(*secs) },
-        FadeIntentIr::In { secs } => FadeRequest { intent: FadeIntent::In, dur: dur(*secs) },
+        FadeIntentIr::Out { secs } => FadeRequest { intent: FadeIntent::Out, dur: dur(*secs), commit_logical: None },
+        FadeIntentIr::In { secs } => FadeRequest { intent: FadeIntent::In, dur: dur(*secs), commit_logical: None },
         FadeIntentIr::To { target_db, vol, secs } => FadeRequest {
             intent: FadeIntent::To { target_db: *target_db, vol: *vol },
             dur: dur(*secs),
+            commit_logical: None,
         },
         // Wind-down to the configured floor, playback continuing. The floor is
         // resolved from the LIVE config inside `start_fade_spec` (never baked here).
         FadeIntentIr::ToFloor { secs } => FadeRequest {
             intent: FadeIntent::ToFloor,
             dur: dur(*secs),
+            commit_logical: None,
         },
         FadeIntentIr::WakeTo { target_db, vol, secs } => FadeRequest {
             intent: FadeIntent::WakeTo { target_db: *target_db, vol: *vol },
             dur: dur(*secs),
+            commit_logical: None,
         },
     }
 }

@@ -86,6 +86,14 @@ struct State {
     /// time via [`State::reported_volume`], so getvol/status never desync from an
     /// in-flight envelope. Initialised to the dB of `target_volume`.
     live_gain_db: f64,
+    /// The committed PERCEPTUAL target in dB - the authoritative source for BOTH
+    /// knob stepping and the resume baseline. The FadeSlot merely animates
+    /// `live_gain_db` toward it; every volume commit path (setvol glide, knob
+    /// detent, baseline terminal) writes it SYNCHRONOUSLY so a key-mash or a
+    /// superseded glide always leaves the true intended level committed here, not
+    /// the mid-flight live gain. Invariant: after any baseline commit it equals
+    /// `mpv_volume_to_db(target_volume)`. Initialised to the dB of `target_volume`.
+    logical_gain_db: f64,
     /// Monotonic fade generation. Bumped on every `start_fade`; a fade's report
     /// closure no-ops if `fade_epoch` moved on (a superseded straggler), so late
     /// writes from an aborted fade can never clobber the live gain.
@@ -118,6 +126,18 @@ struct State {
     /// so a superseded skip never leaves the reported current pointing at a track
     /// that never loaded.
     pending_skip: Option<usize>,
+    /// Does `logical_gain_db` currently reflect a COMMITTED baseline the knob can
+    /// step from directly? `true` at rest and while a knob/glide fade animates (its
+    /// baseline is committed synchronously at install, so N rapid presses = N
+    /// detents). `false` while a NON-committing fade (transport resume-in, sleep
+    /// wind-down, wake, alarm ramp, skip dip) animates: those leave `logical_gain_db`
+    /// at the STALE pre-fade level and only move `live_gain_db`, so a knob press must
+    /// step from the live in-flight gain instead - otherwise a DOWN during a gentle
+    /// wake would compute its target from the loud pre-sleep baseline and jump the
+    /// volume UP (a startle). Set `true` by every baseline commit (set_manual_volume,
+    /// the commit_logical install, and each settling terminal); set `false` when a
+    /// non-committing fade is installed.
+    baseline_committed: bool,
     /// Bumped whenever the queue changes (MPD "playlist version").
     playlist_version: u64,
     /// Client-negotiated binary chunk size (ncmpcpp sends `binarylimit`). MPD is
@@ -143,17 +163,30 @@ struct State {
     /// plain u64 (not a heavyweight RNG) so it is trivially seedable from tests
     /// via [`State::seed_rng`], keeping `random` advance assertions non-flaky.
     rng_state: u64,
+    /// Deterministic RNG state for the volume-glide human-noise DITHER, SEPARATE
+    /// from `rng_state` so drawing a dither on every setvol never desyncs the
+    /// `random` next-track selection (whose seeded advances tests assert). Seeded
+    /// from a fixed non-zero constant in Default and the wall clock in the
+    /// constructor; tests pin it directly.
+    vol_dither_state: u64,
+}
+
+/// One splitmix64 step: advance `state` and return a well-mixed u64. The shared
+/// deterministic mixer for `random` next-track selection AND the volume-glide
+/// dither draw; seedable so both are reproducible in tests.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl State {
-    /// One splitmix64 step: advance `rng_state` and return a well-mixed u64. The
-    /// deterministic source for `random` next-track selection; seedable in tests.
+    /// One splitmix64 step over `rng_state`, the deterministic source for
+    /// `random` next-track selection; seedable in tests.
     fn next_rand(&mut self) -> u64 {
-        self.rng_state = self.rng_state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.rng_state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+        splitmix64(&mut self.rng_state)
     }
 
     /// Pick a random in-range next index for `random` playback, avoiding an
@@ -184,10 +217,14 @@ impl Default for State {
             target_volume: 100,
             // 100 -> 0 dB (see mpv_volume_to_db); the two start in sync.
             live_gain_db: 0.0,
+            // 100 -> 0 dB; the committed logical target starts in sync too.
+            logical_gain_db: 0.0,
             fade_epoch: 0,
             fading: false,
             pending_pause: false,
             pending_skip: None,
+            // At rest the committed logical target IS the current baseline.
+            baseline_committed: true,
             playlist_version: 0,
             binary_limit: 8192,
             last_starred_order: Vec::new(),
@@ -198,6 +235,9 @@ impl Default for State {
             // A fixed non-zero default seed; production is seeded from the wall
             // clock at handler construction, tests override via `seed_rng`.
             rng_state: 0x243F_6A88_85A3_08D3,
+            // A fixed non-zero default seed for the glide dither; production seeds
+            // it from the wall clock at construction, tests pin it directly.
+            vol_dither_state: 0x8B7F_A1C2_D3E4_F506,
         }
     }
 }
@@ -230,6 +270,13 @@ impl State {
     fn set_manual_volume(&mut self, v: u8) {
         self.target_volume = v;
         self.live_gain_db = mpv_volume_to_db(v as f64);
+        // Keep the committed logical target in lockstep with every baseline
+        // commit so the next knob press steps from the true settled level, never
+        // a stale rung (the SetBaseline / StopRestore / Clear / Stop / resume
+        // paths all route through here).
+        self.logical_gain_db = self.live_gain_db;
+        // A concrete baseline is now committed: the knob steps from it directly.
+        self.baseline_committed = true;
         self.fading = false;
         self.pending_pause = false;
         // A manual volume commit also supersedes any in-flight skip: the deck is
@@ -413,6 +460,13 @@ enum Terminal {
 pub struct FadeRequest {
     pub intent: FadeIntent,
     pub dur: Duration,
+    /// If `Some((db, vol))`, the fade's install (the spawn closure, under the
+    /// FadeSlot lock alongside the epoch bump) SYNCHRONOUSLY commits
+    /// `logical_gain_db = db` and `target_volume = vol` - BEFORE any tick. So a
+    /// superseded key-mash / slider-drag still commits every intermediate rung,
+    /// and the off-click pause reads the true quiet baseline. Does NOT touch
+    /// `live_gain_db` and does NOT clear `fading` (the envelope still animates).
+    pub commit_logical: Option<(f64, u8)>,
 }
 
 /// The abstract, fade-native fade intents. Kept separate from the MPD
@@ -448,6 +502,13 @@ pub enum FadeIntent {
     /// so a short single-step request always LANDS (never rejected as too-short) -
     /// the knob's "every press moves" guarantee. Works up OR down from any level.
     Knob { target_db: f64, vol: u8 },
+    /// A graduated absolute-volume GLIDE (the humanized `setvol`/MPRIS drag): a
+    /// short deliberate perceptual ramp to `target_db`, committing `vol` as the
+    /// baseline. Resolves IDENTICALLY to [`FadeIntent::Knob`] (Db target,
+    /// deliberate, SetBaseline, clamp_dur_up) - a distinct variant only for
+    /// intent/readability. NEVER Silence/Pause, so `setvol 0` lands at the -60
+    /// floor as a committed baseline and stays Playing (never the off-click pause).
+    Glide { target_db: f64, vol: u8 },
     /// Wake ramp-in on smooth-restart: a SUB-JND ramp UP to the user's SAVED
     /// perceptual level (`target_db`), committing `vol` as the restored baseline.
     /// Distinct from [`FadeIntent::In`] (which targets the comfort ceiling / vol
@@ -503,6 +564,12 @@ impl FadeIntent {
             // One knob detent: deliberate, commits the new baseline, clamp_dur_up so
             // a short 3 dB step always lands rather than rejecting as StepTooLarge.
             FadeIntent::Knob { target_db, vol } => {
+                (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol), true)
+            }
+            // Absolute-volume glide: identical resolve to Knob (deliberate, commits
+            // the baseline, clamp_dur_up so a large 0->100 span always lands as a
+            // multi-step ramp rather than rejecting as StepTooLarge).
+            FadeIntent::Glide { target_db, vol } => {
                 (FadeTarget::Db(target_db), false, Terminal::SetBaseline(vol), true)
             }
             // Wake ramp: sub-JND ramp to the SAVED level, committing it as the
@@ -614,6 +681,11 @@ fn fade_task(
                     let mut st = state.lock().unwrap();
                     let v = db_to_mpv_volume(st.live_gain_db).round().clamp(0.0, 100.0) as u8;
                     st.target_volume = v;
+                    // Adopt the reached level as the committed logical target too
+                    // (this writer bypasses set_manual_volume).
+                    st.logical_gain_db = mpv_volume_to_db(v as f64);
+                    // The ramp settled to a concrete baseline: the knob steps from it.
+                    st.baseline_committed = true;
                     st.fading = false;
                     drop(st);
                     changed.notify_waiters();
@@ -657,6 +729,9 @@ fn fade_task(
                         let mut st = state.lock().unwrap();
                         st.live_gain_db = mpv_volume_to_db(baseline as f64);
                         st.fading = false;
+                        // Restored to the baseline: the knob (a knob-up resume) once
+                        // more steps from the committed logical target.
+                        st.baseline_committed = true;
                         // The real pause has landed (mpv is Paused): the pending
                         // intent is fulfilled and the raw state now carries it.
                         st.pending_pause = false;
@@ -715,6 +790,11 @@ fn fade_task(
                 let mut st = state.lock().unwrap();
                 let v = db_to_mpv_volume(st.live_gain_db).round().clamp(0.0, 100.0) as u8;
                 st.target_volume = v;
+                // Adopt the settled level as the committed logical target too
+                // (this writer bypasses set_manual_volume).
+                st.logical_gain_db = mpv_volume_to_db(v as f64);
+                // Settled to a concrete baseline: the knob steps from it.
+                st.baseline_committed = true;
                 st.fading = false;
                 drop(st);
                 changed.notify_waiters();
@@ -903,11 +983,14 @@ impl HypodjHandler {
         // always shuffle the same order across restarts (tests override via
         // `seed_rng`). Any non-zero seed is fine for splitmix64.
         let mut init_state = State::default();
-        init_state.rng_state = std::time::SystemTime::now()
+        let wall = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x243F_6A88_85A3_08D3)
-            | 1;
+            .unwrap_or(0x243F_6A88_85A3_08D3);
+        init_state.rng_state = wall | 1;
+        // A distinct non-zero seed for the glide dither (mixed off the same wall
+        // clock so it varies across restarts but never collides with rng_state).
+        init_state.vol_dither_state = wall.rotate_left(32) | 1;
         Self {
             client,
             player,
@@ -1316,7 +1399,7 @@ impl HypodjHandler {
             target_db: mpv_volume_to_db(comfort_vol as f64),
             vol: comfort_vol,
         };
-        self.start_fade_spec(FadeRequest { intent, dur })
+        self.start_fade_spec(FadeRequest { intent, dur, commit_logical: None })
             .await
             .map_err(|e| e.to_string())
     }
@@ -1722,7 +1805,7 @@ impl HypodjHandler {
                 }
             }
         };
-        self.start_fade_spec(FadeRequest { intent, dur }).await
+        self.start_fade_spec(FadeRequest { intent, dur, commit_logical: None }).await
     }
 
     /// THE reusable, fade-NATIVE entry point that starts a volume-envelope fade.
@@ -1745,6 +1828,7 @@ impl HypodjHandler {
         let floor_db = self.fade_cfg.floor_level_db;
         let dur = req.dur;
         let intent = req.intent;
+        let commit_logical = req.commit_logical;
 
         let cfg = self.fade_cfg.clone();
         let state_read = self.state.clone();
@@ -1794,6 +1878,35 @@ impl HypodjHandler {
                         let mut st = state_task.lock().unwrap();
                         st.fade_epoch += 1;
                         st.fading = true;
+                        // Synchronously commit the logical target + baseline at
+                        // INSTALL (under this slot lock, atomic against supersede),
+                        // before any tick. A superseded key-mash / slider-drag thus
+                        // still commits every intermediate rung; does NOT touch
+                        // live_gain_db (the envelope keeps animating) or `fading`.
+                        // Also reconcile the pending intents like a manual commit
+                        // (mirrors set_manual_volume): a glide/knob commit means the
+                        // deck is being driven to a concrete baseline, so it must
+                        // never leave the reported state stuck Paused (a setvol that
+                        // supersedes an in-flight PauseOut) nor at a never-loaded
+                        // skip target - the difference from set_manual_volume is it
+                        // leaves `fading`/`live_gain_db` alone so the ramp animates.
+                        if let Some((db, vol)) = commit_logical {
+                            st.logical_gain_db = db;
+                            st.target_volume = vol;
+                            // A knob/glide commits its baseline synchronously, so the
+                            // knob keeps stepping from logical_gain_db (rapid presses
+                            // each advance a detent).
+                            st.baseline_committed = true;
+                            st.pending_pause = false;
+                            st.pending_skip = None;
+                        } else {
+                            // A non-committing fade (resume-in, wind-down, wake, skip
+                            // dip) leaves logical_gain_db at the stale pre-fade level
+                            // and only animates live_gain_db, so a knob press during
+                            // it must step from the LIVE gain, not the stale baseline
+                            // (else a DOWN mid-wake jumps the volume up - a startle).
+                            st.baseline_committed = false;
+                        }
                         st.fade_epoch
                     };
                     let join = tokio::spawn(fade_task(
@@ -1847,6 +1960,17 @@ impl HypodjHandler {
         self.clamp_fade_dur(raw)
     }
 
+    /// The clamped absolute-volume GLIDE fade duration (float-second
+    /// `glide_fade_secs` into `[min_slew, max_dur]`). Distinct from
+    /// `pause_fade_dur` so the human-feel of a setvol glide is tunable
+    /// independently of the pause ramp. Saturating parse; a large span still
+    /// extends past this via `clamp_dur_up` to keep every step <= 3 dB.
+    fn glide_fade_dur(&self) -> Duration {
+        let raw = Duration::try_from_secs_f64(self.fade_cfg.glide_fade_secs)
+            .unwrap_or_else(|_| Duration::from_millis(self.fade_cfg.min_slew_ms));
+        self.clamp_fade_dur(raw)
+    }
+
     /// THE startle-safe transport toggle, shared by the MPD `pause` command and the
     /// MPRIS Pause/PlayPause/Play controls. `want`: `Some(true)` pause, `Some(false)`
     /// resume, `None` toggle from the live state.
@@ -1891,10 +2015,17 @@ impl HypodjHandler {
     /// signals direction.
     ///
     /// Each detent is a fixed [`KNOB_STEP_DB`] (3 dB) equal-loudness step on a grid
-    /// anchored at 0 dB, read from the LIVE gain (so rapid presses climb/descend
-    /// monotonically, superseding any in-flight knob fade rather than stalling on a
-    /// not-yet-committed baseline). The bottom of the usable knob is the configured
-    /// `floor_level_db`; a down-step that would cross below it is the OFF-CLICK,
+    /// anchored at 0 dB. The reference level is the COMMITTED logical target while at
+    /// rest or during a knob-glide (so rapid presses climb/descend monotonically -
+    /// each supersedes the in-flight knob fade from a synchronously-committed
+    /// baseline rather than collapsing onto the same not-yet-reached live gain), but
+    /// the LIVE in-flight gain while a non-committing fade (resume-in, wind-down,
+    /// wake, skip dip) animates - there the committed target is a stale pre-fade
+    /// value and stepping from it would jolt the volume the wrong way (see
+    /// [`State::baseline_committed`]). A settled level is a u8-requantized rung, so
+    /// the step SNAPS a near-grid start onto its rung before advancing (one press =
+    /// one detent, never a sub-rung plateau). The bottom of the usable knob is the
+    /// configured `floor_level_db`; a down-step that would cross below it is the OFF-CLICK,
     /// which reuses the EXACT `set_pause` pause path (one pause mechanism). A knob-up
     /// while paused resumes. Because each down-step commits its rung as the baseline,
     /// `target_volume` already sits at the bottom detent when you off-click, so the
@@ -1907,23 +2038,39 @@ impl HypodjHandler {
         // covers both the mid-fade window (pending_pause) and the settled pause.
         let paused = self.reported_play_state() == PlayState::Paused;
         // Brief lock, dropped BEFORE any await (never hold State across .await).
-        let live_db = self.state.lock().unwrap().live_gain_db;
-        // Quantize to the 3 dB grid so float error never accumulates across presses.
-        let rung = (live_db / KNOB_STEP_DB).round() * KNOB_STEP_DB;
+        // Pick the reference level per `baseline_committed`: the committed logical
+        // target while at rest / during a knob-glide (so rapid presses each advance
+        // a detent from a synchronously-committed baseline, and a settled u8 rung is
+        // stepped cleanly), but the LIVE in-flight gain while a non-committing fade
+        // (resume-in, wind-down, wake, skip dip) animates - there logical is a stale
+        // pre-fade level and stepping from it would drive the volume the wrong way
+        // (a DOWN mid-wake would jump up from the loud pre-sleep baseline).
+        let ref_db = {
+            let st = self.state.lock().unwrap();
+            if st.baseline_committed {
+                st.logical_gain_db
+            } else {
+                st.live_gain_db
+            }
+        };
         match (dir, paused) {
             // Up while paused -> resume (climbs from the bottom detent baseline).
             (KnobDir::Up, true) => self.set_pause(Some(false)).await,
             // Down while already paused -> idempotent no-op (already off).
             (KnobDir::Down, true) => Ok(()),
             (KnobDir::Up, false) => {
-                let target = (rung + KNOB_STEP_DB).min(0.0);
-                if target <= live_db {
+                // The next 3 dB detent up (snapping a settled near-grid start onto
+                // its rung first, so one press is always a full detent), capped at
+                // the 0 dB ceiling.
+                let target = Self::knob_detent(ref_db, true).min(0.0);
+                if target <= ref_db {
                     return Ok(()); // at the ceiling: no-op
                 }
                 self.knob_step_to(target).await
             }
             (KnobDir::Down, false) => {
-                let target = rung - KNOB_STEP_DB;
+                // The next 3 dB detent down (same near-grid snap).
+                let target = Self::knob_detent(ref_db, false);
                 if target < floor {
                     // Off-click: below the lowest audible detent -> pause.
                     self.set_pause(Some(true)).await
@@ -1932,6 +2079,30 @@ impl HypodjHandler {
                 }
             }
         }
+    }
+
+    /// The 3 dB detent strictly beyond `from_db` in `dir` (up = `true`), on the grid
+    /// anchored at 0 dB. A settled level is a u8-requantized rung (e.g. vol 79 =
+    /// -6.14 dB, ~0.05 rung off the -6 line), so a naive strict `floor()`/`ceil()`
+    /// step would move only that sub-rung sliver and then plateau (or oscillate)
+    /// forever. We therefore SNAP a near-grid start onto its rung first (within a
+    /// quarter rung - larger than any u8 requant error, smaller than a mid-rung
+    /// gap) so one press always advances a full detent; a GENUINELY mid-rung start
+    /// (left by a prior absolute setvol) is not snapped and lands on the adjacent
+    /// bracketing rung, preserving the "one press = adjacent rung" off-grid rule.
+    fn knob_detent(from_db: f64, up: bool) -> f64 {
+        let idx = from_db / KNOB_STEP_DB;
+        let nearest = idx.round();
+        let rung = if (idx - nearest).abs() < 0.25 {
+            // Essentially on a rung: one full detent in the pressed direction.
+            if up { nearest + 1.0 } else { nearest - 1.0 }
+        } else if up {
+            // Between rungs: the adjacent rung above / below.
+            idx.ceil()
+        } else {
+            idx.floor()
+        };
+        rung * KNOB_STEP_DB
     }
 
     /// Drive one knob detent to `target_db` as a single deliberate slewed fade
@@ -1946,6 +2117,11 @@ impl HypodjHandler {
             .start_fade_spec(FadeRequest {
                 intent: FadeIntent::Knob { target_db, vol },
                 dur,
+                // Commit this rung to the logical target + baseline at INSTALL, so
+                // a key-mash whose fades supersede still commits every intermediate
+                // detent (bug b) and the off-click pause resumes at the true quiet
+                // rung, not the loud pre-mash level.
+                commit_logical: Some((target_db, vol)),
             })
             .await;
         self.notify_change();
@@ -1974,7 +2150,7 @@ impl HypodjHandler {
         self.notify_change();
         let dur = self.pause_fade_dur();
         match self
-            .start_fade_spec(FadeRequest { intent: FadeIntent::PauseOut, dur })
+            .start_fade_spec(FadeRequest { intent: FadeIntent::PauseOut, dur, commit_logical: None })
             .await
         {
             Ok(()) => Ok(()),
@@ -2019,7 +2195,7 @@ impl HypodjHandler {
         // A user resume is responsive, not the long sub-JND alarm wake.
         let dur = self.pause_fade_dur();
         let intent = FadeIntent::ResumeIn { target_db: mpv_volume_to_db(vol as f64), vol };
-        let _ = self.start_fade_spec(FadeRequest { intent, dur }).await;
+        let _ = self.start_fade_spec(FadeRequest { intent, dur, commit_logical: None }).await;
         r
     }
 
@@ -2289,7 +2465,7 @@ impl HypodjHandler {
                 target_db: mpv_volume_to_db(saved_vol as f64),
                 vol: saved_vol,
             };
-            let _ = self.start_fade_spec(FadeRequest { intent, dur }).await;
+            let _ = self.start_fade_spec(FadeRequest { intent, dur, commit_logical: None }).await;
         } else {
             // Paused/Stopped: restore the baseline volume, leave playback stopped.
             let v = s.volume.min(100);
@@ -3168,17 +3344,10 @@ impl MpdHandler for HypodjHandler {
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "seekid", &e.to_string()),
             },
             MpdCommand::SetVol(v) => {
-                let v = v.min(100);
-                // Manual wins ATOMICALLY: cancel any fade (abort+join) AND apply
-                // the manual value under the SAME slot lock, so a concurrent `fade`
-                // from another connection cannot install a fade in the gap and
-                // clobber the manual volume (or leave a surviving fade driving mpv
-                // while getvol lies). The mpv set_volume is sequenced after.
-                self.fade
-                    .cancel_with(|| self.state.lock().unwrap().set_manual_volume(v))
-                    .await;
-                let _ = self.player.set_volume(v).await;
-                self.notify_change();
+                // Graduated + humanized: GLIDE to the target through the one
+                // FadeSlot (epoch-guarded supersede = manual-wins, last-drag-wins)
+                // instead of snapping. See `glide_to_volume`.
+                self.glide_to_volume(v).await;
                 MpdResponse::ok()
             }
             MpdCommand::Knob(dir) => {
@@ -3584,13 +3753,71 @@ impl HypodjHandler {
     /// Set volume (MPRIS `Volume` setter): mirror it into shared state and push
     /// to the player, same as the MPD `setvol` path.
     pub async fn mpris_set_volume(&self, vol: u8) {
-        let v = vol.min(100);
-        // Manual wins ATOMICALLY (mirrors the MPD setvol path): cancel any fade
-        // AND apply the manual value under the SAME slot lock.
-        self.fade
-            .cancel_with(|| self.state.lock().unwrap().set_manual_volume(v))
-            .await;
-        let _ = self.player.set_volume(v).await;
+        // Same graduated + humanized glide as the MPD setvol path: a GNOME slider
+        // drag = many rapid Glides, each superseding the last (follows the finger).
+        self.glide_to_volume(vol).await;
+    }
+
+    /// Graduated + humanized absolute volume: GLIDE to `v` through the one FadeSlot
+    /// (never snap), with a small SEEDED sub-JND dither so it never lands exactly
+    /// on the rung - the human noise of operating a physical knob. Shared by MPD
+    /// `setvol` and the MPRIS Volume setter.
+    ///
+    /// Manual-wins is preserved AS a glide: the Glide rides the epoch-guarded
+    /// supersede (validate-before-abort), so a later set / a rapid slider drag
+    /// supersedes the in-flight one cleanly (last wins), curing the old
+    /// abort+snap-vs-supersede MPRIS-drag race. `setvol 0` lands EXACTLY 0 and
+    /// stays Playing (Glide never takes the off-click pause branch). Mid-glide
+    /// getvol/status report the in-flight envelope (fading=true) - honest, not the
+    /// final u8 until the glide completes.
+    async fn glide_to_volume(&self, v: u8) {
+        let v = v.min(100);
+        // Draw the dither + compute the landing under ONE State lock, dropped
+        // BEFORE any await (never hold State across .await).
+        let (target_db, landing_vol) = {
+            let mut st = self.state.lock().unwrap();
+            if v == 0 {
+                // A mute / slider-to-0 must land EXACTLY 0 - dithering UP would
+                // un-mute. No dither; target the synth floor as a committed
+                // baseline (a Db target, NOT Silence/Pause, so playback continues).
+                (mpv_volume_to_db(0.0), 0u8)
+            } else {
+                // 53-bit uniform in [0,1) -> symmetric [-0.7, 0.7] dB dither. 0.7 dB
+                // is sub-JND (barely perceptible) - human noise, no exaggeration.
+                let d = splitmix64(&mut st.vol_dither_state);
+                let frac = (d >> 11) as f64 / (1u64 << 53) as f64;
+                let dither_db = (frac * 2.0 - 1.0) * 0.7;
+                let raw_db = mpv_volume_to_db(v as f64) + dither_db;
+                // HARD post-clamp: the committed u8 lands within [v-1, v+1] and
+                // [0, 100], never above 100. NOTE: near the bottom (v < ~15) the
+                // dB-domain dither can map to > 1 vol before this clamp, so the
+                // effective dither there is ~0 (quiet levels barely change) - that
+                // is acceptable, NOT a bug.
+                let landing = db_to_mpv_volume(raw_db).round().clamp(0.0, 100.0) as i32;
+                let lo = (v as i32 - 1).max(0);
+                let hi = (v as i32 + 1).min(100);
+                let landing_vol = landing.clamp(lo, hi) as u8;
+                // Keep the sub-JND offset in the audible landing target, but the
+                // COMMITTED u8 baseline is the rounded landing_vol. Cap at 0 dB so
+                // the envelope never pushes the reported bar above 100.
+                let target_db = (mpv_volume_to_db(landing_vol as f64) + dither_db).min(0.0);
+                (target_db, landing_vol)
+            }
+        };
+        let req = FadeRequest {
+            intent: FadeIntent::Glide { target_db, vol: landing_vol },
+            dur: self.glide_fade_dur(),
+            commit_logical: Some((target_db, landing_vol)),
+        };
+        if self.start_fade_spec(req).await.is_err() {
+            // Defensive: clamp_dur_up should make a rejection impossible, but never
+            // let a setvol become a silent no-op - fall back to the old instant
+            // cancel_with + set_manual_volume snap (still manual-wins, atomic).
+            self.fade
+                .cancel_with(|| self.state.lock().unwrap().set_manual_volume(landing_vol))
+                .await;
+            let _ = self.player.set_volume(landing_vol).await;
+        }
         self.notify_change();
     }
 
@@ -4954,20 +5181,30 @@ mod tests {
         assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0, "gain restored to audible");
     }
 
-    // A manual setvol mid-fade cancels (abort+join) the fade FIRST, then applies
-    // the manual value: manual wins, strictly ordered, no trailing fade tick.
+    // A manual setvol mid-fade SUPERSEDES the running fade (validate-before-abort)
+    // as its OWN graduated glide: manual wins as a glide. The glide commits its
+    // landing to target_volume synchronously at install, then animates to it; once
+    // it settles the reported volume equals the landing (within the +/-1 dither).
     #[tokio::test(start_paused = true)]
     async fn manual_wins_last() {
         let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().vol_dither_state = 0x1234_5678_9ABC_DEF0;
         h.start_fade(fade_args(FadeKind::Out, 60)).await.unwrap();
         assert!(h.fade_active().await);
 
-        // setvol 30 mid-fade.
+        // setvol 30 mid-fade: the glide superseded the fade out (committed the
+        // landing at install), then run it out.
         h.handle(MpdCommand::SetVol(30)).await;
-        // Fade is gone (cancelled), and the last applied volume is exactly 30.
-        assert!(!h.fade_active().await);
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 30);
-        assert_eq!(h.state.lock().unwrap().target_volume, 30);
+        assert!(h.fade_active().await, "setvol is itself a glide fade");
+        // Landing committed within [29,31] at install, before any tick.
+        let committed = h.state.lock().unwrap().target_volume;
+        assert!((29..=31).contains(&committed), "landing committed at install: {committed}");
+        h.wait_for_fade().await;
+        // Post-completion the slot may retain a FINISHED handle; `fading` is the
+        // source of truth for "a fade is active" (see the fade_task NOTE).
+        assert!(!h.state.lock().unwrap().fading, "the glide settled");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), committed);
+        assert_eq!(h.state.lock().unwrap().target_volume, committed);
     }
 
     // A superseding fade continues from the LIVE gain, not a stale value, and the
@@ -5086,14 +5323,18 @@ mod tests {
         assert!(n >= 1, "a fade should notify at least once");
     }
 
-    // F1: with NO fade active, a low manual volume is reported EXACTLY, never
-    // round-tripped through the cubic dB domain (which would floor <= 10 to 0).
-    // `setvol 5` then `getvol` must return 5.
-    #[tokio::test]
+    // F1: once a setvol glide SETTLES, a low manual volume is reported as the
+    // committed landing u8 VERBATIM, never round-tripped through the cubic dB
+    // domain (which would floor <= 10 to 0). The landing is within +/-1 of the
+    // request (the human dither); `setvol 0` lands EXACTLY 0 (a mute must not
+    // un-mute via dither).
+    #[tokio::test(start_paused = true)]
     async fn low_volume_reports_exactly() {
         let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().vol_dither_state = 0xDEAD_BEEF_CAFE_1234;
         for v in [0u8, 1, 5, 7, 10, 33, 100] {
             h.handle(MpdCommand::SetVol(v)).await;
+            h.wait_for_fade().await;
             let got = match h.handle(MpdCommand::GetVol).await {
                 MpdResponse::Pairs(p) => p
                     .iter()
@@ -5102,8 +5343,15 @@ mod tests {
                     .unwrap(),
                 other => panic!("got {other:?}"),
             };
-            assert_eq!(got, v, "setvol {v} must report exactly {v}");
-            assert_eq!(h.volume(), v, "MPRIS volume must also report exactly {v}");
+            if v == 0 {
+                assert_eq!(got, 0, "setvol 0 lands exactly 0 (no un-mute dither)");
+            } else {
+                let lo = v.saturating_sub(1);
+                let hi = (v + 1).min(100);
+                assert!((lo..=hi).contains(&got), "setvol {v} lands in [{lo},{hi}], got {got}");
+                assert!(v < 5 || got > 0, "a low but audible setvol is never floored to 0");
+            }
+            assert_eq!(h.volume(), got, "MPRIS volume must match the settled getvol");
         }
     }
 
@@ -5113,8 +5361,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fade_in_ramps_up_from_silence() {
         let Some((h, _events)) = handler_with_null_player() else { return };
-        // Start from silence: setvol 0 (live gain at the floor).
+        // Start from silence: setvol 0 glides down to the floor, then settles at 0.
         h.handle(MpdCommand::SetVol(0)).await;
+        h.wait_for_fade().await;
         assert_eq!(h.state.lock().unwrap().reported_volume(), 0);
 
         h.start_fade(fade_args(FadeKind::In, 30)).await.unwrap();
@@ -5213,6 +5462,7 @@ mod tests {
         h.start_fade_spec(FadeRequest {
             intent: FadeIntent::Out,
             dur: Duration::from_secs(20),
+            commit_logical: None,
         })
         .await
         .unwrap();
@@ -5313,6 +5563,157 @@ mod tests {
         assert_eq!(h.state.lock().unwrap().reported_volume(), 79, "climbs back one detent");
     }
 
+    // GRADUATED + HUMANIZED absolute volume: a setvol GLIDES to the target (it does
+    // NOT snap) and lands WITHIN +/-1 vol of the request (the seeded human dither).
+    // Mid-glide the reported volume tracks the in-flight envelope (honest), and the
+    // final landing is byte-for-byte reproducible under a pinned seed.
+    #[tokio::test(start_paused = true)]
+    async fn glide_lands_within_one_vol() {
+        let run_once = || async {
+            let Some((h, _events)) = handler_with_null_player() else { return None };
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+            h.handle(MpdCommand::Play(Some(0))).await;
+            // Start at 70, pin the dither seed, then glide down to 50.
+            {
+                let mut st = h.state.lock().unwrap();
+                st.set_manual_volume(70);
+                st.vol_dither_state = 0xF00D_1357_2468_ACE0;
+            }
+            h.handle(MpdCommand::SetVol(50)).await;
+            // It is a GLIDE, not a snap: a fade is in flight and the reported value
+            // is tracking the envelope (still near 70, not already 50).
+            assert!(h.fade_active().await, "setvol installs a glide, never snaps");
+            assert!(h.state.lock().unwrap().fading, "reported tracks the envelope");
+            h.wait_for_fade().await;
+            let landed = h.state.lock().unwrap().target_volume;
+            assert!(!h.state.lock().unwrap().fading, "the glide settled");
+            assert!((49..=51).contains(&landed), "landing within +/-1 of 50: {landed}");
+            Some(landed)
+        };
+        let a = run_once().await;
+        let b = run_once().await;
+        // Same seed -> byte-for-byte reproducible landing.
+        assert_eq!(a, b, "a pinned dither seed lands deterministically");
+    }
+
+    // The dither is REAL: two DIFFERENT seeds both land within +/-1 of the request
+    // but need not be equal (proves it dithers - bounded, never wild).
+    #[tokio::test(start_paused = true)]
+    async fn glide_dithers_deterministically() {
+        let land_with = |seed: u64| async move {
+            let Some((h, _events)) = handler_with_null_player() else { return None };
+            h.handle(MpdCommand::Add(NTS.to_string())).await;
+            h.handle(MpdCommand::Play(Some(0))).await;
+            {
+                let mut st = h.state.lock().unwrap();
+                st.set_manual_volume(90);
+                st.vol_dither_state = seed;
+            }
+            // Draw many landings and collect the set so a seed that happens to
+            // agree on one value still shows variation across draws.
+            let mut lands = Vec::new();
+            for _ in 0..8 {
+                h.handle(MpdCommand::SetVol(50)).await;
+                h.wait_for_fade().await;
+                let v = h.state.lock().unwrap().target_volume;
+                assert!((49..=51).contains(&v), "bounded landing: {v}");
+                lands.push(v);
+            }
+            Some(lands)
+        };
+        let a = land_with(0x1111_2222_3333_4444).await.unwrap();
+        let b = land_with(0x9999_8888_7777_6666).await.unwrap();
+        // Each stream varies (not a constant), and the two seeds differ somewhere.
+        let a_varies = a.iter().any(|&v| v != a[0]);
+        let b_varies = b.iter().any(|&v| v != b[0]);
+        assert!(a_varies || b_varies || a != b, "the dither actually perturbs the landing");
+    }
+
+    // setvol 0 (a mute / GNOME slider to 0) must land EXACTLY 0 and stay PLAYING -
+    // the Glide never takes the knob off-click / pause branch (only the knob does).
+    #[tokio::test(start_paused = true)]
+    async fn setvol_0_does_not_pause() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.mpris_set_volume(0).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "setvol 0 must NOT pause");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 0, "lands exactly 0, no un-mute");
+    }
+
+    // A low but audible setvol is not floored to 0 by the dither/clamp: setvol 5
+    // lands in [4,6], never 0 (guards the low-value setvol behavior).
+    #[tokio::test(start_paused = true)]
+    async fn setvol_low_not_floored() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().vol_dither_state = 0x0BAD_F00D_1234_5678;
+        h.handle(MpdCommand::SetVol(5)).await;
+        h.wait_for_fade().await;
+        let v = h.state.lock().unwrap().reported_volume();
+        assert!((4..=6).contains(&v), "setvol 5 lands in [4,6]: {v}");
+        assert_ne!(v, 0, "a low audible setvol is never floored to 0");
+    }
+
+    // Knob bug (a): from an OFF-GRID level (left by a prior absolute set) ONE knob
+    // press moves to exactly the adjacent 3 dB rung - never 1.5-4.5 dB, never skips.
+    #[tokio::test(start_paused = true)]
+    async fn knob_off_grid_single_rung() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.state.lock().unwrap().vol_dither_state = 0x2468_1357_9BDF_0ACE;
+        // 55 -> ~-15.6 dB, deliberately OFF the 3 dB grid (rungs at -15, -18).
+        h.handle(MpdCommand::SetVol(55)).await;
+        h.wait_for_fade().await;
+        let pre = h.state.lock().unwrap().logical_gain_db;
+        // Expected: the largest 3 dB rung STRICTLY BELOW `pre`.
+        let expected = (pre / KNOB_STEP_DB).ceil() * KNOB_STEP_DB - KNOB_STEP_DB;
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        // The rung is committed to logical_gain_db SYNCHRONOUSLY at install.
+        let committed = h.state.lock().unwrap().logical_gain_db;
+        assert!((committed - expected).abs() < 1e-9, "adjacent rung {expected}, got {committed}");
+        // It is exactly on the 3 dB grid, and the move is one rung (< a full step
+        // from an off-grid start, never a skipped rung).
+        assert!((committed / KNOB_STEP_DB).fract().abs() < 1e-9, "on the 3 dB grid");
+        assert!(pre - committed > 0.0 && pre - committed <= KNOB_STEP_DB + 1e-9, "one detent down");
+    }
+
+    // Knob bugs (b)+(c): N rapid knob-downs whose fades SUPERSEDE each other still
+    // commit EVERY intermediate rung to the logical target synchronously, so the
+    // baseline sits at the Nth rung (not the loud pre-mash level), and a resume
+    // ramps back to that committed quiet rung.
+    #[tokio::test(start_paused = true)]
+    async fn knob_mash_commits_every_rung() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        // Three rapid detents down (each supersedes the last in-flight fade). From
+        // 0 dB the rungs are -3, -6, -9; -9 dB = mpv vol 71.
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        // The Nth rung is committed to the baseline even though the fades superseded
+        // (bug b/c): target_volume already sits at the quiet -9 dB rung.
+        assert_eq!(h.state.lock().unwrap().target_volume, 71, "every mashed rung committed");
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 71);
+
+        // Pause, then resume via knob-up: the resume ramps back FROM the committed
+        // quiet rung (the baseline), never the loud pre-mash level.
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+        h.handle(MpdCommand::Knob(KnobDir::Up)).await;
+        assert_eq!(h.player.state(), PlayState::Playing, "knob up resumes");
+        h.wait_for_fade().await;
+        let resumed = h.state.lock().unwrap().reported_volume();
+        // Resumed at the committed quiet rung's neighbourhood (one detent up from
+        // 71), never back at the loud 100.
+        assert!(resumed <= 80, "resume climbs from the committed quiet rung, not loud: {resumed}");
+    }
+
     // The bottom of the knob is a real off-click: a `knob down` from the lowest
     // audible detent (at/below floor_level_db) PAUSES via the exact same pause path
     // as the `p` key. Position at the floor deterministically with `setvol` (which
@@ -5322,10 +5723,18 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Play(Some(0))).await;
-        // vol 18 ~= -44.7 dB, i.e. the lowest audible detent (floor is -45 dB). The
-        // next detent down crosses the floor - the off-click.
-        h.handle(MpdCommand::SetVol(18)).await;
-        h.wait_for_fade().await;
+        // Position the committed logical target AT the floor rung (-45 dB, the
+        // lowest audible detent) deterministically. The next `knob down` targets
+        // the rung strictly below (-48 dB), which crosses the floor - the
+        // off-click. (Direct state write, so the glide/dither never perturbs the
+        // starting rung; the glide is covered by its own tests.)
+        {
+            let mut st = h.state.lock().unwrap();
+            st.live_gain_db = -45.0;
+            st.logical_gain_db = -45.0;
+            st.target_volume = db_to_mpv_volume(-45.0).round() as u8;
+            st.fading = false;
+        }
         assert_eq!(h.reported_play_state(), PlayState::Playing);
 
         h.handle(MpdCommand::Knob(KnobDir::Down)).await;
@@ -5333,6 +5742,98 @@ mod tests {
         assert!(h.state.lock().unwrap().pending_pause, "off-click uses the pause path");
         h.wait_for_fade().await;
         assert_eq!(h.reported_play_state(), PlayState::Paused, "knob past the floor pauses");
+    }
+
+    // After a knob detent SETTLES, logical_gain_db is re-derived from the rounded u8
+    // volume, so it lands slightly OFF the 3 dB grid (vol 79 = -6.14 dB, just below
+    // the -6 line). A knob-up must still climb a FULL detent (-6 -> -3 = vol 89),
+    // never plateau on the same rung by nudging only the sub-rung sliver. This is the
+    // realistic path the earlier test masks by only ever stepping up from -9.
+    #[tokio::test(start_paused = true)]
+    async fn knob_up_from_settled_rung_advances_a_full_detent() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // Descend two detents to the -6 dB rung, letting EACH settle so logical is
+        // the re-quantized off-grid value (exactly the state the finding hits).
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.wait_for_fade().await;
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        h.wait_for_fade().await;
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 79, "-6 dB rung");
+        let settled = h.state.lock().unwrap().logical_gain_db;
+        assert!(settled < -6.0, "settled just BELOW the -6 grid line: {settled}");
+        // Up one detent must reach the -3 dB rung (vol 89), never plateau at 79.
+        h.handle(MpdCommand::Knob(KnobDir::Up)).await;
+        h.wait_for_fade().await;
+        assert_eq!(
+            h.state.lock().unwrap().reported_volume(),
+            89,
+            "climbs a full detent from the off-grid settled rung, no plateau"
+        );
+    }
+
+    // The off-click fires from the REALISTIC settled bottom rung: after a real settle
+    // at the floor the committed logical is the u8-requantized value (vol 18 = -44.68
+    // dB, ABOVE the -45 floor line), yet a knob DOWN must still cross the floor and
+    // off-click to pause - not plateau just above it. (The other off-click test
+    // writes logical = -45.0 EXACTLY, a value a real settle never produces.)
+    #[tokio::test(start_paused = true)]
+    async fn knob_off_click_from_realistic_settled_floor() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            // The realistic post-settle state at the bottom rung: target_volume is
+            // the u8 (vol 18) and logical is its requantized dB (-44.68, above the
+            // -45 floor), exactly what setvol+settle leaves - not the -45.0 shortcut.
+            let v = db_to_mpv_volume(-45.0).round() as u8;
+            st.target_volume = v;
+            st.live_gain_db = mpv_volume_to_db(v as f64);
+            st.logical_gain_db = st.live_gain_db;
+            st.baseline_committed = true;
+            st.fading = false;
+        }
+        let logical = h.state.lock().unwrap().logical_gain_db;
+        assert!(logical > -45.0, "settled just ABOVE the floor (off-grid): {logical}");
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        assert!(
+            h.state.lock().unwrap().pending_pause,
+            "crosses the floor from the realistic settled rung and off-clicks to pause"
+        );
+        h.wait_for_fade().await;
+        assert_eq!(h.reported_play_state(), PlayState::Paused);
+    }
+
+    // A knob DOWN during a NON-committing fade (a gentle wake ramp climbing from
+    // silence) must step from the LIVE in-flight gain, not the STALE pre-sleep
+    // baseline still sitting in logical_gain_db. Stepping from the stale loud
+    // baseline would compute a target near full loudness and JUMP the volume UP - a
+    // startle that defeats the wake.
+    #[tokio::test(start_paused = true)]
+    async fn knob_down_mid_wake_steps_from_live_not_stale_baseline() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        // Simulate mid-wake: stale loud baseline (0 dB), quiet live gain (-30 dB),
+        // a non-committing fade in flight - exactly what a WakeTo/In install leaves
+        // (commit_logical = None => baseline_committed = false).
+        {
+            let mut st = h.state.lock().unwrap();
+            st.logical_gain_db = 0.0;
+            st.live_gain_db = -30.0;
+            st.fading = true;
+            st.baseline_committed = false;
+        }
+        h.handle(MpdCommand::Knob(KnobDir::Down)).await;
+        // The committed target is one detent BELOW the live -30 dB (a quiet -33),
+        // never a jump UP toward -3 dB / full loudness.
+        let committed = h.state.lock().unwrap().logical_gain_db;
+        assert!(
+            committed < -30.0,
+            "stepped down from the live quiet gain, not up from the stale baseline: {committed}"
+        );
     }
 
     // A knob-up while paused RESUMES - the same set_pause resume path as any other
@@ -5536,28 +6037,29 @@ mod tests {
         );
     }
 
-    // C2: a manual setvol against a running fade must leave NO surviving fade task
-    // and report EXACTLY the manual value - the cancel + the state mutation happen
-    // atomically under the slot lock, so there is no window a concurrent fade
-    // could clobber. Asserts the full post-condition: empty slot, fading cleared,
-    // exact volume.
+    // C2: a manual setvol against a running fade SUPERSEDES it (validate-before-
+    // abort) as its own glide, then - once the glide settles - leaves NO surviving
+    // fade task and reports the committed landing (within +/-1). The atomicity
+    // invariant still holds: the slot and the `fading` switch agree at the end.
     #[tokio::test(start_paused = true)]
     async fn setvol_leaves_no_surviving_fade() {
         let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().vol_dither_state = 0x00FF_1122_3344_5566;
         h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
         pump(250, 6).await;
         assert!(h.fade_active().await && h.live_gain_db() < 0.0);
 
-        // setvol from a second logical caller.
+        // setvol from a second logical caller: superseded the fade out, committed
+        // the landing at install, then run the glide out.
         h.handle(MpdCommand::SetVol(42)).await;
+        let committed = h.state.lock().unwrap().target_volume;
+        assert!((41..=43).contains(&committed), "landing in [41,43]: {committed}");
+        h.wait_for_fade().await;
 
-        // No fade task survives in the slot, the fade switch is cleared, and the
-        // reported/baseline volume is exactly the manual value.
-        assert!(!h.fade_active().await, "no surviving fade task");
         let st = h.state.lock().unwrap();
-        assert!(!st.fading, "fading switch cleared");
-        assert_eq!(st.target_volume, 42);
-        assert_eq!(st.reported_volume(), 42);
+        assert!(!st.fading, "fading switch cleared once the glide settled");
+        assert_eq!(st.target_volume, committed);
+        assert_eq!(st.reported_volume(), committed);
     }
 
     // A setvol that supersedes an in-flight PauseOut fade (before its Terminal::Pause
@@ -5575,13 +6077,18 @@ mod tests {
         assert_eq!(h.player.state(), PlayState::Playing, "mpv not frozen yet");
         assert_eq!(h.reported_play_state(), PlayState::Paused, "pending pause");
 
-        // setvol supersedes the pause fade before it froze mpv.
+        // setvol supersedes the pause fade before it froze mpv. The glide's install
+        // clears pending_pause SYNCHRONOUSLY (under the slot lock, like a manual
+        // commit), so the deck reports Playing IMMEDIATELY even while the glide is
+        // still animating - never stuck Paused with audio audible.
         h.handle(MpdCommand::SetVol(80)).await;
-        assert!(!h.fade_active().await, "no surviving fade");
         assert_eq!(h.player.state(), PlayState::Playing, "mpv still playing");
-        // The deck must report Playing, not stuck Paused, since audio is audible.
         assert_eq!(h.reported_play_state(), PlayState::Playing);
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 80);
+        let committed = h.state.lock().unwrap().target_volume;
+        assert!((79..=81).contains(&committed), "landing in [79,81]: {committed}");
+        h.wait_for_fade().await;
+        assert!(!h.state.lock().unwrap().fading, "the glide settled");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), committed);
     }
 
     // C2: even when a `fade` from a second logical caller races a setvol, the end
@@ -5592,6 +6099,7 @@ mod tests {
     async fn setvol_atomic_against_concurrent_fade() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         let h = Arc::new(h);
+        h.state.lock().unwrap().vol_dither_state = 0x7788_99AA_BBCC_DDEE;
         h.start_fade(fade_args(FadeKind::Out, 120)).await.unwrap();
         pump(250, 4).await;
 
@@ -5600,21 +6108,25 @@ mod tests {
             let _ = h2.start_fade(fade_args(FadeKind::To(60), 120)).await;
         });
         h.handle(MpdCommand::SetVol(20)).await;
+        let committed = h.state.lock().unwrap().target_volume;
         let _ = fade_fut.await;
-        // Let any surviving fade settle a tick.
+        // Run whatever fade owns the slot out to completion so nothing is mid-flight.
+        h.wait_for_fade().await;
         pump(250, 2).await;
 
-        let active = h.fade_active().await;
         let (fading, reported) = {
             let st = h.state.lock().unwrap();
             (st.fading, st.reported_volume())
         };
-        // Invariant: the `fading` switch is set IFF a fade task is installed.
-        assert_eq!(active, fading, "slot and fading switch must agree (no orphan)");
-        if !active {
-            // Manual won: reported is exactly the manual value, no dead envelope.
-            assert_eq!(reported, 20, "manual won -> exact manual volume");
-        }
+        // Once everything settles the `fading` switch is cleared (no dead envelope
+        // driving the reported volume), and the reported value is the settled
+        // baseline of whichever fade landed last: the glide landing (~20) or the
+        // To(60) target.
+        assert!(!fading, "no in-flight envelope after settle");
+        assert!(
+            reported == committed || (59..=60).contains(&reported),
+            "settled at the glide landing or the To(60) target: {reported}"
+        );
     }
 
     // C3: superseding a fade while its terminal window is near must not let the
@@ -5782,14 +6294,19 @@ mod tests {
     // resume_snapshot reflects the live queue + current + volume + play state, and
     // returns an OWNED struct with the state guard already dropped (no lock held
     // across the await in the async callers).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resume_snapshot_reflects_queue_and_state() {
         let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().vol_dither_state = 0x0102_0304_0506_0708;
         h.enqueue_song_for_test(mk_song("s1")).await;
         h.enqueue_stream_for_test(NTS).await;
         h.enqueue_song_for_test(mk_song("s2")).await;
         h.play_for_test(2).await;
+        // A volume set now GLIDES; run it out so the snapshot reads a settled level.
         h.mpris_set_volume(64).await;
+        h.wait_for_fade().await;
+        let vol = h.state.lock().unwrap().reported_volume();
+        assert!((63..=65).contains(&vol), "settled glide landing in [63,65]: {vol}");
 
         let snap = h.resume_snapshot(31.5);
         assert_eq!(snap.schema_version, RESUME_SCHEMA_VERSION);
@@ -5798,7 +6315,7 @@ mod tests {
         assert!(matches!(snap.queue[1], ResumeItem::Stream { .. }));
         assert_eq!(snap.queue[2], ResumeItem::Song { id: "s2".into() });
         assert_eq!(snap.current, Some(2));
-        assert_eq!(snap.volume, 64);
+        assert_eq!(snap.volume, vol);
         assert_eq!(snap.elapsed_secs, 31.5);
         assert_eq!(snap.play_state, ResumePlayState::Playing);
     }
@@ -6147,11 +6664,14 @@ mod tests {
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
     }
 
-    // A setvol DURING the dip cleanly cancels it: the target is NEVER loaded, the
-    // manual volume wins, pending_skip is cleared, and the OLD track keeps playing.
+    // A setvol DURING the dip cleanly SUPERSEDES it as a glide: the skip target is
+    // NEVER loaded (the dip's SkipLoad terminal never runs), pending_skip is
+    // cleared SYNCHRONOUSLY at the glide install, the OLD track keeps playing, and
+    // the glide settles at its landing.
     #[tokio::test(start_paused = true)]
     async fn setvol_during_skip_dip_cancels_cleanly() {
         let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().vol_dither_state = 0xABCD_1234_5678_90AB;
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Add(NTS.to_string())).await;
         h.handle(MpdCommand::Play(Some(0))).await;
@@ -6160,11 +6680,15 @@ mod tests {
         pump(20, 1).await;
         h.handle(MpdCommand::SetVol(30)).await;
 
-        assert!(!h.fade_active().await, "setvol cancels the dip");
-        assert_eq!(h.state.lock().unwrap().reported_volume(), 30);
+        // The glide's install already reconciled the deck: skip target abandoned.
         assert_eq!(h.state.lock().unwrap().current, Some(0), "target NOT loaded");
         assert_eq!(h.state.lock().unwrap().pending_skip, None);
         assert_eq!(h.player.state(), PlayState::Playing, "old track still playing");
+        let committed = h.state.lock().unwrap().target_volume;
+        assert!((29..=31).contains(&committed), "landing in [29,31]: {committed}");
+        h.wait_for_fade().await;
+        assert!(!h.state.lock().unwrap().fading, "the glide settled");
+        assert_eq!(h.state.lock().unwrap().reported_volume(), committed);
     }
 
     // A stop DURING the dip cleanly cancels it: the target is NEVER loaded, the

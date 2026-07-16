@@ -59,7 +59,7 @@ fn status_line(np: &NowPlaying) -> String {
     }
     if let Some(v) = np.volume {
         if v >= 0 {
-            bits.push(format!("vol {v}%"));
+            bits.push(volume_slider(v.min(100) as u8, 12));
         }
     }
     if let (Some(song), Some(m)) = (np.song, np.playlistlength) {
@@ -70,6 +70,69 @@ fn status_line(np: &NowPlaying) -> String {
         bits.push(format!("{}:{:02}", total / 60, total % 60));
     }
     bits.join(" | ")
+}
+
+/// Render volume as a physical horizontal FADER: `[==#-----] V%`. `width` is the
+/// number of inner track cells; the `#` thumb slides across them proportional to
+/// `vol` (0..=100). A fader (not a round dial) maps 1:1 to a physical fader's
+/// travel, needs only one row, reflows with pane width, and its thumb visibly
+/// slides as the reported volume tracks a glide envelope. ASCII-safe glyphs
+/// (`[`, `]`, `=`, `#`, `-`) so terminals without good unicode still render it.
+/// Pure and deterministic - unit-tested below.
+fn volume_slider(vol: u8, width: usize) -> String {
+    let vol = vol.min(100);
+    // At least one cell so the thumb always has a home.
+    let width = width.max(1);
+    // Thumb cell index in [0, width-1], proportional to vol.
+    let pos = ((vol as f64 / 100.0) * (width as f64 - 1.0)).round() as usize;
+    let pos = pos.min(width - 1);
+    let filled = "=".repeat(pos);
+    let empty = "-".repeat(width - 1 - pos);
+    format!("[{filled}#{empty}] {vol}%")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_slider;
+
+    #[test]
+    fn thumb_hard_left_at_zero() {
+        // vol 0 -> thumb at the very first cell, no fill before it.
+        assert_eq!(volume_slider(0, 12), "[#-----------] 0%");
+    }
+
+    #[test]
+    fn thumb_hard_right_at_full() {
+        // vol 100 -> thumb at the last cell, everything before it filled.
+        assert_eq!(volume_slider(100, 12), "[===========#] 100%");
+    }
+
+    #[test]
+    fn thumb_centered_at_half() {
+        let s = volume_slider(50, 12);
+        // 12 inner cells, pos = round(0.5 * 11) = 6 (6 filled, thumb, 5 empty).
+        assert_eq!(s, "[======#-----] 50%");
+    }
+
+    #[test]
+    fn exact_cell_counts_and_percent_suffix() {
+        let s = volume_slider(30, 12);
+        assert!(s.ends_with(" 30%"), "percent suffix present: {s}");
+        let inner = &s[1..s.find(']').unwrap()];
+        assert_eq!(inner.chars().count(), 12, "inner track is exactly `width` cells");
+        assert_eq!(inner.chars().filter(|&c| c == '#').count(), 1, "exactly one thumb");
+    }
+
+    #[test]
+    fn thumb_position_monotonic_non_decreasing() {
+        let mut last = 0usize;
+        for v in 0..=100u8 {
+            let s = volume_slider(v, 12);
+            let pos = s.find('#').unwrap();
+            assert!(pos >= last, "thumb never moves left as vol rises (v={v})");
+            last = pos;
+        }
+    }
 }
 
 fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {

@@ -136,6 +136,15 @@ pub struct FadeConfig {
     /// startle safety requires. Normalized into `[min_slew_s, max_dur_secs]`.
     #[serde(default = "d_skip_fade_s")]
     pub skip_fade_secs: f64,
+    /// Duration of the graduated absolute-volume GLIDE fade, SECONDS (a float,
+    /// like `pause_fade_secs`). A manual `setvol` / MPRIS Volume set GLIDES to the
+    /// target over this span (never snaps), like a hand moving a knob. Distinct
+    /// from `pause_fade_secs` so the setvol feel is tunable independently of the
+    /// pause ramp. Kept SHORT (default ~0.4s); a large span (e.g. 0 -> 100) still
+    /// extends past it via the deliberate 3 dB/step clamp so it stays startle-safe.
+    /// Normalized into `[min_slew_s, max_dur_secs]`.
+    #[serde(default = "d_glide_fade_s")]
+    pub glide_fade_secs: f64,
 }
 
 // Research-backed defaults (memory 01kxhjqr). Exposed as `pub const` so the fade
@@ -154,6 +163,7 @@ pub const DEFAULT_SHUTDOWN_FADE_SECS: u64 = 6;
 pub const DEFAULT_RESTART_FADE_SECS: u64 = 5;
 pub const DEFAULT_PAUSE_FADE_SECS: f64 = 0.5;
 pub const DEFAULT_SKIP_FADE_SECS: f64 = 0.35;
+pub const DEFAULT_GLIDE_FADE_SECS: f64 = 0.4;
 
 /// Positive minimum for `step_size_db`. A `0` (or negative) step would divide by
 /// zero in [`crate::fade::FadeSpec::new`]'s sub-JND path (`range / step_size` ->
@@ -182,6 +192,7 @@ fn d_shutdown_fade_s() -> u64 { DEFAULT_SHUTDOWN_FADE_SECS }
 fn d_restart_fade_s() -> u64 { DEFAULT_RESTART_FADE_SECS }
 fn d_pause_fade_s() -> f64 { DEFAULT_PAUSE_FADE_SECS }
 fn d_skip_fade_s() -> f64 { DEFAULT_SKIP_FADE_SECS }
+fn d_glide_fade_s() -> f64 { DEFAULT_GLIDE_FADE_SECS }
 
 impl FadeConfig {
     /// Clamp every knob into its safe range at LOAD time, logging any correction,
@@ -326,6 +337,11 @@ impl FadeConfig {
             self.skip_fade_secs = DEFAULT_SKIP_FADE_SECS;
         }
         self.skip_fade_secs = self.skip_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
+        // The glide fade is the same FLOAT-second shape as the pause fade.
+        if !self.glide_fade_secs.is_finite() {
+            self.glide_fade_secs = DEFAULT_GLIDE_FADE_SECS;
+        }
+        self.glide_fade_secs = self.glide_fade_secs.clamp(pause_lo, self.max_dur_secs as f64);
     }
 }
 
@@ -346,6 +362,7 @@ impl Default for FadeConfig {
             restart_fade_secs: DEFAULT_RESTART_FADE_SECS,
             pause_fade_secs: DEFAULT_PAUSE_FADE_SECS,
             skip_fade_secs: DEFAULT_SKIP_FADE_SECS,
+            glide_fade_secs: DEFAULT_GLIDE_FADE_SECS,
         }
     }
 }
