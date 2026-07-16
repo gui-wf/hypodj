@@ -3,6 +3,11 @@
 , pkg-config
 , mpv-unwrapped
 , makeWrapper
+# DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
+# the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
+# no .git, so this is what `hypodj --version` shows).
+, buildInfo ? ""
+, cargoVersion ? "0.1.0"
 }:
 
 # Plain Cargo workspace with a committed Cargo.lock -> buildRustPackage is the
@@ -10,7 +15,7 @@
 # probe/play-probe are dev-only provers.
 rustPlatform.buildRustPackage {
   pname = "hypodj";
-  version = "0.1.0";
+  version = cargoVersion;
 
   src = lib.cleanSource ../.;
 
@@ -39,9 +44,12 @@ rustPlatform.buildRustPackage {
   # binary fails in ld.so at exec, BEFORE main() - the NullPlayer fallback (which
   # only covers an Mpv::init Err) never runs. LD_LIBRARY_PATH points at the dir
   # that actually contains libmpv.so.2.
+  # --set-default so an explicit runtime HYPODJ_BUILD_INFO still wins; the baked
+  # value is what makes `--version` show the hash on a nix build (no .git here).
   postInstall = ''
     wrapProgram $out/bin/hypodj \
-      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]}
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
+      --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
   '';
 
   meta = {

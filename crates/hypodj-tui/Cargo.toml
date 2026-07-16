@@ -1,6 +1,6 @@
 [package]
 name = "dj-gui"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -25,7 +25,13 @@ path = "src/main.rs"
 default = ["cc"]
 cc = ["dep:hypodj-nl"]
 
+[build-dependencies]
+# emit() from build.rs: bakes HYPODJ_BUILD_INFO for the enriched `dj-gui --version`.
+hypodj-build-info = { path = "../hypodj-build-info" }
+
 [dependencies]
+# compose() at print time for `dj-gui --version`.
+hypodj-build-info = { path = "../hypodj-build-info" }
 hypodj-client = { path = "../hypodj-client" }
 hypodj-nl = { path = "../hypodj-nl", optional = true, default-features = false, features = ["cc"] }
 ratatui.workspace = true

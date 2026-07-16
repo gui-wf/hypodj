@@ -1,6 +1,6 @@
 [package]
 name = "hypodj-daemon"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -30,7 +30,13 @@ path = "src/bin/play_probe.rs"
 llm = ["hypodj-nl/llm"]
 llm-llama = ["hypodj-nl/llm-llama"]
 
+[build-dependencies]
+# emit() from build.rs: bakes HYPODJ_BUILD_INFO for the enriched --version.
+hypodj-build-info = { path = "../hypodj-build-info" }
+
 [dependencies]
+# compose() at print time for `hypodj --version`.
+hypodj-build-info = { path = "../hypodj-build-info" }
 hypodj-core = { path = "../hypodj-core" }
 # The NL translator, model-free by default (default-features = false); the `llm`
 # feature is re-exported above so the model backend is opt-in only.
