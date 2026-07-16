@@ -7,9 +7,14 @@ members = [
     "crates/hypodj-cli",
     "crates/hypodj-client",
     "crates/hypodj-tui",
+    "crates/hypodj-build-info",
 ]
 
 [workspace.package]
+# One semver for the whole workspace, bumped in exactly one place at release.
+# Member crates inherit via `version.workspace = true`; display-time enrichment
+# (commits-since-tag + short hash) is layered on by hypodj-build-info.
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"

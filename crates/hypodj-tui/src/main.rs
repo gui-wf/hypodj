@@ -47,6 +47,30 @@ const REFRESH_SAFETY: Duration = Duration::from_secs(5);
 const KNOB_STEP: i32 = 5;
 
 fn main() {
+    // --version/--help short-circuit before the terminal is taken over. Enriched
+    // display version: base semver + commits-since-tag + git short hash on source
+    // builds (bare semver otherwise).
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-V" | "--version" => {
+                println!(
+                    "dj-gui {}",
+                    hypodj_build_info::version(
+                        env!("CARGO_PKG_VERSION"),
+                        option_env!("HYPODJ_BUILD_INFO"),
+                    )
+                );
+                return;
+            }
+            "-h" | "--help" => {
+                println!(
+                    "dj-gui - hypodj interactive TUI\n\nUSAGE:\n  dj-gui            launch the jukebox TUI\n\nOPTIONS:\n  -h, --help    this help\n  -V, --version print version and exit"
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
     if let Err(e) = run() {
         eprintln!("hypodj-tui: {e}");
         std::process::exit(1);

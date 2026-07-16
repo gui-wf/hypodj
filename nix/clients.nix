@@ -3,6 +3,11 @@
 , pkg-config
 , mpv-unwrapped
 , makeWrapper
+# DISPLAY-only enrichment (from flake.nix): the semver read from Cargo.toml and
+# the HYPODJ_BUILD_INFO grammar baked into the runtime env (the nix sandbox has
+# no .git, so this is what `dj --version` / `dj-gui --version` shows).
+, buildInfo ? ""
+, cargoVersion ? "0.1.0"
 }:
 
 # The HypoDJ clients: the `dj` jukebox CLI and the `dj-gui` interactive TUI.
@@ -22,7 +27,7 @@
 # off-surface rejection) execute.
 rustPlatform.buildRustPackage {
   pname = "hypodj-clients";
-  version = "0.1.0";
+  version = cargoVersion;
 
   src = lib.cleanSource ../.;
 
@@ -47,10 +52,13 @@ rustPlatform.buildRustPackage {
   # with no link-search, so the RPATH is not reliably baked. Wrap both bins so
   # ld.so finds libmpv.so.2 at exec (the clients never call the player, but the
   # hard DT_NEEDED must still resolve).
+  # --set-default so an explicit runtime HYPODJ_BUILD_INFO still wins; the baked
+  # value is what makes `--version` show the hash on a nix build (no .git here).
   postInstall = ''
     for b in dj dj-gui; do
       wrapProgram $out/bin/$b \
-        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]}
+        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]} \
+        --set-default HYPODJ_BUILD_INFO ${lib.escapeShellArg buildInfo}
     done
   '';
 

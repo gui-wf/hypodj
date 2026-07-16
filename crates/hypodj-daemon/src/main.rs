@@ -44,7 +44,15 @@ async fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "-V" | "--version" => {
-                println!("hypodj {}", env!("CARGO_PKG_VERSION"));
+                // Enriched display version: base semver + commits-since-tag +
+                // git short hash on source builds (bare semver otherwise).
+                println!(
+                    "hypodj {}",
+                    hypodj_build_info::version(
+                        env!("CARGO_PKG_VERSION"),
+                        option_env!("HYPODJ_BUILD_INFO"),
+                    )
+                );
                 return Ok(());
             }
             _ => {}

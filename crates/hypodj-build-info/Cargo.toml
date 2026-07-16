@@ -1,0 +1,11 @@
+[package]
+name = "hypodj-build-info"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# Display-only version enrichment. A leaf crate with no dependencies: it is used
+# both as a build-dependency (emit() from a binary crate's build.rs) and as a
+# normal dependency (compose() at print time). Never fails the build.
+[dependencies]

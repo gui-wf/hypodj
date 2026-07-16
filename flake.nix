@@ -15,12 +15,40 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+
+        # The released semver, read from the workspace manifest so the derivation
+        # version tracks the tag and is bumped in exactly one place at release.
+        cargoVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
+        # DISPLAY-only build info baked into the runtime env of the wrapped bins,
+        # so a nix-built binary (no .git in the sandbox) still shows its short
+        # hash via `--version`. Mirrors the HYPODJ_BUILD_INFO grammar emitted by
+        # the build.rs on source builds: `count=<N> hash=<short> dirty=<0|1>`.
+        #
+        # - biHash: bare short commit hash. self.dirtyShortRev carries a trailing
+        #   "-dirty" suffix, so strip it - the dirty state is carried by biDirty.
+        #   Parens are load-bearing: `or` binds looser than function application.
+        # - biDirty: a clean tree exposes self.rev; a dirty one does not.
+        # - anchor: optional released-commit revCount (nix/release-anchor.nix); it
+        #   lets count= be commits-since-release. Omitted (no count=) when absent.
+        anchor = if builtins.pathExists ./nix/release-anchor.nix then import ./nix/release-anchor.nix else null;
+        biHash = self.shortRev or (nixpkgs.lib.removeSuffix "-dirty" (self.dirtyShortRev or ""));
+        biDirty = !(self ? rev);
+        biCount = if (self ? revCount) && anchor != null then self.revCount - anchor.revCount else null;
+        buildInfo =
+          if biHash == "" then
+            ""
+          else
+            nixpkgs.lib.concatStringsSep " " (
+              (nixpkgs.lib.optional (biCount != null && biCount >= 0) "count=${toString biCount}")
+              ++ [ "hash=${biHash}" "dirty=${if biDirty then "1" else "0"}" ]
+            );
       in
       {
-        packages.hypodj = pkgs.callPackage ./nix/package.nix { };
+        packages.hypodj = pkgs.callPackage ./nix/package.nix { inherit buildInfo cargoVersion; };
         # The client bins (dj + dj-gui) - libmpv-free, so a separate, lighter
         # derivation that a workstation can install without pulling mpv.
-        packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { };
+        packages.hypodj-clients = pkgs.callPackage ./nix/clients.nix { inherit buildInfo cargoVersion; };
         packages.default = self.packages.${system}.hypodj;
 
         apps.hypodj = {

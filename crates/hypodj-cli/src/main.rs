@@ -32,6 +32,7 @@ OPTIONS:
   --port <p>    daemon port (default 6600, matches the live deploy; a DEV daemon
                 defaults to 6601 - point at it with HYPODJ_PORT=6601)
   -h, --help    this help
+  -V, --version print version and exit
 
 CONFIG precedence: flags > HYPODJ_HOST/HYPODJ_PORT > MPD_HOST/MPD_PORT
                    > 127.0.0.1:6600
@@ -39,6 +40,18 @@ CONFIG precedence: flags > HYPODJ_HOST/HYPODJ_PORT > MPD_HOST/MPD_PORT
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    // --version short-circuits before any socket work. Enriched display version:
+    // base semver + commits-since-tag + git short hash on source builds.
+    if raw.iter().any(|a| a == "-V" || a == "--version") {
+        println!(
+            "dj {}",
+            hypodj_build_info::version(
+                env!("CARGO_PKG_VERSION"),
+                option_env!("HYPODJ_BUILD_INFO"),
+            )
+        );
+        return;
+    }
     match run(raw) {
         Ok(()) => {}
         Err(e) => {
