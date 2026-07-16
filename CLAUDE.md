@@ -45,6 +45,17 @@ nix develop --command cargo test  -j4 --workspace
 - **Time-based code is always fake-clocked.** Fades, timers, and the executor use
   `clock.rs` and `#[tokio::test(start_paused)]`, NEVER wall-clock (flaky). Apply
   the pattern to any new time-dependent logic before writing it.
+- **After touching a shared crate (`hypodj-core`/`hypodj-client`) or any
+  cross-crate enum/type, build AND test the WHOLE `--workspace`, never just
+  `-p <crate>`.** A new enum variant (e.g. an `Action`/`MpdCommand` case) breaks
+  another crate's exhaustive `match` (this broke the `dj-gui` build once).
+- **Devshell `cargo test` green does NOT mean the Nix package builds.**
+  `nix/package.nix` and `nix/clients.nix` run `doCheck` with `-p hypodj-core` in a
+  CERTLESS, network-less sandbox where `handler_with_null_player()` returns `None`.
+  Tests using it MUST skip via `let Some((h, _)) = handler_with_null_player() else
+  { return };` - NEVER `.unwrap()` the `Option` (an unwrap panics in the sandbox
+  and fails the build while the devshell stays green). Run `nix build .#hypodj` (or
+  `nixos-rebuild build`) before calling a change deploy-ready.
 
 ## Deploy (human-gated - an agent cannot finish it)
 
