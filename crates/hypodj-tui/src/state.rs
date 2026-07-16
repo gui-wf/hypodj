@@ -44,6 +44,62 @@ pub fn scroll_offset(sel: usize, n: usize, h: usize, prev: usize) -> usize {
     off.min(max_off)
 }
 
+/// Group a server browse pair list into rows. A `directory:` pair starts a dir row
+/// (label refined by a following `Album`/`Artist`/`Genre` value, else the path
+/// tail); a `file:` pair starts a song row (label from `Title`, with ` - <artist>`
+/// appended); a `playlist:` pair becomes a name row for the Playlists screen. Pure
+/// and testable - mirrors the boundary logic of client model.rs::group_blocks.
+pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
+    let mut rows: Vec<BrowseRow> = Vec::new();
+    for (k, v) in pairs {
+        match k.as_str() {
+            "directory" => rows.push(BrowseRow {
+                label: path_tail(v).to_string(),
+                uri: v.clone(),
+                is_dir: true,
+            }),
+            "file" => rows.push(BrowseRow {
+                label: path_tail(v).to_string(),
+                uri: v.clone(),
+                is_dir: false,
+            }),
+            "playlist" => rows.push(BrowseRow {
+                label: v.clone(),
+                uri: v.clone(),
+                is_dir: false,
+            }),
+            "Album" | "Genre" => {
+                if let Some(last) = rows.last_mut() {
+                    if last.is_dir {
+                        last.label = v.clone();
+                    }
+                }
+            }
+            "Title" => {
+                if let Some(last) = rows.last_mut() {
+                    if !last.is_dir {
+                        last.label = v.clone();
+                    }
+                }
+            }
+            "Artist" => {
+                if let Some(last) = rows.last_mut() {
+                    if !last.is_dir {
+                        last.label = format!("{} - {}", last.label, v);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// The last `/`-separated segment of a browse path, used as a fallback row label.
+fn path_tail(p: &str) -> &str {
+    p.rsplit('/').next().unwrap_or(p)
+}
+
 /// Which input surface has focus.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -67,6 +123,76 @@ pub struct Pending {
     pub trust: Option<String>,
 }
 
+/// Which main view is showing. Queue is the live-refreshed default; Albums and
+/// Playlists are lazily-fetched browse screens.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Screen {
+    Queue,
+    Albums,
+    Playlists,
+}
+
+/// One row in a browse list. `uri` is the server browse path (`album/<id>`,
+/// `song/<id>`, `list/<name>`) for Albums, or the playlist NAME for Playlists.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct BrowseRow {
+    pub label: String,
+    pub uri: String,
+    pub is_dir: bool,
+}
+
+/// A self-contained browse list with its own cursor, scroll offset, nav stack, and
+/// lazy-fetch guard. One per browse screen so cursors are independent.
+#[derive(Debug)]
+pub struct Browse {
+    pub rows: Vec<BrowseRow>,
+    pub selected: usize,
+    /// The lsinfo path this list currently shows (root default per screen).
+    pub path: String,
+    /// Display title for the pane header.
+    pub title: String,
+    /// (path, cursor) of each ancestor level, for BrowseBack.
+    pub stack: Vec<(String, usize)>,
+    /// Lazy-fetch guard: false until the first ShowScreen fetch lands.
+    pub loaded: bool,
+    /// Top visible row for the scrolloff viewport (see [`scroll_offset`]).
+    pub offset: Cell<usize>,
+}
+
+impl Browse {
+    fn new(path: &str, title: &str) -> Self {
+        Browse {
+            rows: Vec::new(),
+            selected: 0,
+            path: path.to_string(),
+            title: title.to_string(),
+            stack: Vec::new(),
+            loaded: false,
+            offset: Cell::new(0),
+        }
+    }
+
+    /// Replace the rows for a freshly-fetched level, resetting cursor + scroll.
+    pub fn apply(&mut self, rows: Vec<BrowseRow>, path: String, title: String) {
+        self.rows = rows;
+        self.selected = 0;
+        self.offset.set(0);
+        self.path = path;
+        self.title = title;
+        self.loaded = true;
+    }
+
+    fn move_selection(&mut self, delta: i32) {
+        if self.rows.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.rows.len() - 1;
+        let next = self.selected as i32 + delta;
+        self.selected = next.clamp(0, last as i32) as usize;
+    }
+}
+
 /// The side-effecting request handle_key emits for the event loop to run. IO lives
 /// entirely in the loop; the state machine only ever returns one of these.
 #[derive(Debug, PartialEq, Eq)]
@@ -81,6 +207,16 @@ pub enum Intent {
     ConfirmArm,
     /// Cancel the pending plan.
     ConfirmCancel,
+    /// Switch the main view; main.rs lazily fetches the screen if not loaded.
+    ShowScreen(Screen),
+    /// Drill into a browse directory (fetch its children via lsinfo <uri>).
+    BrowseInto(String),
+    /// Pop one browse level and re-fetch the parent.
+    BrowseBack,
+    /// Enqueue a browse uri (`add <uri>`), optionally play the new tail.
+    Enqueue { uri: String, play: bool },
+    /// Load a playlist by name (`load <name>`), appending to the queue.
+    LoadPlaylist(String),
     /// Leave the session.
     Quit,
 }
@@ -89,6 +225,12 @@ pub struct TuiState {
     pub now: NowPlaying,
     pub queue: Vec<QueueItem>,
     pub selected: usize,
+    /// The active main view.
+    pub screen: Screen,
+    /// The Albums browse screen (seeded from the `list/newest` smart list).
+    pub albums: Browse,
+    /// The Playlists browse screen (server currently exposes only `Starred`).
+    pub playlists: Browse,
     /// Top visible queue row, derived in render (where the viewport height is
     /// known) via [`scroll_offset`] and persisted here so scroll state survives
     /// across frames. Interior-mutable so the render (which holds `&TuiState`)
@@ -107,6 +249,9 @@ impl Default for TuiState {
             now: NowPlaying::default(),
             queue: Vec::new(),
             selected: 0,
+            screen: Screen::Queue,
+            albums: Browse::new("list/newest", "Albums (newest)"),
+            playlists: Browse::new("", "Playlists"),
             offset: Cell::new(0),
             mode: Mode::Normal,
             input: String::new(),
@@ -147,6 +292,10 @@ impl TuiState {
         self.connected = false;
         self.pending = None;
         self.mode = Mode::Normal;
+        // Browse caches were fetched on the dead socket; drop them so a reconnect
+        // re-fetches on the next screen visit.
+        self.albums.loaded = false;
+        self.playlists.loaded = false;
         self.status_msg = Some("connection lost - reconnecting...".to_string());
     }
 
@@ -219,10 +368,22 @@ impl TuiState {
                 None
             }
             KeyCode::Char('f') => self.favorite_selected(),
-            KeyCode::Enter => self
-                .queue
-                .get(self.selected)
-                .map(|it| Intent::Command(format!("play {}", it.pos))),
+            // Screen switch: 1/2/3 select the view; main.rs lazily fetches it.
+            KeyCode::Char('1') => {
+                self.screen = Screen::Queue;
+                Some(Intent::ShowScreen(Screen::Queue))
+            }
+            KeyCode::Char('2') => {
+                self.screen = Screen::Albums;
+                Some(Intent::ShowScreen(Screen::Albums))
+            }
+            KeyCode::Char('3') => {
+                self.screen = Screen::Playlists;
+                Some(Intent::ShowScreen(Screen::Playlists))
+            }
+            // Back out of a browse drill-down (Queue: no-op).
+            KeyCode::Char('h') | KeyCode::Left => self.browse_back(),
+            KeyCode::Enter => self.enter_action(),
             KeyCode::Char('/') | KeyCode::Char(':') => {
                 self.mode = Mode::Command;
                 self.input.clear();
@@ -233,17 +394,69 @@ impl TuiState {
         }
     }
 
-    /// Jump the selection to the top of the queue (no-op on an empty queue).
-    fn go_top(&mut self) {
-        if !self.queue.is_empty() {
-            self.selected = 0;
+    /// The active screen's browse list, if the active screen is a browse screen.
+    pub fn active_browse(&mut self) -> Option<&mut Browse> {
+        match self.screen {
+            Screen::Queue => None,
+            Screen::Albums => Some(&mut self.albums),
+            Screen::Playlists => Some(&mut self.playlists),
         }
     }
 
-    /// Jump the selection to the last row (no-op on an empty queue).
+    /// Jump the selection to the top of the active list (no-op when empty).
+    fn go_top(&mut self) {
+        match self.active_browse() {
+            Some(b) if !b.rows.is_empty() => b.selected = 0,
+            Some(_) => {}
+            None => {
+                if !self.queue.is_empty() {
+                    self.selected = 0;
+                }
+            }
+        }
+    }
+
+    /// Jump the selection to the last row of the active list (no-op when empty).
     fn go_bottom(&mut self) {
-        if !self.queue.is_empty() {
-            self.selected = self.queue.len() - 1;
+        match self.active_browse() {
+            Some(b) if !b.rows.is_empty() => b.selected = b.rows.len() - 1,
+            Some(_) => {}
+            None => {
+                if !self.queue.is_empty() {
+                    self.selected = self.queue.len() - 1;
+                }
+            }
+        }
+    }
+
+    /// Enter behaviour per screen: Queue plays the selected row; Albums drills into
+    /// a directory or enqueues+plays a song; Playlists loads the selected playlist.
+    fn enter_action(&mut self) -> Option<Intent> {
+        match self.screen {
+            Screen::Queue => self
+                .queue
+                .get(self.selected)
+                .map(|it| Intent::Command(format!("play {}", it.pos))),
+            Screen::Albums => {
+                let row = self.albums.rows.get(self.albums.selected)?;
+                if row.is_dir {
+                    Some(Intent::BrowseInto(row.uri.clone()))
+                } else {
+                    Some(Intent::Enqueue { uri: row.uri.clone(), play: true })
+                }
+            }
+            Screen::Playlists => {
+                let row = self.playlists.rows.get(self.playlists.selected)?;
+                Some(Intent::LoadPlaylist(row.uri.clone()))
+            }
+        }
+    }
+
+    /// Back out one browse level; only on a browse screen with a non-empty stack.
+    fn browse_back(&mut self) -> Option<Intent> {
+        match self.active_browse() {
+            Some(b) if !b.stack.is_empty() => Some(Intent::BrowseBack),
+            _ => None,
         }
     }
 
@@ -264,8 +477,13 @@ impl TuiState {
         }
     }
 
-    /// Move the queue selection with clamping (no wrap).
+    /// Move the ACTIVE screen's selection with clamping (no wrap). Queue moves
+    /// `self.selected`; browse screens move their own cursor.
     fn move_selection(&mut self, delta: i32) {
+        if let Some(b) = self.active_browse() {
+            b.move_selection(delta);
+            return;
+        }
         if self.queue.is_empty() {
             self.selected = 0;
             return;
@@ -569,6 +787,110 @@ mod tests {
         let p = s.pending.as_ref().unwrap();
         assert_eq!(p.command, Some("clear".to_string()));
         assert_eq!(p.token, None);
+    }
+
+    fn brow(label: &str, uri: &str, is_dir: bool) -> BrowseRow {
+        BrowseRow { label: label.into(), uri: uri.into(), is_dir }
+    }
+
+    #[test]
+    fn screen_switch_keys_set_screen_and_intent() {
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('2')), Some(Intent::ShowScreen(Screen::Albums)));
+        assert_eq!(s.screen, Screen::Albums);
+        assert_eq!(s.handle_key(ch('3')), Some(Intent::ShowScreen(Screen::Playlists)));
+        assert_eq!(s.screen, Screen::Playlists);
+        assert_eq!(s.handle_key(ch('1')), Some(Intent::ShowScreen(Screen::Queue)));
+        assert_eq!(s.screen, Screen::Queue);
+    }
+
+    #[test]
+    fn nav_moves_active_screen_cursor() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1), item(2)]);
+        s.albums.rows = vec![brow("a", "album/1", true), brow("b", "album/2", true), brow("c", "album/3", true)];
+        s.screen = Screen::Albums;
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 1);
+        s.handle_key(ch('j'));
+        s.handle_key(ch('j')); // clamp, no wrap
+        assert_eq!(s.albums.selected, 2);
+        s.handle_key(ch('k'));
+        assert_eq!(s.albums.selected, 1);
+        // Queue cursor untouched.
+        assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn enter_is_contextual_per_screen() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(4), item(5)]);
+        s.selected = 1;
+        // Queue: play selected pos.
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::Command("play 5".into())));
+        // Albums dir -> BrowseInto; song -> Enqueue.
+        s.albums.rows = vec![brow("X", "album/9", true), brow("song", "song/7", false)];
+        s.screen = Screen::Albums;
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::BrowseInto("album/9".into())));
+        s.albums.selected = 1;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Enqueue { uri: "song/7".into(), play: true })
+        );
+        // Playlists -> LoadPlaylist(name).
+        s.playlists.rows = vec![brow("Starred", "Starred", false)];
+        s.screen = Screen::Playlists;
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::LoadPlaylist("Starred".into())));
+    }
+
+    #[test]
+    fn browse_back_needs_stack_and_screen() {
+        let mut s = TuiState::new();
+        // Queue: h is a no-op.
+        assert_eq!(s.handle_key(ch('h')), None);
+        s.screen = Screen::Albums;
+        // No stack yet -> no-op.
+        assert_eq!(s.handle_key(ch('h')), None);
+        s.albums.stack.push(("list/newest".into(), 0));
+        assert_eq!(s.handle_key(ch('h')), Some(Intent::BrowseBack));
+        assert_eq!(s.handle_key(key(KeyCode::Left)), Some(Intent::BrowseBack));
+    }
+
+    #[test]
+    fn transport_keys_work_on_every_screen() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        assert_eq!(s.handle_key(ch(' ')), Some(Intent::Command("seekcur +5".into())));
+        assert_eq!(s.handle_key(ch('p')), Some(Intent::Command("pause".into())));
+        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("stop".into())));
+        assert_eq!(s.handle_key(ch('>')), Some(Intent::Command("next".into())));
+        assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("knob up".into())));
+    }
+
+    #[test]
+    fn empty_browse_enter_and_move_noop() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Albums;
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), None);
+        s.handle_key(ch('j'));
+        assert_eq!(s.albums.selected, 0);
+    }
+
+    #[test]
+    fn parse_browse_groups_dirs_songs_playlists() {
+        let pairs: Vec<(String, String)> = vec![
+            ("directory".into(), "album/1".into()),
+            ("Album".into(), "X".into()),
+            ("file".into(), "song/9".into()),
+            ("Title".into(), "T".into()),
+            ("Artist".into(), "A".into()),
+            ("playlist".into(), "Starred".into()),
+        ];
+        let rows = parse_browse(&pairs);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true });
+        assert_eq!(rows[1], BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false });
+        assert_eq!(rows[2], BrowseRow { label: "Starred".into(), uri: "Starred".into(), is_dir: false });
     }
 
     #[test]

@@ -9,20 +9,78 @@ use ratatui::Frame;
 
 use hypodj_client::model::NowPlaying;
 
-use crate::state::{Mode, TuiState};
+use crate::state::{Browse, Mode, Screen, TuiState};
 
-/// Draw the full jukebox: now-playing pane, queue list, command/confirm line.
+/// Draw the full jukebox: now-playing pane, a screen-tab row, the active list
+/// (Queue/Albums/Playlists), and the command/confirm line.
 pub fn render(f: &mut Frame, state: &TuiState) {
     let chunks = Layout::vertical([
         Constraint::Length(5),
+        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(3),
     ])
     .split(f.area());
 
     render_now(f, chunks[0], &state.now);
-    render_queue(f, chunks[1], state);
-    render_command(f, chunks[2], state);
+    render_tabs(f, chunks[1], state.screen);
+    match state.screen {
+        Screen::Queue => render_queue(f, chunks[2], state),
+        Screen::Albums => render_browse(f, chunks[2], &state.albums),
+        Screen::Playlists => render_browse(f, chunks[2], &state.playlists),
+    }
+    render_command(f, chunks[3], state);
+}
+
+/// A one-line tab strip: the active screen is REVERSED, the rest dim.
+fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
+    let labels = [
+        (Screen::Queue, "[1]Queue"),
+        (Screen::Albums, "[2]Albums"),
+        (Screen::Playlists, "[3]Playlists"),
+    ];
+    let mut spans = Vec::new();
+    for (i, (s, label)) in labels.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if *s == screen {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        spans.push(Span::styled(*label, style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The terminal window/tab title for the current now-playing snapshot, emitted via
+/// OSC (crossterm `SetTitle`). "HypoDJ" when stopped or nothing is playing;
+/// "HypoDJ - <artist> - <title>" when both are known; "HypoDJ - <title>" when only
+/// the title is. Pure and testable - mirrors the stopped/empty test in render_now.
+pub fn window_title(np: &NowPlaying) -> String {
+    let stopped = np.state.as_deref() == Some("stop");
+    let empty = np.title.is_none() && np.artist.is_none();
+    if stopped || empty {
+        return "HypoDJ".to_string();
+    }
+    let artist = np.artist.as_deref().map(sanitize_title);
+    let title = np.title.as_deref().map(sanitize_title);
+    match (artist, title) {
+        (Some(a), Some(t)) => format!("HypoDJ - {a} - {t}"),
+        (None, Some(t)) => format!("HypoDJ - {t}"),
+        _ => "HypoDJ".to_string(),
+    }
+}
+
+/// Strip control characters from an MPD tag before it reaches the OSC window
+/// title. crossterm `SetTitle` wraps the string as `ESC]0;<title>BEL`, so an
+/// embedded BEL (0x07) or ESC (0x1b) in an artist/title tag would terminate the
+/// OSC early and let the terminal interpret the trailing bytes as raw
+/// output/escape sequences (title injection). Dropping every control char
+/// (including newlines/tabs) keeps only printable text.
+fn sanitize_title(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
 }
 
 fn render_now(f: &mut Frame, area: ratatui::layout::Rect, np: &NowPlaying) {
@@ -93,7 +151,56 @@ fn volume_slider(vol: u8, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::volume_slider;
+    use super::{volume_slider, window_title};
+    use hypodj_client::model::NowPlaying;
+
+    #[test]
+    fn window_title_default_and_stopped_are_plain() {
+        // Empty now-playing -> plain product name.
+        assert_eq!(window_title(&NowPlaying::default()), "HypoDJ");
+        // Explicitly stopped, even with tags, is plain.
+        let np = NowPlaying {
+            state: Some("stop".into()),
+            title: Some("T".into()),
+            artist: Some("A".into()),
+            ..NowPlaying::default()
+        };
+        assert_eq!(window_title(&np), "HypoDJ");
+    }
+
+    #[test]
+    fn window_title_artist_and_title() {
+        let np = NowPlaying {
+            state: Some("play".into()),
+            title: Some("Blue in Green".into()),
+            artist: Some("Miles Davis".into()),
+            ..NowPlaying::default()
+        };
+        assert_eq!(window_title(&np), "HypoDJ - Miles Davis - Blue in Green");
+    }
+
+    #[test]
+    fn window_title_title_only() {
+        let np = NowPlaying {
+            state: Some("play".into()),
+            title: Some("Live Stream".into()),
+            ..NowPlaying::default()
+        };
+        assert_eq!(window_title(&np), "HypoDJ - Live Stream");
+    }
+
+    #[test]
+    fn window_title_strips_control_chars() {
+        // A BEL/ESC in a tag would terminate the OSC title early and inject the
+        // trailing bytes into the terminal; they must be dropped.
+        let np = NowPlaying {
+            state: Some("play".into()),
+            artist: Some("Ac\x1bDC".into()),
+            title: Some("Foo\x07rm -rf".into()),
+            ..NowPlaying::default()
+        };
+        assert_eq!(window_title(&np), "HypoDJ - AcDC - Foorm -rf");
+    }
 
     #[test]
     fn thumb_hard_left_at_zero() {
@@ -168,11 +275,42 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     f.render_stateful_widget(list, area, &mut ls);
 }
 
+/// Render a browse screen (Albums/Playlists): the active `Browse.rows` in a List,
+/// dirs marked with a trailing `/`, driven by the browse's own cursor + scrolloff
+/// offset. Reuses the same List+ListState mechanics as render_queue.
+fn render_browse(f: &mut Frame, area: ratatui::layout::Rect, browse: &Browse) {
+    let block = Block::default().borders(Borders::ALL).title(browse.title.clone());
+    let items: Vec<ListItem> = browse
+        .rows
+        .iter()
+        .map(|r| {
+            let text = if r.is_dir {
+                format!("  {}/", r.label)
+            } else {
+                format!("  {}", r.label)
+            };
+            ListItem::new(Line::from(text))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let mut ls = ListState::default();
+    if !browse.rows.is_empty() {
+        let h = area.height.saturating_sub(2) as usize;
+        let off = crate::state::scroll_offset(browse.selected, browse.rows.len(), h, browse.offset.get());
+        browse.offset.set(off);
+        *ls.offset_mut() = off;
+        ls.select(Some(browse.selected));
+    }
+    f.render_stateful_widget(list, area, &mut ls);
+}
+
 fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     let block = Block::default().borders(Borders::ALL);
     let lines: Vec<Line> = match state.mode {
         Mode::Normal => {
-            let hint = "keys: space/bksp=scrub p=pause </>=prev/next ^s=stop j/k=move g/G=top/bot f=fav 9/0=vol enter=play  /=command  q=quit";
+            let hint = "keys: space/bksp=scrub p=pause </>=prev/next ^s=stop j/k=move g/G=top/bot f=fav 9/0=vol enter=play/open 1/2/3=view h=back  /=command  q=quit";
             match &state.status_msg {
                 Some(msg) => vec![Line::from(msg.replace('\n', " "))],
                 None => vec![Line::from(Span::styled(
