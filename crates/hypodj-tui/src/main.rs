@@ -370,22 +370,13 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
             // An empty phase clears the spinner line (call settled).
             state.dj_phase = if phase.is_empty() { None } else { Some(phase) };
         }
-        Inbound::CcDelta(frag) => {
-            // A live token fragment: the typewriter is now flowing, so drop the
-            // "thinking..." spinner and APPEND onto the current streaming line.
-            state.dj_phase = None;
-            state.push_dj_delta(&frag);
-        }
         Inbound::CcLine(line) => {
-            // A discrete line (result summary / miss / error): close any open stream.
-            state.end_dj_stream();
+            // A discrete line (result summary / miss / error).
             state.push_dj_log(line);
         }
-        Inbound::CcDone => state.end_dj_stream(),
         Inbound::CcConfirm(pending) => {
             // The settled, validated plan: drive the standard confirm popup. Arming
             // on `y` runs the direct `plan add <dsl>` on the command worker.
-            state.end_dj_stream();
             state.dj_phase = None;
             state.enter_confirm(pending);
         }

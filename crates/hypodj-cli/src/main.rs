@@ -238,14 +238,13 @@ fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
 }
 
 /// The Claude Code client-side NL handshake. Reads the small context the client
-/// already has (queue length, is-playing) from `status`, then streams `claude` in
-/// `--output-format stream-json` mode: each token delta is typed out live to stderr
-/// (stdout stays clean for the echo + confirm), and the settled VALIDATED RawPlan
-/// (from the last complete result line, or a non-streamed fallback on claude 2.1.204
-/// which truncates the final line) is echoed via describe_plan, confirmed y/N, and
-/// armed via `plan add <dsl>`. Returns Ok(true) when it handled the phrase (armed,
-/// cancelled, or a loud user-facing miss), Ok(false) to fall through to the daemon
-/// `nl` path (spawn/parse failure, or a plan not DSL-expressible).
+/// already has (queue length, is-playing) from `status`, then makes ONE non-streamed
+/// `claude` call (`--output-format json`): a simple "thinking..." indicator on stderr
+/// keeps the multi-second call from looking frozen (stdout stays clean for the echo +
+/// confirm), and the settled VALIDATED RawPlan is echoed via describe_plan, confirmed
+/// y/N, and armed via `plan add <dsl>`. Returns Ok(true) when it handled the phrase
+/// (armed, cancelled, or a loud user-facing miss), Ok(false) to fall through to the
+/// daemon `nl` path (spawn/parse failure, or a plan not DSL-expressible).
 #[cfg(feature = "cc")]
 fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
     let status = conn.command("status")?;
@@ -260,25 +259,16 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
         .map(|(_, v)| v == "play")
         .unwrap_or(false);
 
-    // Live typewriter: stream the model's token deltas to stderr (stdout stays clean
-    // for the echo + y/N). The blocking multi-second call is fine here - the CLI is a
-    // one-shot; the deltas keep it from ever looking frozen. The settled plan comes
-    // from the last complete result line, or the non-streamed fallback on 2.1.204.
-    eprint!("Claude Code: ");
+    // Simple "thinking..." indicator on stderr (stdout stays clean for the echo +
+    // y/N). The blocking multi-second call is fine here - the CLI is a one-shot; the
+    // indicator keeps it from ever looking frozen. One non-streamed call returns the
+    // settled VALIDATED plan directly (the installed CLI returns the result intact).
+    eprint!("Claude Code: thinking...");
     let _ = std::io::stderr().flush();
-    let mut any_delta = false;
-    let result = hypodj_nl::cc::run_claude_streaming(phrase, queue_len, is_playing, |frag| {
-        any_delta = true;
-        eprint!("{frag}");
-        let _ = std::io::stderr().flush();
-    });
-    if any_delta {
-        eprintln!();
-    } else {
-        // Nothing streamed (e.g. immediate error): clear the prefix line.
-        eprint!("\r\x1b[2K");
-        let _ = std::io::stderr().flush();
-    }
+    let result = hypodj_nl::cc::run_claude(phrase, queue_len, is_playing);
+    // Clear the indicator line before any output.
+    eprint!("\r\x1b[2K");
+    let _ = std::io::stderr().flush();
 
     let raw = match result {
         Ok(raw) => raw,
