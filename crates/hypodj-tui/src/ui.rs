@@ -4,7 +4,7 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use hypodj_client::model::NowPlaying;
@@ -16,22 +16,33 @@ use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState}
 /// preview), and the command/confirm line. Now Playing sits BELOW the list, just
 /// above the command box.
 pub fn render(f: &mut Frame, state: &TuiState) {
+    // A blank top and bottom margin row give the frame breathing room; the bottom
+    // bar is a single borderless row (thin + less prominent than the old 3-row
+    // bordered box), living as a dim ambient wave when idle.
     let chunks = Layout::vertical([
+        Constraint::Length(1),  // top breathing margin (blank)
         Constraint::Length(1),  // screen tabs
         Constraint::Min(3),     // active list
         Constraint::Length(12), // Now Playing: album art + up-next preview
-        Constraint::Length(3),  // command / status
+        Constraint::Length(1),  // command / search / status / ambient wave (thin)
+        Constraint::Length(1),  // bottom breathing margin (blank)
     ])
     .split(f.area());
 
-    render_tabs(f, chunks[0], state.screen);
+    render_tabs(f, chunks[1], state.screen);
+    let list_area = chunks[2];
     match state.screen {
-        Screen::Queue => render_queue(f, chunks[1], state),
-        Screen::Albums => render_browse(f, chunks[1], &state.albums, state, true),
-        Screen::Playlists => render_browse(f, chunks[1], &state.playlists, state, false),
+        Screen::Queue => render_queue(f, list_area, state),
+        Screen::Albums => render_browse(f, list_area, &state.albums, state, true),
+        Screen::Playlists => render_browse(f, list_area, &state.playlists, state, false),
     }
-    render_now(f, chunks[2], state);
-    render_command(f, chunks[3], state);
+    render_now(f, chunks[3], state);
+    render_command(f, chunks[4], state);
+    // Confirm is a small centered popup over the list/now region so the thin bottom
+    // bar never grows (no layout jump when toggling modes).
+    if state.mode == Mode::Confirm {
+        render_confirm_popup(f, list_area, state);
+    }
 }
 
 /// Split `label` into styled spans, underlining+bolding the FIRST case-insensitive
@@ -325,7 +336,10 @@ fn volume_slider(vol: u8, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{hit_style, match_spans, volume_slider, window_title};
+    use super::{
+        hit_style, match_spans, track_seed, volume_slider, wave_glyphs, wave_row, window_title,
+    };
+    use crate::state::{Mode, TuiState};
     use hypodj_client::model::NowPlaying;
     use ratatui::style::Style;
 
@@ -473,6 +487,114 @@ mod tests {
         assert_eq!(inner.chars().filter(|&c| c == '#').count(), 1, "exactly one thumb");
     }
 
+    fn render_to_lines(state: &TuiState) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| super::render(f, state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn render_smoke_idle_playing_shows_wave_row() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.file = Some("song/1".into());
+        s.anim_secs = 3.0;
+        let lines = render_to_lines(&s);
+        // The bottom bar row (index 21: top margin, tabs, list 0..17, now 18..? -
+        // it is the second-to-last row, above the blank bottom margin) carries wave
+        // glyphs when idle+playing.
+        let joined = lines.join("\n");
+        let allowed = wave_glyphs();
+        assert!(
+            joined.chars().any(|c| allowed.contains(&c)),
+            "an idle playing frame draws ambient wave glyphs somewhere:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn render_smoke_command_and_confirm() {
+        let mut s = TuiState::new();
+        // Command mode: the prompt is drawn (viz yields).
+        s.mode = Mode::Command;
+        s.input = "pause".into();
+        let cmd = render_to_lines(&s).join("\n");
+        assert!(cmd.contains("> pause"), "command prompt on the bar:\n{cmd}");
+        // Confirm mode: the popup carries the prompt (bottom bar blank).
+        let mut s2 = TuiState::new();
+        s2.mode = Mode::Confirm;
+        s2.pending = Some(crate::state::Pending {
+            command: Some("clear".into()),
+            token: None,
+            steps: vec!["clear the whole queue".into()],
+            note: None,
+            trust: None,
+        });
+        let conf = render_to_lines(&s2).join("\n");
+        assert!(conf.contains("confirm? [y/N]"), "confirm popup shown:\n{conf}");
+        assert!(conf.contains("clear the whole queue"), "popup shows the step:\n{conf}");
+    }
+
+    #[test]
+    fn wave_row_length_matches_width() {
+        // The row is exactly `width` glyphs, including the degenerate 0/1 widths.
+        for w in [0usize, 1, 5, 20, 79] {
+            assert_eq!(wave_row(w, 3.0, 42, true).chars().count(), w);
+            assert_eq!(wave_row(w, 3.0, 42, false).chars().count(), w);
+        }
+    }
+
+    #[test]
+    fn wave_row_glyphs_all_in_allowed_ramp() {
+        let allowed = wave_glyphs();
+        let row = wave_row(64, 7.5, 1234, true);
+        assert!(row.chars().all(|c| allowed.contains(&c)), "every glyph is on the ramp");
+    }
+
+    #[test]
+    fn wave_row_deterministic_for_same_inputs() {
+        // Same (width, t, seed, animate) => identical string (drives off wall-clock,
+        // no hidden state or randomness).
+        assert_eq!(wave_row(40, 12.25, 99, true), wave_row(40, 12.25, 99, true));
+    }
+
+    #[test]
+    fn wave_row_frozen_baseline_when_not_animating() {
+        // Paused/stopped => a flat baseline row, all the lowest glyph.
+        let base = wave_glyphs()[0];
+        let row = wave_row(24, 5.0, 7, false);
+        assert!(row.chars().all(|c| c == base), "frozen row is all baseline glyph");
+        // And it is time-independent while frozen.
+        assert_eq!(wave_row(24, 5.0, 7, false), wave_row(24, 999.0, 7, false));
+    }
+
+    #[test]
+    fn wave_row_different_seeds_diverge() {
+        // Two tracks (seeds from real file hashes) at the same instant have distinct
+        // textures. Use realistic hashed seeds - adjacent tiny integers fold to
+        // near-identical phases (the real seeds are full DefaultHasher outputs).
+        let a = wave_row(48, 4.0, track_seed(&NowPlaying { file: Some("song/1".into()), ..NowPlaying::default() }), true);
+        let b = wave_row(48, 4.0, track_seed(&NowPlaying { file: Some("song/2".into()), ..NowPlaying::default() }), true);
+        assert_ne!(a, b, "per-track seed gives each track its own texture");
+    }
+
+    #[test]
+    fn track_seed_stable_and_track_dependent() {
+        let mut np = NowPlaying { file: Some("song/1".into()), ..NowPlaying::default() };
+        let s1 = track_seed(&np);
+        assert_eq!(s1, track_seed(&np), "stable for one track");
+        np.file = Some("song/2".into());
+        assert_ne!(s1, track_seed(&np), "changes with the track");
+    }
+
     #[test]
     fn thumb_position_monotonic_non_decreasing() {
         let mut last = 0usize;
@@ -578,53 +700,147 @@ fn render_browse(
     f.render_stateful_widget(list, area, &mut ls);
 }
 
+/// Whether to use unicode block glyphs for the ambient wave. Kept as a const so a
+/// terminal without good unicode can flip to the ASCII fallback ramp at build time.
+const USE_BLOCK_GLYPHS: bool = true;
+
+/// The eight vertical block glyphs (U+2581 lower one-eighth .. U+2588 full block),
+/// the wave's rest ramp - it reads as a soft equalizer/oscilloscope at idle.
+const BLOCK_GLYPHS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+
+/// An ASCII fallback ramp (low -> high) for terminals without block glyphs.
+const ASCII_GLYPHS: [char; 8] = ['.', ':', '-', '=', '+', '*', '#', '@'];
+
+/// The active wave glyph ramp (block or ASCII fallback).
+fn wave_glyphs() -> &'static [char; 8] {
+    if USE_BLOCK_GLYPHS { &BLOCK_GLYPHS } else { &ASCII_GLYPHS }
+}
+
+/// Fold a per-track seed into a stable phase in `[0, TAU)` so each track gets its
+/// own standing-wave texture (its wave looks distinct but never random per frame).
+fn seed_phase(seed: u64) -> f64 {
+    (seed % 100_000) as f64 / 100_000.0 * std::f64::consts::TAU
+}
+
+/// A cheap per-track seed: a hash of the current `file` (fallback `title`), so the
+/// wave texture is stable for one track and changes when the track does. `0` when
+/// nothing is playing (the caller freezes the wave there anyway).
+fn track_seed(np: &NowPlaying) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match np.file.as_deref().or(np.title.as_deref()) {
+        Some(s) => s.hash(&mut h),
+        None => return 0,
+    }
+    h.finish()
+}
+
+/// Build one borderless ambient wave row `width` glyphs wide: a soft standing wave
+/// of vertical block glyphs, driven ONLY by wall-clock `t_secs`, a per-track `seed`,
+/// and whether to `animate`. Two summed incommensurate sines give a slowly-morphing,
+/// never-repeating "breathing" envelope; `seed` shifts its phase per track. When
+/// `animate` is false (paused/stopped/nothing) the row FREEZES to a flat baseline
+/// (all the lowest glyph) - honest: it signals music is flowing + which track, never
+/// pretends to know the beat or the position. Pure and deterministic - unit-tested.
+fn wave_row(width: usize, t_secs: f64, seed: u64, animate: bool) -> String {
+    let glyphs = wave_glyphs();
+    if width == 0 {
+        return String::new();
+    }
+    if !animate {
+        return std::iter::repeat(glyphs[0]).take(width).collect();
+    }
+    let phase = seed_phase(seed);
+    // Spatial wave numbers (per column) and temporal rates (rad/s). w1,w2 stay in
+    // ~0.6-1.0 rad/s so the field drifts, never strobes.
+    let (k1, k2, w1, w2) = (0.35_f64, 0.17_f64, 0.9_f64, 0.6_f64);
+    let mut out = String::with_capacity(width);
+    for x in 0..width {
+        let xf = x as f64;
+        let s = 0.6 * (xf * k1 + t_secs * w1 + phase).sin()
+            + 0.4 * (xf * k2 - t_secs * w2 + phase * 1.7).sin();
+        // s in [-1, 1]; a base + amp keeps the level off the row edges (never slams
+        // 0 or 7 constantly). Round to a glyph index and clamp to the ramp.
+        let level = (3.5 + 3.0 * s).round().clamp(0.0, 7.0) as usize;
+        out.push(glyphs[level]);
+    }
+    out
+}
+
+/// The thin, borderless bottom bar: the command/search prompt while typing, a status
+/// banner when one is set, else the dim ambient wave when truly idle. Confirm renders
+/// its own popup (see [`render_confirm_popup`]), so the bar stays blank there.
 fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
-    let block = Block::default().borders(Borders::ALL);
-    // Draw a visible caret in the input box only in Command/Search mode; a stray
-    // block cursor in Normal/Confirm would sit over the hint line. Inner coords
-    // skip the 1-cell border (area.x+1, area.y+1); prompt_len = 2 for "> ", 1 for
-    // "/"; chars().count() (not len()) so multibyte input is not mis-placed.
+    // Caret only in Command/Search mode. The row is borderless now, so the caret
+    // math drops the old +1 border offsets: prompt_len = 2 for "> ", 1 for "/";
+    // chars().count() (not len()) so multibyte input is not mis-placed.
     let caret: Option<(u16, usize)> = match state.mode {
         Mode::Command => Some((2, state.input.chars().count())),
         Mode::Search => Some((1, state.input.chars().count())),
         _ => None,
     };
     if let Some((prompt_len, input_chars)) = caret {
-        f.set_cursor_position((
-            area.x + 1 + prompt_len + input_chars as u16,
-            area.y + 1,
-        ));
+        f.set_cursor_position((area.x + prompt_len + input_chars as u16, area.y));
     }
-    let lines: Vec<Line> = match state.mode {
-        // Only a status banner here (the key hints were removed); empty otherwise.
+    let line: Line = match state.mode {
+        Mode::Command => Line::from(format!("> {}", state.input)),
+        Mode::Search => Line::from(format!("/{}", state.input)),
+        // Confirm's detail lives in the popup; keep the bar blank so it never grows.
+        Mode::Confirm => Line::from(""),
         Mode::Normal => match &state.status_msg {
-            Some(msg) => vec![Line::from(msg.replace('\n', " "))],
-            None => vec![Line::from("")],
-        },
-        Mode::Command => vec![Line::from(format!("> {}", state.input))],
-        Mode::Search => vec![Line::from(format!("/{}", state.input))],
-        Mode::Confirm => {
-            let mut ls = Vec::new();
-            if let Some(p) = &state.pending {
-                if let Some(trust) = &p.trust {
-                    ls.push(Line::from(Span::styled(
-                        trust.clone(),
-                        Style::default().add_modifier(Modifier::DIM),
-                    )));
-                }
-                for step in &p.steps {
-                    ls.push(Line::from(step.clone()));
-                }
-                if let Some(note) = &p.note {
-                    ls.push(Line::from(Span::styled(
-                        format!("! {note}"),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    )));
-                }
+            Some(msg) => Line::from(msg.replace('\n', " ")),
+            None => {
+                // Truly idle: the dim ambient wave, animating only while playing.
+                let animate = state.now.state.as_deref() == Some("play");
+                let wave = wave_row(area.width as usize, state.anim_secs, track_seed(&state.now), animate);
+                Line::from(Span::styled(wave, Style::default().add_modifier(Modifier::DIM)))
             }
-            ls.push(Line::from("confirm? [y/N]"));
-            ls
-        }
+        },
     };
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// The confirm surface: a small centered, bordered popup over the list/now region
+/// (trust footnote / steps / note + the `confirm? [y/N]` prompt). A popup instead of
+/// growing the thin bottom bar, so toggling into Confirm never jumps the layout.
+fn render_confirm_popup(f: &mut Frame, region: Rect, state: &TuiState) {
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(p) = &state.pending {
+        if let Some(trust) = &p.trust {
+            lines.push(Line::from(Span::styled(
+                trust.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+        for step in &p.steps {
+            lines.push(Line::from(step.clone()));
+        }
+        if let Some(note) = &p.note {
+            lines.push(Line::from(Span::styled(
+                format!("! {note}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+    lines.push(Line::from(Span::styled(
+        "confirm? [y/N]",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+
+    // Size the popup to the content, clamped inside the region (with borders).
+    let content_h = lines.len() as u16 + 2;
+    let content_w = lines
+        .iter()
+        .map(|l| l.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4);
+    let w = content_w.min(region.width).max(1);
+    let h = content_h.min(region.height).max(1);
+    let x = region.x + (region.width.saturating_sub(w)) / 2;
+    let y = region.y + (region.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+    let block = Block::default().borders(Borders::ALL).title("Confirm");
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block), popup);
 }

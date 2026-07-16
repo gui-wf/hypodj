@@ -82,7 +82,20 @@ fn event_loop(
     // every tick. Seeded to the setup_terminal() startup title.
     let mut last_title = String::from("HypoDJ");
     sync_title(terminal, state, &mut last_title);
+    // Ambient-visualizer clock: a wall-clock accumulator advanced by the per-frame
+    // delta ONLY while playback is `play`, so the idle bottom-bar wave drifts while
+    // music flows and freezes flat when paused/stopped. It rides the existing
+    // poll(POLL) cadence - one Instant delta per frame, no extra wakeups.
+    let mut anim_accum = 0.0f64;
+    let mut last_frame = Instant::now();
     loop {
+        let frame_now = Instant::now();
+        if state.now.state.as_deref() == Some("play") {
+            anim_accum += frame_now.duration_since(last_frame).as_secs_f64();
+        }
+        last_frame = frame_now;
+        state.anim_secs = anim_accum;
+
         terminal
             .draw(|f| ui::render(f, state))
             .map_err(|e| MpdError::Io(e.to_string()))?;

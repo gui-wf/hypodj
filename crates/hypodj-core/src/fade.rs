@@ -206,6 +206,24 @@ impl FadeSpec {
         self.schedule.steps.len()
     }
 
+    /// The wall-clock offset (`at`, relative to the fade's start instant) of the
+    /// FIRST scheduled step whose gain reaches `threshold_db` (`gain_db >=
+    /// threshold_db`); `None` if no step reaches it (or the schedule is empty).
+    ///
+    /// For a monotone ramp-UP (a wake / resume from the synth floor) this is the
+    /// instant the envelope first crosses a hearability threshold - so the resume
+    /// path can seek the track back by exactly this LEAD and land the playhead at
+    /// the saved position the moment the ramp becomes audible. Read off the REAL
+    /// (sub-JND-extended) schedule, never the nominal duration; pure and fake-clock
+    /// testable.
+    pub fn time_to_reach_db(&self, threshold_db: f64) -> Option<Duration> {
+        self.schedule
+            .steps
+            .iter()
+            .find(|s| s.gain_db >= threshold_db)
+            .map(|s| s.at)
+    }
+
     /// Build a validated schedule from the fade parameters. Returns an error
     /// rather than ever producing a startle-unsafe plan.
     ///
@@ -752,6 +770,58 @@ mod tests {
                 assert!((w[0].gain_db - w[1].gain_db).abs() <= DELIBERATE_STEP_CAP_DB + 1e-9);
             }
         }
+    }
+
+    #[test]
+    fn time_to_reach_db_first_crossing_on_a_wake_ramp() {
+        // A wake ramp from the -60 dB synth floor UP to -8 dB over restart_fade_secs
+        // (sub_jnd=true so it EXTENDS to ceil(52/0.75) ~= 70 steps). The audibility
+        // crossing (-40 dB) is the first step whose gain >= -40.
+        let spec = FadeSpec::new(
+            SYNTH_FLOOR_DB,
+            FadeTarget::Db(-8.0),
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            Curve::DbLinear,
+            bounds(true),
+        )
+        .unwrap();
+        let lead = spec.time_to_reach_db(-40.0).expect("ramp crosses -40 dB");
+        // The step at `lead` is the FIRST >= -40; the one just before is < -40.
+        let steps = &spec.schedule.steps;
+        let idx = steps.iter().position(|s| s.at == lead).unwrap();
+        assert!(steps[idx].gain_db >= -40.0);
+        if idx > 0 {
+            assert!(steps[idx - 1].gain_db < -40.0);
+        }
+        // Monotone schedule => the crossing is well-defined and strictly positive.
+        assert!(lead > Duration::ZERO);
+    }
+
+    #[test]
+    fn time_to_reach_db_none_when_unreached() {
+        // A ramp that tops out at -45 dB never reaches -40 dB: no crossing.
+        let spec = FadeSpec::new(
+            SYNTH_FLOOR_DB,
+            FadeTarget::Db(-45.0),
+            Duration::from_secs(30),
+            Duration::from_millis(250),
+            Curve::DbLinear,
+            bounds(true),
+        )
+        .unwrap();
+        assert_eq!(spec.time_to_reach_db(-40.0), None);
+        // An empty (degenerate from==to) schedule also yields None.
+        let deg = FadeSpec::new(
+            -12.0,
+            FadeTarget::Db(-12.0),
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            Curve::DbLinear,
+            bounds(true),
+        )
+        .unwrap();
+        assert_eq!(deg.time_to_reach_db(-40.0), None);
     }
 
     #[test]
