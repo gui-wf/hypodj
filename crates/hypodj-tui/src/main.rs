@@ -137,7 +137,7 @@ fn event_loop(
             // Convert the coalesced intents into worker Reqs; the worker runs them off
             // the render path so a Subsonic-backed browse/enqueue never blocks input
             // or draw.
-            dispatch(req_tx, state, coalesce_intents(intents));
+            dispatch(req_tx, &workers.cc_tx, state, coalesce_intents(intents));
             sync_title(terminal, state, &mut last_title);
         }
 
@@ -170,7 +170,7 @@ fn event_loop(
 /// after them (so a held-key burst costs N cheap commands + a single refresh). The
 /// confirm/cancel handshake is applied to local state here but relies on the worker
 /// running `nl confirm`/`nl cancel` on the ONE command socket, in order.
-fn dispatch(tx: &Sender<Req>, state: &mut TuiState, intents: Vec<Intent>) {
+fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents: Vec<Intent>) {
     let mut sent_mutation = false;
     for intent in intents {
         match intent {
@@ -203,6 +203,15 @@ fn dispatch(tx: &Sender<Req>, state: &mut TuiState, intents: Vec<Intent>) {
             }
             Intent::LoadPlaylist(name) => {
                 let _ = tx.send(Req::Load(name));
+            }
+            Intent::Cc(phrase) => {
+                // Send on the DEDICATED CC channel with the small context the render
+                // thread already holds (queue length + is-playing).
+                let _ = cc_tx.send(Req::Cc {
+                    phrase,
+                    queue_len: state.queue.len(),
+                    is_playing: state.now.state.as_deref() == Some("play"),
+                });
             }
             Intent::Quit => {}
         }
@@ -242,7 +251,8 @@ fn clear_refresh_gate(tx: &Sender<Req>, state: &mut TuiState) {
 /// on first visit (the worker runs the lsinfo/listplaylists off the render path).
 fn show_screen(tx: &Sender<Req>, state: &mut TuiState, screen: Screen) {
     match screen {
-        Screen::Queue => request_refresh(tx, state),
+        // The DJ pane shows the queue alongside; keep it live-refreshed like Queue.
+        Screen::Queue | Screen::Dj => request_refresh(tx, state),
         Screen::Albums => {
             if !state.albums.loaded {
                 // Seed Albums from the `newest` smart list (no flat A-Z album index
@@ -356,6 +366,17 @@ fn apply_inbound(tx: &Sender<Req>, state: &mut TuiState, msg: Inbound) {
             state.mark_connected();
         }
         Inbound::Disconnected => state.mark_disconnected(),
+        Inbound::CcProgress(phase) => {
+            // An empty phase clears the spinner line (call settled).
+            state.dj_phase = if phase.is_empty() { None } else { Some(phase) };
+        }
+        Inbound::CcDelta(line) => state.push_dj_log(line),
+        Inbound::CcConfirm(pending) => {
+            // The settled, validated plan: drive the standard confirm popup. Arming
+            // on `y` runs the direct `plan add <dsl>` on the command worker.
+            state.dj_phase = None;
+            state.enter_confirm(pending);
+        }
     }
 }
 
@@ -457,6 +478,7 @@ fn sync_title(
 /// after a worker-side reconnect); process exit reaps the IO-only threads.
 fn teardown(workers: &Workers) {
     let _ = workers.req_tx.send(Req::Shutdown);
+    let _ = workers.cc_tx.send(Req::Shutdown);
     workers.stop.store(true, Ordering::Relaxed);
     let _ = workers.cmd_shutdown.shutdown(Shutdown::Both);
     if let Some(h) = &workers.idle_shutdown {

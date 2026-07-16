@@ -19,7 +19,18 @@ fn secs(s: f64) -> String {
 /// and bass") survives the `plan add` tokenizer as ONE token (it splits on
 /// unquoted whitespace and unescapes `\"`/`\\` inside quotes). A single bare word
 /// is emitted verbatim; anything with whitespace/quote/backslash is quoted.
-fn dsl_value(s: &str) -> String {
+///
+/// Returns `None` when the value contains a control character (newline, CR, tab,
+/// etc.). The `plan add <dsl>` line is framed on the wire by a literal `\n`, and
+/// the tokenizer's `\`-escape only unescapes the NEXT char (never re-encodes a
+/// literal newline), so a value carrying a newline would smuggle EXTRA command
+/// lines past the single-owner confirm gate. Refusing to render it makes the
+/// caller fall back to direct arming (or a loud "cannot express" miss) - a
+/// control char is nonsense in a music selector anyway.
+fn dsl_value(s: &str) -> Option<String> {
+    if s.chars().any(|c| c.is_control()) {
+        return None;
+    }
     if s.is_empty() || s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
         let mut out = String::with_capacity(s.len() + 2);
         out.push('"');
@@ -30,9 +41,9 @@ fn dsl_value(s: &str) -> String {
             out.push(c);
         }
         out.push('"');
-        out
+        Some(out)
     } else {
-        s.to_string()
+        Some(s.to_string())
     }
 }
 
@@ -72,8 +83,8 @@ fn action_dsl(a: &Action) -> Option<String> {
         Action::SetVolume(v) => format!("action setvol {v}"),
         Action::Enqueue { selector, count } => match selector {
             Selector::Radio => format!("action enqueue radio {count}"),
-            Selector::Query(q) => format!("action enqueue query {} {count}", dsl_value(q)),
-            Selector::Genre(g) => format!("action enqueue genre {} {count}", dsl_value(g)),
+            Selector::Query(q) => format!("action enqueue query {} {count}", dsl_value(q)?),
+            Selector::Genre(g) => format!("action enqueue genre {} {count}", dsl_value(g)?),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -272,5 +283,32 @@ mod tests {
             once: true,
             origin: String::new(),
         });
+    }
+
+    #[test]
+    fn render_dsl_refuses_control_chars_in_selector() {
+        // A selector value carrying a literal newline would, once framed on the
+        // wire as `plan add ...\n`, smuggle EXTRA command lines (`clear`, `next`)
+        // past the single-owner confirm gate. render_dsl must refuse to emit it.
+        let plan = RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action: Action::Enqueue {
+                selector: Selector::Query("chill\nclear\nnext".into()),
+                count: 5,
+            },
+            once: false,
+            origin: String::new(),
+        };
+        assert_eq!(render_dsl(&plan), None, "a newline-bearing selector must not render");
+        // Carriage return and tab are control chars too.
+        let plan = RawPlan {
+            action: Action::Enqueue {
+                selector: Selector::Genre("jazz\rvol\t100".into()),
+                count: 1,
+            },
+            ..plan
+        };
+        assert_eq!(render_dsl(&plan), None);
     }
 }

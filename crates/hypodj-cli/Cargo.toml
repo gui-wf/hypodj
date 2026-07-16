@@ -12,6 +12,15 @@ path = "src/main.rs"
 # Depends on the shared hypodj-client for the one client implementation (MpdConn,
 # nl handshake seams, config, and the NowPlaying/queue parsing). This crate keeps
 # only the text card/queue formatters and the argv/handshake glue. Model-free by
-# construction: no dependency on hypodj-nl, hypodj-core, or any model.
+# construction in the DEFAULT build: no dependency on hypodj-nl, hypodj-core, or any
+# model. The opt-in `cc` feature DELIBERATELY breaks that thin-client invariant to
+# pull hypodj-nl (Claude Code CLI backend) - localized to the feature, default build
+# unchanged and still model-free.
+[features]
+# Client-side Claude Code CLI NL backend. Pulls hypodj-nl(cc) for the prompt build,
+# LlmRawPlan JSON-Schema, envelope parse, render_dsl, and describe_plan.
+cc = ["dep:hypodj-nl"]
+
 [dependencies]
 hypodj-client = { path = "../hypodj-client" }
+hypodj-nl = { path = "../hypodj-nl", optional = true, default-features = false, features = ["cc"] }

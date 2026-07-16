@@ -35,6 +35,14 @@ pub fn render(f: &mut Frame, state: &TuiState) {
         Screen::Queue => render_queue(f, list_area, state),
         Screen::Albums => render_browse(f, list_area, &state.albums, state, true),
         Screen::Playlists => render_browse(f, list_area, &state.playlists, state, false),
+        // The DJ View shares the top region: Queue on the left, the Claude Code
+        // intelligence pane on the right, a straight ~50/50 split (MVP).
+        Screen::Dj => {
+            let cols = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(list_area);
+            render_queue(f, cols[0], state);
+            render_dj(f, cols[1], state);
+        }
     }
     render_now(f, chunks[3], state);
     render_command(f, chunks[4], state);
@@ -126,6 +134,7 @@ fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
         (Screen::Queue, "[1]Queue"),
         (Screen::Albums, "[2]Albums"),
         (Screen::Playlists, "[3]Playlists"),
+        (Screen::Dj, "[4]DJ"),
     ];
     let mut spans = Vec::new();
     for (i, (s, label)) in labels.iter().enumerate() {
@@ -544,6 +553,24 @@ mod tests {
     }
 
     #[test]
+    fn render_dj_view_draws_title_phase_and_input() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.dj_phase = Some("thinking...".into());
+        s.dj_input = "fade out".into();
+        s.push_dj_log("> fade out".into());
+        let out = render_to_lines(&s).join("\n");
+        // The DJ pane title, the phase line, the ask> input, and the logged query.
+        assert!(out.contains("DJ - Claude Code"), "DJ pane titled:\n{out}");
+        assert!(out.contains("thinking..."), "phase line drawn:\n{out}");
+        assert!(out.contains("ask>"), "input prompt drawn:\n{out}");
+        assert!(out.contains("> fade out"), "scrollback shows the query:\n{out}");
+        // The DJ tab is in the strip and the Queue still shares the top region.
+        assert!(out.contains("[4]DJ"), "DJ tab present:\n{out}");
+        assert!(out.contains("Queue"), "Queue shares the split:\n{out}");
+    }
+
+    #[test]
     fn wave_row_length_matches_width() {
         // The row is exactly `width` glyphs, including the degenerate 0/1 widths.
         for w in [0usize, 1, 5, 20, 79] {
@@ -698,6 +725,63 @@ fn render_browse(
         ls.select(Some(browse.selected));
     }
     f.render_stateful_widget(list, area, &mut ls);
+}
+
+/// The DJ View pane (right of Queue on Screen::Dj): the Claude Code intelligence
+/// surface. Bottom-pinned scrollback of coarse CC progress + result lines, a
+/// spinner + phase row while a call is in flight, and the "ask>" NL input row.
+/// The spinner rides the shared anim_secs clock; no token typewriter in the MVP.
+fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
+    let block = Block::default().borders(Borders::ALL).title("DJ - Claude Code");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = Layout::vertical([
+        Constraint::Min(1),    // scrollback log
+        Constraint::Length(1), // spinner + phase
+        Constraint::Length(1), // "ask>" input
+    ])
+    .split(inner);
+
+    // Scrollback, bottom-pinned: show the last rows that fit.
+    let log_h = rows[0].height as usize;
+    let start = state.dj_log.len().saturating_sub(log_h);
+    let log_lines: Vec<Line> = if state.dj_log.is_empty() {
+        vec![Line::from(Span::styled(
+            "ask me to DJ - e.g. \"fade out over 30s\"",
+            Style::default().add_modifier(Modifier::DIM),
+        ))]
+    } else {
+        state.dj_log[start..].iter().map(|l| Line::from(l.clone())).collect()
+    };
+    f.render_widget(Paragraph::new(log_lines), rows[0]);
+
+    // Spinner + phase line (only while a call is in flight).
+    let phase_line = match &state.dj_phase {
+        Some(phase) if !phase.is_empty() => {
+            let frames = ['|', '/', '-', '\\'];
+            let spin = frames[((state.anim_secs * 6.0) as usize) % 4];
+            Line::from(Span::styled(
+                format!("{spin} {phase}"),
+                Style::default().add_modifier(Modifier::DIM),
+            ))
+        }
+        _ => Line::from(""),
+    };
+    f.render_widget(Paragraph::new(phase_line), rows[1]);
+
+    // The "ask>" input row; place the caret when the DJ View has focus.
+    let input_line = Line::from(vec![
+        Span::styled("ask> ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(state.dj_input.clone()),
+    ]);
+    f.render_widget(Paragraph::new(input_line), rows[2]);
+    if state.screen == Screen::Dj && state.mode == Mode::Normal {
+        let caret_x = rows[2].x + 5 + state.dj_input.chars().count() as u16;
+        f.set_cursor_position((caret_x.min(rows[2].x + rows[2].width.saturating_sub(1)), rows[2].y));
+    }
 }
 
 /// Whether to use unicode block glyphs for the ambient wave. Kept as a const so a

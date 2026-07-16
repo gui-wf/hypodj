@@ -166,8 +166,23 @@ fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
     Ok(())
 }
 
-/// The full NL handshake, all on the one open socket.
+/// The full NL handshake, all on the one open socket. Under `cc` (and only when the
+/// `claude` CLI is present) the phrase is first translated CLIENT-SIDE by Claude
+/// Code into a validated Plan IR, echoed + confirmed here, and armed via a normal
+/// `plan add <dsl>` (re-clamped + dry-run validated daemon-side, the same trust
+/// boundary as `nl confirm`). When `cc` is off, `claude` is absent, or the call
+/// fails, it falls through to today's daemon `nl` path unchanged.
 fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
+    #[cfg(feature = "cc")]
+    {
+        if hypodj_nl::cc::cc_available() {
+            match cc_nl_handshake(conn, phrase)? {
+                true => return Ok(()),
+                // The CC call failed (spawn/parse/no-DSL); fall through to the daemon.
+                false => {}
+            }
+        }
+    }
     let req = nl::nl_request(phrase);
     let pairs = match conn.command(&req) {
         Ok(p) => p,
@@ -220,6 +235,96 @@ fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
         println!("cancelled");
     }
     Ok(())
+}
+
+/// The Claude Code client-side NL handshake. Reads the small context the client
+/// already has (queue length, is-playing) from `status`, spawns `claude` on a
+/// worker thread with a stderr "thinking..." spinner (stdout stays clean), then on
+/// the settled validated RawPlan echoes describe_plan + reuses the existing y/N
+/// confirm, and arms via `plan add <dsl>`. Returns Ok(true) when it handled the
+/// phrase (armed, cancelled, or a loud user-facing miss), Ok(false) to fall through
+/// to the daemon `nl` path (spawn/parse failure, or a plan not DSL-expressible).
+#[cfg(feature = "cc")]
+fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let status = conn.command("status")?;
+    let queue_len = status
+        .iter()
+        .find(|(k, _)| k == "playlistlength")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    let is_playing = status
+        .iter()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v == "play")
+        .unwrap_or(false);
+
+    // Run the multi-second call off the main thread so the spinner can tick.
+    let (tx, rx) = mpsc::channel();
+    let p = phrase.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(hypodj_nl::cc::run_claude(&p, queue_len, is_playing));
+    });
+
+    // Coarse stderr spinner: thinking -> planning after a couple seconds. Carriage
+    // return keeps it on one line; stdout is untouched.
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let mut i = 0usize;
+    let result = loop {
+        match rx.try_recv() {
+            Ok(r) => break r,
+            Err(mpsc::TryRecvError::Empty) => {
+                let phase = if i < 20 { "thinking" } else { "planning" };
+                eprint!("\r{} Claude Code {}...  ", FRAMES[i % 4], phase);
+                let _ = std::io::stderr().flush();
+                i += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break Err("claude worker vanished".into()),
+        }
+    };
+    eprint!("\r\x1b[2K"); // clear the spinner line
+    let _ = std::io::stderr().flush();
+
+    let raw = match result {
+        Ok(raw) => raw,
+        Err(e) => {
+            eprintln!("Claude Code could not translate that ({e}); trying the built-in translator.");
+            return Ok(false);
+        }
+    };
+
+    let dsl = match hypodj_nl::render_dsl(&raw) {
+        Some(d) => d,
+        None => {
+            // A validated plan the keyword DSL cannot express (e.g. time_remaining);
+            // fall through so the daemon rules can have a go.
+            return Ok(false);
+        }
+    };
+
+    println!("(via Claude Code)");
+    println!("{}", hypodj_nl::describe_plan(&raw));
+
+    if confirm("confirm?") {
+        match conn.command(&format!("plan add {dsl}")) {
+            Ok(plan_pairs) => {
+                for (k, v) in &plan_pairs {
+                    if k == "plan_id" {
+                        println!("{}", nl::armed_line(v));
+                    }
+                }
+                print_card(conn)?;
+            }
+            Err(MpdError::Ack(msg)) => println!("{}", nl::map_ack_reason(&msg)),
+            Err(e) => return Err(e),
+        }
+    } else {
+        println!("cancelled");
+    }
+    Ok(true)
 }
 
 /// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm; bare
