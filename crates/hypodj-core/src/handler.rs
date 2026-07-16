@@ -2982,6 +2982,33 @@ impl HypodjHandler {
     /// radio) played verbatim, with NO Subsonic call, id, rating, or scrobble -
     /// exactly as MPD's own `add <url>` behaves. Returns the assigned MPD id.
     async fn enqueue_uri(&self, uri: &str) -> Result<u64, String> {
+        // `album/<id>` fans the whole album into the queue as ONE atomic push: the
+        // songs are resolved BEFORE the std Mutex is taken (never hold it across an
+        // await), then every track lands under a single lock with ONE
+        // playlist_version bump and ONE notify_change - so idle/MPRIS see one queue
+        // change, not a per-song wake burst, and a client cannot observe a
+        // half-added album. Returns the FIRST assigned id (MPD addid semantics).
+        if let Some(id) = uri.strip_prefix("album/") {
+            let songs = self
+                .client
+                .album_songs(&AlbumId(id.to_string()))
+                .await
+                .map_err(|e| e.to_string())?;
+            if songs.is_empty() {
+                return Err(format!("no such album: {uri}"));
+            }
+            let mut st = self.state.lock().unwrap();
+            let first = st.next_id;
+            for song in songs {
+                let qid = st.next_id;
+                st.next_id += 1;
+                st.queue.push(QueueItem { id: qid, entry: QueueEntry::Song(song) });
+            }
+            st.playlist_version += 1;
+            drop(st);
+            self.notify_change();
+            return Ok(first);
+        }
         let entry = if is_stream_uri(uri) {
             // Title is the URL (a stream's icy-name is only known once mpv
             // connects; the URL is a sensible, always-available label).
@@ -3848,6 +3875,7 @@ impl HypodjHandler {
                         for al in &albums {
                             pairs.push(("directory".to_string(), format!("album/{}", al.id.0)));
                             pairs.push(("Album".to_string(), al.name.clone()));
+                            pairs.push(("X-SongCount".to_string(), al.song_count.to_string()));
                         }
                         self.dir_cache.put(key, pairs.clone());
                         MpdResponse::Pairs(pairs)
@@ -3926,6 +3954,10 @@ impl HypodjHandler {
                                         format!("album/{}", al.id.0),
                                     ));
                                     pairs.push(("Album".to_string(), al.name.clone()));
+                                    pairs.push((
+                                        "X-SongCount".to_string(),
+                                        al.song_count.to_string(),
+                                    ));
                                 }
                                 if name != "random" {
                                     self.dir_cache.put(format!("list/{name}"), pairs.clone());
@@ -4540,6 +4572,12 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
     if let Some(a) = &s.album {
         p.push(("Album".to_string(), a.clone()));
     }
+    // Non-standard hint so the TUI can group queued songs by album for the browse
+    // queue markers. libmpdclient swallows unknown song-row pairs, so this is safe
+    // for strict clients; emitted only for a library song (a stream has no album).
+    if let Some(al) = &s.album_id {
+        p.push(("X-AlbumUri".to_string(), format!("album/{}", al.0)));
+    }
     if let Some(t) = s.track {
         p.push(("Track".to_string(), t.to_string()));
     }
@@ -4987,6 +5025,27 @@ mod tests {
             }
             other => panic!("expected Stream, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn add_album_uri_is_routed_to_resolution_not_rejected() {
+        // `add album/<id>` must no longer ACK "unsupported uri": it now routes into
+        // album_songs resolution. Against the unreachable test server that resolve
+        // fails, so the response is a NO_EXIST ACK carrying a network error - the
+        // point is that the uri class is HANDLED, not rejected as unsupported, and
+        // NO stream/song item leaks into the queue.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h.handle(MpdCommand::Add("album/whatever".to_string())).await;
+        match resp {
+            MpdResponse::Ack { message, .. } => {
+                assert!(
+                    !message.contains("unsupported uri"),
+                    "album uri must be resolved, not rejected: {message}"
+                );
+            }
+            other => panic!("expected an ACK from the unreachable resolve, got {other:?}"),
+        }
+        assert!(h.state.lock().unwrap().queue.is_empty(), "no item leaks on a failed album add");
     }
 
     #[tokio::test]
