@@ -4,6 +4,7 @@
 //! and the event loop in main.rs does all the IO.
 
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -28,6 +29,21 @@ pub fn search_jump(labels: &[&str], query: &str, origin: usize) -> Option<usize>
     if query.is_empty() {
         return Some(origin);
     }
+    search_step(labels, query, origin, true)
+}
+
+/// Scan for the next case-insensitive `contains` match starting AT `origin`,
+/// stepping forward (`forward`) or backward, wrapping once through the whole list.
+/// Pure and testable - the shared engine behind `search_jump` (forward from the
+/// origin) and the `n`/`N` repeat-search jumps (which step off the current match).
+///
+/// - empty query -> `None`
+/// - empty list -> `None`
+/// - no match -> `None`
+pub fn search_step(labels: &[&str], query: &str, origin: usize, forward: bool) -> Option<usize> {
+    if query.is_empty() {
+        return None;
+    }
     let n = labels.len();
     if n == 0 {
         return None;
@@ -35,7 +51,11 @@ pub fn search_jump(labels: &[&str], query: &str, origin: usize) -> Option<usize>
     let q = query.to_lowercase();
     let start = origin % n;
     for step in 0..n {
-        let i = (start + step) % n;
+        let i = if forward {
+            (start + step) % n
+        } else {
+            (start + n - (step % n)) % n
+        };
         if labels[i].to_lowercase().contains(&q) {
             return Some(i);
         }
@@ -83,21 +103,31 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
                 label: path_tail(v).to_string(),
                 uri: v.clone(),
                 is_dir: true,
+                song_count: None,
             }),
             "file" => rows.push(BrowseRow {
                 label: path_tail(v).to_string(),
                 uri: v.clone(),
                 is_dir: false,
+                song_count: None,
             }),
             "playlist" => rows.push(BrowseRow {
                 label: v.clone(),
                 uri: v.clone(),
                 is_dir: false,
+                song_count: None,
             }),
             "Album" | "Genre" => {
                 if let Some(last) = rows.last_mut() {
                     if last.is_dir {
                         last.label = v.clone();
+                    }
+                }
+            }
+            "X-SongCount" => {
+                if let Some(last) = rows.last_mut() {
+                    if last.is_dir {
+                        last.song_count = v.parse().ok();
                     }
                 }
             }
@@ -119,6 +149,45 @@ pub fn parse_browse(pairs: &[(String, String)]) -> Vec<BrowseRow> {
         }
     }
     rows
+}
+
+/// How much of an album currently sits in the queue, for the browse gutter marker.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum QueueMark {
+    None,
+    Partial,
+    Full,
+}
+
+/// Classify an album's queue presence from the count of its DISTINCT queued songs
+/// and its total track count. Pure and testable.
+///
+/// - `queued_count == 0` -> [`QueueMark::None`]
+/// - a known `song_count > 0` with `queued_count >= song_count` -> [`QueueMark::Full`]
+/// - otherwise (some queued, but fewer than the count OR the count is unknown/0)
+///   -> [`QueueMark::Partial`]
+///
+/// The unknown/`0` songCount case degrades to Partial for any queued track - never
+/// a false Full. Because the caller counts DISTINCT queued song ids, a duplicated
+/// queued track cannot inflate the count past the album size.
+pub fn album_mark(queued_count: usize, song_count: Option<u32>) -> QueueMark {
+    if queued_count == 0 {
+        return QueueMark::None;
+    }
+    match song_count {
+        Some(n) if n > 0 && queued_count >= n as usize => QueueMark::Full,
+        _ => QueueMark::Partial,
+    }
+}
+
+/// The single ASCII gutter glyph for a browse row's queue state (`#` full, `~`
+/// partial, ` ` none). ASCII so terminals without good unicode still render it.
+pub fn queue_mark_glyph(mark: QueueMark) -> char {
+    match mark {
+        QueueMark::Full => '#',
+        QueueMark::Partial => '~',
+        QueueMark::None => ' ',
+    }
 }
 
 /// The last `/`-separated segment of a browse path, used as a fallback row label.
@@ -167,6 +236,10 @@ pub struct BrowseRow {
     pub label: String,
     pub uri: String,
     pub is_dir: bool,
+    /// Total track count for an album dir row, from the daemon's non-standard
+    /// `X-SongCount` pair. Drives the full-vs-partial queue marker; `None` when the
+    /// listing does not carry it (song rows, playlists, missing count).
+    pub song_count: Option<u32>,
 }
 
 /// A self-contained browse list with its own cursor, scroll offset, nav stack, and
@@ -348,6 +421,10 @@ pub struct TuiState {
     /// The active cursor saved when `/` is pressed, so Esc can restore it after a
     /// non-destructive jump-to-match search.
     pub search_origin: usize,
+    /// The last ACCEPTED search query (set on Enter, cleared on a new `/` and on a
+    /// screen change). Drives `n`/`N` repeat jumps and the standing substring
+    /// highlight while in Normal mode; empty means no standing search.
+    pub last_search: String,
     /// True while a `Req::Refresh` is outstanding on the worker (set when one is
     /// sent, cleared when its `Snapshot` lands). Gates wake-driven refreshes so a
     /// wake-storm collapses to one refresh (see [`wake_wants_refresh`]).
@@ -384,6 +461,7 @@ impl Default for TuiState {
             queue_version: None,
             art: None,
             search_origin: 0,
+            last_search: String::new(),
             refresh_in_flight: false,
             refresh_dirty: false,
             epoch: 0,
@@ -523,18 +601,32 @@ impl TuiState {
             // `s` stars the SELECTED row; `f` is freed (vim find idiom now on `/`).
             KeyCode::Char('s') => self.favorite_selected(),
             KeyCode::Char('f') => None,
+            // `n`/`N` repeat the last accepted search over the active list, stepping
+            // OFF the current match (origin +/- 1) so they never re-find in place;
+            // no standing search -> no-op.
+            KeyCode::Char('n') => {
+                self.repeat_search(true);
+                None
+            }
+            KeyCode::Char('N') => {
+                self.repeat_search(false);
+                None
+            }
             // `o` OPENS (drills into) the selected browse directory.
             KeyCode::Char('o') => self.open_selected(),
             // Screen switch: 1/2/3 select the view; main.rs lazily fetches it.
             KeyCode::Char('1') => {
+                self.last_search.clear();
                 self.screen = Screen::Queue;
                 Some(Intent::ShowScreen(Screen::Queue))
             }
             KeyCode::Char('2') => {
+                self.last_search.clear();
                 self.screen = Screen::Albums;
                 Some(Intent::ShowScreen(Screen::Albums))
             }
             KeyCode::Char('3') => {
+                self.last_search.clear();
                 self.screen = Screen::Playlists;
                 Some(Intent::ShowScreen(Screen::Playlists))
             }
@@ -549,6 +641,7 @@ impl TuiState {
                 None
             }
             KeyCode::Char('/') => {
+                self.last_search.clear();
                 self.search_origin = self.active_cursor();
                 self.input.clear();
                 self.mode = Mode::Search;
@@ -725,6 +818,52 @@ impl TuiState {
         self.set_active_cursor(i);
     }
 
+    /// Repeat the last accepted search over the active list, stepping OFF the
+    /// current match: forward (`n`) from cursor+1, backward (`N`) from cursor-1,
+    /// wrapping once. A no-match or empty standing search leaves the cursor put.
+    fn repeat_search(&mut self, forward: bool) {
+        if self.last_search.is_empty() {
+            return;
+        }
+        let labels = self.active_labels();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let cur = self.active_cursor();
+        let origin = if forward { cur + 1 } else { cur.saturating_sub(1) };
+        if let Some(i) = search_step(&refs, &self.last_search, origin, forward) {
+            self.set_active_cursor(i);
+        }
+    }
+
+    /// The query currently driving the substring highlight: the live input while in
+    /// Search mode, else the standing `last_search` in Normal mode, else empty.
+    /// Used by the renderer to underline every matching row.
+    pub fn highlight_query(&self) -> &str {
+        match self.mode {
+            Mode::Search => &self.input,
+            Mode::Normal => &self.last_search,
+            _ => "",
+        }
+    }
+
+    /// Map of `album/<id>` -> the set of DISTINCT queued `song/<id>` uris for that
+    /// album, folded from the current queue. A set (not a count) so a duplicated
+    /// queued track cannot inflate an album past Full. Drives the browse markers.
+    pub fn queued_by_album(&self) -> HashMap<String, HashSet<String>> {
+        let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+        for it in &self.queue {
+            if let (Some(al), Some(uri)) = (&it.album_uri, &it.uri) {
+                map.entry(al.clone()).or_default().insert(uri.clone());
+            }
+        }
+        map
+    }
+
+    /// The set of DISTINCT `song/<id>` uris currently in the queue, so an opened
+    /// album's song rows can be marked when they are already queued.
+    pub fn queued_uris(&self) -> HashSet<String> {
+        self.queue.iter().filter_map(|it| it.uri.clone()).collect()
+    }
+
     /// Incremental jump-to-match search: Char/Backspace re-run the jump, Enter
     /// accepts in place, Esc restores the pre-search cursor. Non-destructive.
     fn key_search(&mut self, key: KeyEvent) -> Option<Intent> {
@@ -736,6 +875,12 @@ impl TuiState {
                 None
             }
             KeyCode::Enter => {
+                // Keep the accepted query as the standing search for n/N + the
+                // post-accept highlight; an empty query (bare Enter) leaves any
+                // prior standing search untouched (Esc-like no-op).
+                if !self.input.is_empty() {
+                    self.last_search = self.input.clone();
+                }
                 self.mode = Mode::Normal;
                 self.input.clear();
                 None
@@ -861,7 +1006,13 @@ mod tests {
     }
 
     fn item(pos: usize) -> QueueItem {
-        QueueItem { pos, title: format!("t{pos}"), artist: None, uri: Some(format!("song/{pos}")) }
+        QueueItem {
+            pos,
+            title: format!("t{pos}"),
+            artist: None,
+            uri: Some(format!("song/{pos}")),
+            album_uri: None,
+        }
     }
 
     fn cmd(s: &str) -> Intent {
@@ -945,10 +1096,120 @@ mod tests {
         assert_eq!(s.handle_key(ch('<')), Some(Intent::Command("previous".into())));
         assert_eq!(s.handle_key(ch('>')), Some(Intent::Command("next".into())));
         assert_eq!(s.handle_key(ch('q')), Some(Intent::Quit));
-        // Bare n/b/f are freed - no transport.
+        // Bare b/f are freed - no transport. Bare n/N are the repeat-search jumps:
+        // with no standing search they are inert no-ops (return None, cursor put).
         assert_eq!(s.handle_key(ch('n')), None);
+        assert_eq!(s.handle_key(ch('N')), None);
         assert_eq!(s.handle_key(ch('b')), None);
         assert_eq!(s.handle_key(ch('f')), None);
+    }
+
+    #[test]
+    fn n_and_shift_n_repeat_the_accepted_search() {
+        let mut s = TuiState::new();
+        s.albums.rows = vec![
+            brow("Alpha", "album/1", true),
+            brow("Beta", "album/2", true),
+            brow("Gamma", "album/3", true),
+            brow("beta two", "album/4", true),
+        ];
+        s.screen = Screen::Albums;
+        // No standing search -> n/N are inert.
+        s.handle_key(ch('n'));
+        assert_eq!(s.albums.selected, 0);
+        // Accept a `/beta` search: it jumps to the first match (index 1).
+        s.handle_key(ch('/'));
+        for c in "beta".chars() {
+            s.handle_key(ch(c));
+        }
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.albums.selected, 1);
+        assert_eq!(s.last_search, "beta");
+        // n steps OFF the current match to the next one (index 3).
+        s.handle_key(ch('n'));
+        assert_eq!(s.albums.selected, 3);
+        // n again wraps back to index 1.
+        s.handle_key(ch('n'));
+        assert_eq!(s.albums.selected, 1);
+        // N steps backward, wrapping to index 3.
+        s.handle_key(ch('N'));
+        assert_eq!(s.albums.selected, 3);
+        // A screen switch clears the standing search (no stale highlight/jump).
+        s.handle_key(ch('1'));
+        assert_eq!(s.last_search, "");
+    }
+
+    #[test]
+    fn search_step_directions_wrap_and_case() {
+        let labels = ["Alpha", "Beta", "Gamma", "beta two"];
+        // Forward from origin 2 finds index 3 (wrapping would reach 1).
+        assert_eq!(search_step(&labels, "beta", 2, true), Some(3));
+        // Backward from origin 2 finds index 1.
+        assert_eq!(search_step(&labels, "beta", 2, false), Some(1));
+        // Case-insensitive.
+        assert_eq!(search_step(&labels, "GAMMA", 0, true), Some(2));
+        // Forward wrap from a late origin.
+        assert_eq!(search_step(&labels, "alpha", 3, true), Some(0));
+        // Empty query / empty list / no match -> None.
+        assert_eq!(search_step(&labels, "", 0, true), None);
+        assert_eq!(search_step(&[], "x", 0, true), None);
+        assert_eq!(search_step(&labels, "zzz", 0, true), None);
+    }
+
+    #[test]
+    fn album_mark_none_partial_full() {
+        // Nothing queued -> None.
+        assert_eq!(album_mark(0, Some(10)), QueueMark::None);
+        // All tracks queued (>= count) -> Full.
+        assert_eq!(album_mark(10, Some(10)), QueueMark::Full);
+        assert_eq!(album_mark(11, Some(10)), QueueMark::Full);
+        // Some but not all -> Partial.
+        assert_eq!(album_mark(3, Some(10)), QueueMark::Partial);
+        // Unknown or zero songCount with queued tracks -> Partial (never false Full).
+        assert_eq!(album_mark(3, None), QueueMark::Partial);
+        assert_eq!(album_mark(3, Some(0)), QueueMark::Partial);
+    }
+
+    #[test]
+    fn queued_by_album_dedups_and_groups() {
+        let mut s = TuiState::new();
+        let it = |pos: usize, uri: &str, al: &str| QueueItem {
+            pos,
+            title: format!("t{pos}"),
+            artist: None,
+            uri: Some(uri.into()),
+            album_uri: Some(al.into()),
+        };
+        // Two distinct songs of album/1, plus a DUPLICATE of song/1 (must not
+        // double-count), plus one song of album/2.
+        s.queue = vec![
+            it(0, "song/1", "album/1"),
+            it(1, "song/2", "album/1"),
+            it(2, "song/1", "album/1"),
+            it(3, "song/9", "album/2"),
+        ];
+        let map = s.queued_by_album();
+        assert_eq!(map.get("album/1").map(|s| s.len()), Some(2));
+        assert_eq!(map.get("album/2").map(|s| s.len()), Some(1));
+        // A full album/1 (count 2) marks Full despite the duplicate row.
+        assert_eq!(album_mark(map["album/1"].len(), Some(2)), QueueMark::Full);
+        assert!(s.queued_uris().contains("song/9"));
+    }
+
+    #[test]
+    fn parse_browse_captures_song_count_on_dir() {
+        let pairs: Vec<(String, String)> = vec![
+            ("directory".into(), "album/1".into()),
+            ("Album".into(), "X".into()),
+            ("X-SongCount".into(), "12".into()),
+            ("file".into(), "song/9".into()),
+            ("Title".into(), "T".into()),
+            // A stray count on a file row is ignored (not a dir).
+            ("X-SongCount".into(), "99".into()),
+        ];
+        let rows = parse_browse(&pairs);
+        assert_eq!(rows[0].song_count, Some(12));
+        assert_eq!(rows[1].song_count, None);
     }
 
     #[test]
@@ -1256,7 +1517,7 @@ mod tests {
     }
 
     fn brow(label: &str, uri: &str, is_dir: bool) -> BrowseRow {
-        BrowseRow { label: label.into(), uri: uri.into(), is_dir }
+        BrowseRow { label: label.into(), uri: uri.into(), is_dir, song_count: None }
     }
 
     #[test]
@@ -1371,9 +1632,23 @@ mod tests {
         ];
         let rows = parse_browse(&pairs);
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0], BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true });
-        assert_eq!(rows[1], BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false });
-        assert_eq!(rows[2], BrowseRow { label: "Starred".into(), uri: "Starred".into(), is_dir: false });
+        assert_eq!(
+            rows[0],
+            BrowseRow { label: "X".into(), uri: "album/1".into(), is_dir: true, song_count: None }
+        );
+        assert_eq!(
+            rows[1],
+            BrowseRow { label: "T - A".into(), uri: "song/9".into(), is_dir: false, song_count: None }
+        );
+        assert_eq!(
+            rows[2],
+            BrowseRow {
+                label: "Starred".into(),
+                uri: "Starred".into(),
+                is_dir: false,
+                song_count: None,
+            }
+        );
     }
 
     #[test]

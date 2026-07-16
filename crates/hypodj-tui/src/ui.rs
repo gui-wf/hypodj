@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use hypodj_client::model::NowPlaying;
 
-use crate::state::{Browse, Mode, Screen, TuiState};
+use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
 
 /// Draw the full jukebox: the screen-tab row, the active list
 /// (Queue/Albums/Playlists), then the Now Playing pane (album art + up-next
@@ -27,11 +27,86 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     render_tabs(f, chunks[0], state.screen);
     match state.screen {
         Screen::Queue => render_queue(f, chunks[1], state),
-        Screen::Albums => render_browse(f, chunks[1], &state.albums),
-        Screen::Playlists => render_browse(f, chunks[1], &state.playlists),
+        Screen::Albums => render_browse(f, chunks[1], &state.albums, state, true),
+        Screen::Playlists => render_browse(f, chunks[1], &state.playlists, state, false),
     }
     render_now(f, chunks[2], state);
     render_command(f, chunks[3], state);
+}
+
+/// Split `label` into styled spans, underlining+bolding the FIRST case-insensitive
+/// occurrence of `query`. The middle (match) span carries `hit`, the rest `base`.
+/// An empty query or no match is a fast path -> a single plain `base` span. The
+/// hit style is a MODIFIER (underline+bold), never a fg color: the selected row is
+/// already REVERSED, and a fg would invert into a background swatch on that row,
+/// whereas a modifier survives the reverse swap and stays legible everywhere. Pure
+/// and unit-tested.
+fn match_spans(label: &str, query: &str, base: Style, hit: Style) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return vec![Span::styled(label.to_string(), base)];
+    }
+    let needle = query.to_lowercase();
+    // Search on the ORIGINAL label and return byte offsets valid in it. We cannot
+    // reuse offsets from `label.to_lowercase()`: `to_lowercase` can change byte
+    // length (e.g. Turkish dotted-capital-I 'I' -> "i" combining, or German 'SS'
+    // -> "ss"), which would put the slice off a char boundary and panic the whole
+    // render. `find_ci` walks char boundaries of the original, so every offset is
+    // guaranteed valid there.
+    match find_ci(label, &needle) {
+        Some((start, end)) => {
+            let mut spans = Vec::new();
+            if start > 0 {
+                spans.push(Span::styled(label[..start].to_string(), base));
+            }
+            spans.push(Span::styled(label[start..end].to_string(), hit));
+            if end < label.len() {
+                spans.push(Span::styled(label[end..].to_string(), base));
+            }
+            spans
+        }
+        None => vec![Span::styled(label.to_string(), base)],
+    }
+}
+
+/// Find the FIRST case-insensitive occurrence of `needle_lower` (already
+/// lowercased) in `label`, returning a `(start, end)` byte range that is always
+/// valid in `label` (both ends land on char boundaries of the original). Unlike
+/// searching `label.to_lowercase()`, this never yields offsets that fall off a
+/// char boundary when the lowercase mapping changes byte length. An empty needle
+/// yields no match (callers treat an empty query as the fast path).
+fn find_ci(label: &str, needle_lower: &str) -> Option<(usize, usize)> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let starts: Vec<usize> = label.char_indices().map(|(i, _)| i).collect();
+    for &start in &starts {
+        // Lowercase the tail one char at a time, comparing against the needle as a
+        // growing prefix. Stop as soon as it diverges or matches.
+        let mut lowered = String::new();
+        let mut end = start;
+        for ch in label[start..].chars() {
+            for lc in ch.to_lowercase() {
+                lowered.push(lc);
+            }
+            end += ch.len_utf8();
+            if lowered.len() >= needle_lower.len() {
+                if lowered == needle_lower {
+                    return Some((start, end));
+                }
+                break;
+            }
+            if !needle_lower.starts_with(&lowered) {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// The substring-highlight style: underline + bold, composed over the selected
+/// row's REVERSED modifier (see [`match_spans`]).
+fn hit_style() -> Style {
+    Style::default().add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
 }
 
 /// A one-line tab strip: the active screen is REVERSED, the rest dim.
@@ -250,8 +325,77 @@ fn volume_slider(vol: u8, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{volume_slider, window_title};
+    use super::{hit_style, match_spans, volume_slider, window_title};
     use hypodj_client::model::NowPlaying;
+    use ratatui::style::Style;
+
+    #[test]
+    fn match_spans_splits_before_match_after() {
+        let base = Style::default();
+        let hit = hit_style();
+        // Case-insensitive middle match splits into (before, MATCH, after).
+        let spans = match_spans("Kind of Blue", "of", base, hit);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "Kind ");
+        assert_eq!(spans[1].content, "of");
+        assert_eq!(spans[1].style, hit);
+        assert_eq!(spans[2].content, " Blue");
+        assert_eq!(spans[0].style, base);
+    }
+
+    #[test]
+    fn match_spans_case_insensitive_and_edges() {
+        let base = Style::default();
+        let hit = hit_style();
+        // A match at the very start has no `before` span.
+        let spans = match_spans("Beta", "be", base, hit);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].content, "Be");
+        assert_eq!(spans[0].style, hit);
+        assert_eq!(spans[1].content, "ta");
+        // A match at the very end has no `after` span.
+        let spans = match_spans("Gamma", "MMA", base, hit);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[1].content, "mma");
+        assert_eq!(spans[1].style, hit);
+    }
+
+    #[test]
+    fn match_spans_empty_and_no_match_fast_path() {
+        let base = Style::default();
+        let hit = hit_style();
+        // Empty query -> one plain span.
+        let spans = match_spans("Alpha", "", base, hit);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, base);
+        // No match -> one plain span.
+        let spans = match_spans("Alpha", "zzz", base, hit);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content, "Alpha");
+        assert_eq!(spans[0].style, base);
+    }
+
+    #[test]
+    fn match_spans_non_ascii_lowercase_length_change_no_panic() {
+        let base = Style::default();
+        let hit = hit_style();
+        // 'I' (U+0130) lowercases to a 3-byte "i" + combining dot, growing the
+        // byte length. Offsets from the lowercased copy would slice off a char
+        // boundary of the original and panic; ours stay valid.
+        let dotted = "\u{0130}"; // Turkish dotted capital I
+        let label = format!("{dotted}a");
+        let spans = match_spans(&label, "a", base, hit);
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(joined, label);
+        assert!(spans.iter().any(|s| s.content == "a" && s.style == hit));
+        // A query that overshoots into the expanded lowercase must not match the
+        // dotted 'I' and must not panic.
+        let label = format!("a{dotted}b");
+        let spans = match_spans(&label, "b", base, hit);
+        let joined: String = spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(joined, label);
+        assert!(spans.iter().any(|s| s.content == "b" && s.style == hit));
+    }
 
     #[test]
     fn window_title_default_and_stopped_are_plain() {
@@ -344,17 +488,21 @@ mod tests {
 fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     let block = Block::default().borders(Borders::ALL).title("Queue");
     let current = state.now.song;
+    let query = state.highlight_query();
     let items: Vec<ListItem> = state
         .queue
         .iter()
         .map(|it| {
-            let base = match &it.artist {
-                Some(a) => format!("{}. {} - {}", it.pos + 1, it.title, a),
-                None => format!("{}. {}", it.pos + 1, it.title),
+            // The searchable label (matches active_labels for the Queue screen).
+            let label = match &it.artist {
+                Some(a) => format!("{} - {}", it.title, a),
+                None => it.title.clone(),
             };
             // Mark the current song row.
             let marker = if current == Some(it.pos) { "> " } else { "  " };
-            ListItem::new(Line::from(format!("{marker}{base}")))
+            let mut spans = vec![Span::raw(format!("{marker}{}. ", it.pos + 1))];
+            spans.extend(match_spans(&label, query, Style::default(), hit_style()));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items).block(block).highlight_style(
@@ -377,18 +525,43 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
 /// Render a browse screen (Albums/Playlists): the active `Browse.rows` in a List,
 /// dirs marked with a trailing `/`, driven by the browse's own cursor + scrolloff
 /// offset. Reuses the same List+ListState mechanics as render_queue.
-fn render_browse(f: &mut Frame, area: ratatui::layout::Rect, browse: &Browse) {
+fn render_browse(
+    f: &mut Frame,
+    area: ratatui::layout::Rect,
+    browse: &Browse,
+    state: &TuiState,
+    markers: bool,
+) {
     let block = Block::default().borders(Borders::ALL).title(browse.title.clone());
+    let query = state.highlight_query();
+    // Queue-marker lookups (Albums screen only): album/<id> -> distinct queued song
+    // ids for the full/partial gutter, plus the flat queued-uri set for the song
+    // rows of an opened album.
+    let album_map = if markers { state.queued_by_album() } else { Default::default() };
+    let queued_uris = if markers { state.queued_uris() } else { Default::default() };
     let items: Vec<ListItem> = browse
         .rows
         .iter()
         .map(|r| {
-            let text = if r.is_dir {
-                format!("  {}/", r.label)
+            // Gutter glyph: for an album dir row, full/partial from queued vs total;
+            // for a song row (opened album), `#` when already queued. Two-char gutter
+            // (glyph + space) so it never collides with the REVERSED cursor bar.
+            let glyph = if !markers {
+                ' '
+            } else if r.is_dir {
+                let queued = album_map.get(&r.uri).map(|s| s.len()).unwrap_or(0);
+                queue_mark_glyph(album_mark(queued, r.song_count))
+            } else if queued_uris.contains(&r.uri) {
+                '#'
             } else {
-                format!("  {}", r.label)
+                ' '
             };
-            ListItem::new(Line::from(text))
+            let mut spans = vec![Span::raw(format!("{glyph} "))];
+            spans.extend(match_spans(&r.label, query, Style::default(), hit_style()));
+            if r.is_dir {
+                spans.push(Span::raw("/"));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)

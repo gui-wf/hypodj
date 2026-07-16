@@ -50,6 +50,10 @@ pub struct QueueItem {
     /// an `http(s)://...` URL for a raw stream). Needed to favorite the SELECTED
     /// row (`playlistadd Starred <uri>`); a stream has no star surface.
     pub uri: Option<String>,
+    /// The album browse uri (`album/<id>`) from the non-standard `X-AlbumUri` pair
+    /// the daemon emits per library song, so the TUI can group the queue by album
+    /// for the browse queue markers. `None` for a raw stream (no album).
+    pub album_uri: Option<String>,
 }
 
 /// Parse the flat `playlistinfo` pair list into structured queue items. Each entry
@@ -63,6 +67,7 @@ pub fn parse_queue(pairs: &[(String, String)]) -> Vec<QueueItem> {
             title: find(b, "Title").unwrap_or("(unknown)").to_string(),
             artist: find(b, "Artist").map(str::to_string),
             uri: find(b, "file").map(str::to_string),
+            album_uri: find(b, "X-AlbumUri").map(str::to_string),
         })
         .collect()
 }
@@ -156,13 +161,40 @@ mod tests {
                 title: "One".into(),
                 artist: Some("A".into()),
                 uri: Some("song/1".into()),
+                album_uri: None,
             }
         );
         // Second block has no Artist -> None.
         assert_eq!(
             q[1],
-            QueueItem { pos: 1, title: "Two".into(), artist: None, uri: Some("song/2".into()) }
+            QueueItem {
+                pos: 1,
+                title: "Two".into(),
+                artist: None,
+                uri: Some("song/2".into()),
+                album_uri: None,
+            }
         );
+    }
+
+    #[test]
+    fn parse_queue_reads_album_uri() {
+        // The daemon's non-standard X-AlbumUri pair groups a queued song by album.
+        let pairs = p(&[
+            ("file", "song/1"),
+            ("Title", "One"),
+            ("X-AlbumUri", "album/al-9"),
+            ("Pos", "0"),
+            ("Id", "1"),
+            // A stream row carries no X-AlbumUri -> None.
+            ("file", "http://stream.example/live"),
+            ("Title", "Live"),
+            ("Pos", "1"),
+            ("Id", "2"),
+        ]);
+        let q = parse_queue(&pairs);
+        assert_eq!(q[0].album_uri.as_deref(), Some("album/al-9"));
+        assert_eq!(q[1].album_uri, None);
     }
 
     #[test]
