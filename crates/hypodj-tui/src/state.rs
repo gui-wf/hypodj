@@ -441,6 +441,11 @@ pub struct TuiState {
     /// The track uri the art thread was last asked to fetch, so the render thread
     /// only sends one art request per track change.
     pub art_req_uri: Option<String>,
+    /// The ambient-visualizer clock, in seconds. The render loop advances this by
+    /// the wall-clock frame delta ONLY while playback is `play` (so it freezes when
+    /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
+    /// reads it as its animation phase. Pure display state - no key/logic meaning.
+    pub anim_secs: f64,
 }
 
 impl Default for TuiState {
@@ -466,6 +471,7 @@ impl Default for TuiState {
             refresh_dirty: false,
             epoch: 0,
             art_req_uri: None,
+            anim_secs: 0.0,
         }
     }
 }

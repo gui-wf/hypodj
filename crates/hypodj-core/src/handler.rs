@@ -920,6 +920,15 @@ const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// the baseline). Closer to 0 = shallower + faster; deeper = slower.
 const SKIP_DIP_DB: f64 = -18.0;
 
+/// The perceptual dB at which the wake/resume ramp-in first becomes HEARABLE, 20 dB
+/// above the -60 dB synth floor. The resume path reads the wall-clock LEAD - the
+/// time the wake ramp first crosses this level - off the real schedule and seeks
+/// the track back by that LEAD, so the playhead lands at the saved position at the
+/// first-audible instant (no audible content skipped or replayed under the inaudible
+/// head of the ramp). A judgement call on where mpv's cubic softvol becomes audible;
+/// named so it is easy to tune - higher loses audible content, lower rewinds more.
+const AUDIBILITY_DB: f64 = -40.0;
+
 /// One physical-potentiometer knob detent, in dB. 3 dB is a clear, EQUAL-loudness
 /// "one notch" everywhere on the range (a ~just-noticeable-strong step), curing the
 /// linear `setvol +/-5` unevenness (which is ~+18 dB near the bottom but ~+0.4 dB
@@ -2445,26 +2454,39 @@ impl HypodjHandler {
             let idx = new_current.expect("playing implies a current index");
             let elapsed = s.elapsed_secs.max(0.0);
             let saved_vol = s.volume.min(100);
+            let target_db = mpv_volume_to_db(saved_vol as f64);
+            // Smooth-restart ramp-IN: a QUICK deliberate ramp from silence to the
+            // user's SAVED level, using restart_fade_secs - the counterpart to the
+            // shutdown fade-OUT. NOT the long alarm wake_ramp_secs (8 min), which
+            // would leave the music barely audible for minutes after a rebuild.
+            let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.restart_fade_secs));
+            // The wake ramp starts SUB-audible: from the synth floor its whole lower
+            // stretch is inaudible. LEAD is the wall-clock time that ramp - the EXACT
+            // one start_fade_spec spawns below (live_gain_db == synth_floor here, so
+            // the two specs are identical) - first crosses AUDIBILITY_DB. Reading it
+            // off the REAL (sub-JND-extended) schedule, not the nominal duration, and
+            // seeking back by LEAD lands the playhead at the saved elapsed at the
+            // first-audible instant: no audible content skipped or replayed under the
+            // inaudible head. Falls back to no lead if the spec cannot be built.
+            let lead = self
+                .wake_ramp_spec(synth_floor, target_db, dur)
+                .ok()
+                .and_then(|spec| spec.time_to_reach_db(AUDIBILITY_DB))
+                .unwrap_or(Duration::ZERO);
             // Silence BEFORE the first buffer: mpv volume 0 persists across the
             // loadfile so the wake ramp owns the rise.
             let _ = self.player.set_volume(0).await;
             if let Err(e) = self.play_index_from_silence(idx).await {
                 return Err(e);
             }
-            // A library song seeks to the saved elapsed; a raw Stream restarts from
-            // 0 (no seek - a live stream has no seekable saved offset).
+            // A library song seeks to (saved elapsed - LEAD), clamped >= 0 so it
+            // never seeks before the track start; a raw Stream restarts from 0 (no
+            // seek - a live stream has no seekable saved offset).
             if current_is_song && elapsed > 0.0 {
-                let _ = self.player.seek(elapsed).await;
+                let target = (elapsed - lead.as_secs_f64()).max(0.0);
+                let _ = self.player.seek(target).await;
             }
-            // Smooth-restart ramp-IN: a QUICK deliberate ramp from silence to the
-            // user's SAVED level, using restart_fade_secs - the counterpart to the
-            // shutdown fade-OUT. NOT the long alarm wake_ramp_secs (8 min), which
-            // would leave the music barely audible for minutes after a rebuild.
-            let dur = self.clamp_fade_dur(Duration::from_secs(self.fade_cfg.restart_fade_secs));
-            let intent = FadeIntent::WakeTo {
-                target_db: mpv_volume_to_db(saved_vol as f64),
-                vol: saved_vol,
-            };
+            let intent = FadeIntent::WakeTo { target_db, vol: saved_vol };
             let _ = self.start_fade_spec(FadeRequest { intent, dur, commit_logical: None }).await;
         } else {
             // Paused/Stopped: restore the baseline volume, leave playback stopped.
@@ -2473,6 +2495,24 @@ impl HypodjHandler {
             let _ = self.player.set_volume(v).await;
         }
         Ok(())
+    }
+
+    /// Build the exact wake ramp-in [`FadeSpec`] the restore path spawns via
+    /// `start_fade_spec` for a [`FadeIntent::WakeTo`]: sub-JND (extends to honor the
+    /// per-step cap), `DbLinear`, from `from_db` up to `target_db`, at the configured
+    /// tick. Kept as a single source so the LEAD computed off this spec cannot drift
+    /// from the schedule the spawned fade actually runs (they agree today only
+    /// because `live_gain_db == synth_floor` at restore; the drift-guard test pins
+    /// the shared params). Pure aside from reading the live config.
+    fn wake_ramp_spec(
+        &self,
+        from_db: f64,
+        target_db: f64,
+        dur: Duration,
+    ) -> Result<FadeSpec, FadeError> {
+        let tick = Duration::from_millis(self.fade_cfg.tick_ms);
+        let bounds = startle_bounds(&self.fade_cfg, true);
+        FadeSpec::new(from_db, FadeTarget::Db(target_db), dur, tick, Curve::DbLinear, bounds)
     }
 
     /// Clamp a fade duration into the configured `[min_slew, max_dur]` window (the
@@ -4641,6 +4681,48 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_seek_target_is_elapsed_minus_lead() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let saved_vol = 73u8;
+        let target_db = mpv_volume_to_db(saved_vol as f64);
+        let synth_floor = h.fade_cfg.synth_floor_db;
+        // The EXACT wake ramp restore builds (from the synth floor, sub-JND extended).
+        let dur = h.clamp_fade_dur(Duration::from_secs(h.fade_cfg.restart_fade_secs));
+        let spec = h.wake_ramp_spec(synth_floor, target_db, dur).unwrap();
+        let lead = spec.time_to_reach_db(AUDIBILITY_DB).expect("ramp crosses audibility");
+        // A real sub-audible head exists, so the seek-back is strictly positive.
+        assert!(lead > Duration::ZERO);
+        // At t=LEAD into the ramp the schedule is first >= AUDIBILITY_DB, so seeking
+        // back by LEAD lands the playhead at `elapsed` at the first-audible instant.
+        // Big elapsed: target = elapsed - LEAD.
+        let e = 120.0_f64;
+        let target = (e - lead.as_secs_f64()).max(0.0);
+        assert!((target - (e - lead.as_secs_f64())).abs() < 1e-9);
+        assert!(target > 0.0);
+        // elapsed < LEAD clamps to 0 (never seeks before the track start).
+        let small = lead.as_secs_f64() / 2.0;
+        assert_eq!((small - lead.as_secs_f64()).max(0.0), 0.0);
+    }
+
+    #[test]
+    fn resume_lead_spec_matches_wake_intent_resolution() {
+        // Drift guard: the LEAD spec (wake_ramp_spec) and the fade start_fade_spec
+        // actually spawns for a WakeTo must share (from_db, target, sub_jnd, no
+        // clamp-up). start_fade_spec resolves the intent and, since WakeTo does NOT
+        // clamp_dur_up, uses `dur` verbatim with sub_jnd bounds - exactly what
+        // wake_ramp_spec assumes.
+        let saved_vol = 73u8;
+        let target_db = mpv_volume_to_db(saved_vol as f64);
+        let synth_floor = -60.0;
+        let intent = FadeIntent::WakeTo { target_db, vol: saved_vol };
+        let (target, sub_jnd, _terminal, clamp_dur_up) =
+            intent.resolve(synth_floor, -8.0, -45.0);
+        assert!(matches!(target, FadeTarget::Db(x) if (x - target_db).abs() < 1e-9));
+        assert!(sub_jnd, "wake_ramp_spec builds sub-JND bounds");
+        assert!(!clamp_dur_up, "WakeTo never clamps the duration up, so LEAD uses dur verbatim");
     }
 
     #[test]
