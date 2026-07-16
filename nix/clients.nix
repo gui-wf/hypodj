@@ -18,8 +18,8 @@
 # Runtime cc is gated on `claude` being on PATH (cc_available), so this package runs
 # unchanged on a machine without it (falls back to the daemon `nl` path). The check
 # phase is CERTLESS + network-less: cc_available() is false, so no live `claude`
-# call ever runs - only the PURE cc unit tests (prompt build, NDJSON parse, envelope
-# + stream-json settle/fallback) execute.
+# call ever runs - only the PURE cc unit tests (prompt build, envelope parse +
+# off-surface rejection) execute.
 rustPlatform.buildRustPackage {
   pname = "hypodj-clients";
   version = "0.1.0";
