@@ -2,7 +2,10 @@
 //! the daemon stamps a per-connection owner_key, and `nl confirm`/`nl cancel`
 //! only work on the SAME socket that ran the translate (a connect-per-command
 //! client is silently rejected). So open once, verify the greeting, run every
-//! command on it, never reconnect. NEVER send `idle`.
+//! command on it, never reconnect. NEVER send `idle` on THIS command socket - the
+//! owner-scoped `nl confirm`/`nl cancel` handshake must own the turn. `idle` is
+//! allowed ONLY on a dedicated, separate socket (see `idle_once`) that never runs
+//! owner-scoped commands.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -93,6 +96,61 @@ impl MpdConn {
         }
         Ok(parse_pairs(&body))
     }
+
+    /// Clear the read timeout on this socket (blocking reads park indefinitely).
+    ///
+    /// The dedicated idle socket MUST call this right after connect: `idle`
+    /// legitimately blocks for minutes waiting for a subsystem change, so reusing
+    /// the 5s [`IO_TIMEOUT`] would fire spuriously every 5s and demote the push
+    /// socket to a 5s poller - the single most likely liveness bug. Never call this
+    /// on the command socket (its bounded timeout is what keeps a wedged daemon from
+    /// freezing the UI past 5s).
+    pub fn clear_read_timeout(&self) -> std::io::Result<()> {
+        self.stream.set_read_timeout(None)
+    }
+
+    /// A cloned handle on the underlying stream, for `TcpStream::shutdown(Both)` from
+    /// another thread to unblock a read parked in [`idle_once`] or `command` at quit.
+    /// The clone shares the same OS socket; a shutdown on it tears down the read.
+    pub fn shutdown_handle(&self) -> std::io::Result<TcpStream> {
+        self.stream.try_clone()
+    }
+
+    /// Issue ONE `idle` and block until the daemon reports a change (or a `noidle`
+    /// interrupt yields a bare `OK`). Returns the changed subsystems parsed from the
+    /// `changed: <sys>` lines (empty on a bare `OK`). This is the ONLY command that
+    /// may run on a dedicated non-command socket; it needs no owner_key. Requires
+    /// [`clear_read_timeout`] first, else it self-limits to the 5s IO timeout.
+    pub fn idle_once(&mut self) -> Result<Vec<String>, MpdError> {
+        self.stream.write_all(b"idle\n").map_err(|e| MpdError::Io(e.to_string()))?;
+        self.stream.flush().map_err(|e| MpdError::Io(e.to_string()))?;
+        let mut body = Vec::new();
+        loop {
+            let l = self.read_line()?;
+            if l == "OK" {
+                break;
+            }
+            if l.starts_with("ACK ") || l == "ACK" {
+                return Err(MpdError::Ack(ack_message(&l)));
+            }
+            body.push(l);
+        }
+        Ok(parse_changed(&body))
+    }
+}
+
+/// Parse the changed subsystems from an `idle` response body: each `changed: <sys>`
+/// line yields one subsystem. Tolerant by design - 0..N lines, unknown values pass
+/// through, a bare `OK` (or any non-`changed:` line) yields an empty Vec. The daemon
+/// today always emits exactly `changed: player` (a single conservative wake), but
+/// this already exploits per-subsystem granularity if the daemon later carries it.
+/// Pure and testable.
+pub fn parse_changed(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("changed: ").map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Extract the human message from an ACK line: everything after the LAST '}'
@@ -136,6 +194,24 @@ mod tests {
             ack_message("ACK [5@0] {nl} plan no longer valid: queue changed"),
             "plan no longer valid: queue changed"
         );
+    }
+
+    #[test]
+    fn parse_changed_tolerates_zero_n_and_unknown() {
+        // Single wake (what the daemon emits today).
+        assert_eq!(parse_changed(&v(&["changed: player"])), vec!["player".to_string()]);
+        // Multiple subsystems in one idle response.
+        assert_eq!(
+            parse_changed(&v(&["changed: playlist", "changed: mixer"])),
+            vec!["playlist".to_string(), "mixer".to_string()]
+        );
+        // Bare OK / empty -> no subsystems (an interrupt wake).
+        assert!(parse_changed(&v(&["OK"])).is_empty());
+        assert!(parse_changed(&v(&[])).is_empty());
+        // Unknown subsystem values pass through untouched (forward-compatible).
+        assert_eq!(parse_changed(&v(&["changed: foo"])), vec!["foo".to_string()]);
+        // Non-changed lines are ignored.
+        assert!(parse_changed(&v(&["OK MPD 0.23.0", "list_OK"])).is_empty());
     }
 
     #[test]

@@ -288,6 +288,24 @@ pub fn coalesce_intents(intents: Vec<Intent>) -> Vec<Intent> {
     out
 }
 
+/// Decide whether an inbound `idle` wake should enqueue a `Refresh`, given whether
+/// a refresh is already in flight. A wake with nothing in flight starts one (returns
+/// true, caller sets the in-flight bool); a wake while one is in flight is dropped
+/// (returns false) so a wake-storm - e.g. a fade ramp firing `changed` on every
+/// volume step - collapses to a SINGLE version-gated refresh. Pure and testable.
+pub fn wake_wants_refresh(refresh_in_flight: bool) -> bool {
+    !refresh_in_flight
+}
+
+/// Whether an inbound worker response tagged with `resp_epoch` is stale and must be
+/// dropped, given the render thread's current `epoch`. The epoch bumps on every
+/// reconnect, so a response computed against a since-dead socket (epoch strictly
+/// less than current) is discarded rather than folded into a fresh connection's
+/// state. Pure and testable.
+pub fn resp_is_stale(resp_epoch: u64, current_epoch: u64) -> bool {
+    resp_epoch < current_epoch
+}
+
 /// Build a single coalesced relative-seek intent (`seekcur +N` keeps the sign).
 fn scrub_intent(secs: i32) -> Intent {
     let arg = if secs >= 0 {
@@ -330,6 +348,22 @@ pub struct TuiState {
     /// The active cursor saved when `/` is pressed, so Esc can restore it after a
     /// non-destructive jump-to-match search.
     pub search_origin: usize,
+    /// True while a `Req::Refresh` is outstanding on the worker (set when one is
+    /// sent, cleared when its `Snapshot` lands). Gates wake-driven refreshes so a
+    /// wake-storm collapses to one refresh (see [`wake_wants_refresh`]).
+    pub refresh_in_flight: bool,
+    /// Set when a wake (or a mutation-driven refresh request) is suppressed because a
+    /// refresh is already in flight. The outstanding refresh may have read the server
+    /// state BEFORE the suppressed change landed, so when its Snapshot (or a Banner
+    /// that clears the gate) arrives we re-arm exactly one more refresh to catch up.
+    /// Without this a lost wake is not reflected until the 5s safety-net refresh.
+    pub refresh_dirty: bool,
+    /// The connection epoch, bumped on every worker reconnect. A response tagged
+    /// with an older epoch is stale and dropped (see [`resp_is_stale`]).
+    pub epoch: u64,
+    /// The track uri the art thread was last asked to fetch, so the render thread
+    /// only sends one art request per track change.
+    pub art_req_uri: Option<String>,
 }
 
 impl Default for TuiState {
@@ -350,6 +384,10 @@ impl Default for TuiState {
             queue_version: None,
             art: None,
             search_origin: 0,
+            refresh_in_flight: false,
+            refresh_dirty: false,
+            epoch: 0,
+            art_req_uri: None,
         }
     }
 }
@@ -390,6 +428,13 @@ impl TuiState {
         self.connected = false;
         self.pending = None;
         self.mode = Mode::Normal;
+        // A refresh outstanding on the dead socket will never land a Snapshot (a
+        // Disconnected arrives instead); clear the gate so a post-reconnect wake can
+        // drive a fresh refresh.
+        self.refresh_in_flight = false;
+        // The command worker pushes a catch-up Snapshot on reconnect, so a suppressed
+        // wake from the dead socket needs no re-arm; drop the dirty bit.
+        self.refresh_dirty = false;
         // Force a full queue re-fetch on reconnect: the queue may have changed while
         // we were away, and the fresh socket's version numbering may differ.
         self.queue_version = None;
@@ -511,6 +556,17 @@ impl TuiState {
             }
             KeyCode::Char('q') => Some(Intent::Quit),
             _ => None,
+        }
+    }
+
+    /// The browse list for a specific target screen, if it is a browse screen. Used
+    /// to fold a worker `Browse` response into the right list even if the user has
+    /// since switched screens while the fetch was in flight.
+    pub fn browse_for(&mut self, target: Screen) -> Option<&mut Browse> {
+        match target {
+            Screen::Queue => None,
+            Screen::Albums => Some(&mut self.albums),
+            Screen::Playlists => Some(&mut self.playlists),
         }
     }
 
@@ -823,6 +879,23 @@ mod tests {
         assert_eq!(coalesce_intents(batch), vec![cmd("seekcur -5")]);
         // A net-zero burst emits nothing (no spurious seek).
         assert_eq!(coalesce_intents(vec![cmd("seekcur +5"), cmd("seekcur -5")]), vec![]);
+    }
+
+    #[test]
+    fn wake_gate_collapses_a_storm_to_one_refresh() {
+        // First wake with nothing in flight -> start a refresh.
+        assert!(wake_wants_refresh(false));
+        // A wake while a refresh is already in flight -> dropped (storm collapses).
+        assert!(!wake_wants_refresh(true));
+    }
+
+    #[test]
+    fn stale_resp_dropped_below_current_epoch() {
+        // A response from before a reconnect (older epoch) is stale.
+        assert!(resp_is_stale(0, 1));
+        // Same-epoch and future-epoch responses are live.
+        assert!(!resp_is_stale(1, 1));
+        assert!(!resp_is_stale(2, 1));
     }
 
     #[test]
