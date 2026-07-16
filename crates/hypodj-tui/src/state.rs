@@ -249,6 +249,55 @@ pub enum Intent {
     Quit,
 }
 
+/// The relative-seek delta of a `seekcur +N` / `seekcur -N` command line, or None
+/// if it is not a relative scrub. Used to coalesce a held-scrub burst.
+fn seekcur_delta(line: &str) -> Option<i32> {
+    let rest = line.strip_prefix("seekcur ")?;
+    if rest.starts_with('+') || rest.starts_with('-') {
+        rest.parse::<i32>().ok()
+    } else {
+        None
+    }
+}
+
+/// Coalesce a frame's drained intents so a burst of held-key autorepeat collapses
+/// into ONE real action instead of a backlog. Consecutive relative scrubs
+/// (`seekcur +/-N`) SUM into a single seek; everything else passes through in
+/// order. This is what makes holding a key track the finger and stop the instant
+/// it is released - the loop then applies the REAL summed effect (no faked UI
+/// preview, no queued backlog draining after release). Pure and testable.
+pub fn coalesce_intents(intents: Vec<Intent>) -> Vec<Intent> {
+    let mut out: Vec<Intent> = Vec::new();
+    let mut scrub: i32 = 0;
+    for it in intents {
+        if let Intent::Command(line) = &it {
+            if let Some(d) = seekcur_delta(line) {
+                scrub = scrub.saturating_add(d);
+                continue;
+            }
+        }
+        if scrub != 0 {
+            out.push(scrub_intent(scrub));
+            scrub = 0;
+        }
+        out.push(it);
+    }
+    if scrub != 0 {
+        out.push(scrub_intent(scrub));
+    }
+    out
+}
+
+/// Build a single coalesced relative-seek intent (`seekcur +N` keeps the sign).
+fn scrub_intent(secs: i32) -> Intent {
+    let arg = if secs >= 0 {
+        format!("+{secs}")
+    } else {
+        secs.to_string()
+    };
+    Intent::Command(format!("seekcur {arg}"))
+}
+
 pub struct TuiState {
     pub now: NowPlaying,
     pub queue: Vec<QueueItem>,
@@ -757,6 +806,40 @@ mod tests {
 
     fn item(pos: usize) -> QueueItem {
         QueueItem { pos, title: format!("t{pos}"), artist: None, uri: Some(format!("song/{pos}")) }
+    }
+
+    fn cmd(s: &str) -> Intent {
+        Intent::Command(s.to_string())
+    }
+
+    #[test]
+    fn coalesce_sums_a_held_scrub_burst_into_one_seek() {
+        // A held Space burst: five +5 scrubs collapse to a single +25 seek, so the
+        // player jumps once instead of draining five queued seeks after release.
+        let batch = (0..5).map(|_| cmd("seekcur +5")).collect();
+        assert_eq!(coalesce_intents(batch), vec![cmd("seekcur +25")]);
+        // Mixed directions net out (held back then forward).
+        let batch = vec![cmd("seekcur -5"), cmd("seekcur -5"), cmd("seekcur +5")];
+        assert_eq!(coalesce_intents(batch), vec![cmd("seekcur -5")]);
+        // A net-zero burst emits nothing (no spurious seek).
+        assert_eq!(coalesce_intents(vec![cmd("seekcur +5"), cmd("seekcur -5")]), vec![]);
+    }
+
+    #[test]
+    fn coalesce_preserves_order_around_non_scrub() {
+        // Non-scrub intents pass through in order; a scrub run flushes as one seek
+        // before the next distinct action. Absolute setvol is NOT a relative scrub.
+        let batch = vec![
+            cmd("seekcur +5"),
+            cmd("seekcur +5"),
+            cmd("knob down"),
+            cmd("seekcur -5"),
+            cmd("setvol 40"),
+        ];
+        assert_eq!(
+            coalesce_intents(batch),
+            vec![cmd("seekcur +10"), cmd("knob down"), cmd("seekcur -5"), cmd("setvol 40")],
+        );
     }
 
     fn ctrl(c: char) -> KeyEvent {

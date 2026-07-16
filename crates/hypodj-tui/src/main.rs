@@ -73,20 +73,46 @@ fn event_loop(
             .draw(|f| ui::render(f, state))
             .map_err(|e| MpdError::Io(e.to_string()))?;
 
+        // Drain ALL key events queued this frame, not just one. Holding a key
+        // (autorepeat) floods events faster than one-per-frame handling drains
+        // them, so they back up - a felt delay starting, and input still
+        // processing after release ("it keeps scrubbing after I let go"). Draining
+        // + coalescing makes a held key track the finger and stop the instant it
+        // is released: the loop applies the REAL summed action, never a faked UI
+        // preview.
+        let mut intents: Vec<Intent> = Vec::new();
+        let mut quit = false;
         if event::poll(POLL).map_err(|e| MpdError::Io(e.to_string()))? {
-            if let Event::Key(key) = event::read().map_err(|e| MpdError::Io(e.to_string()))? {
-                if key.kind == event::KeyEventKind::Press || key.kind == event::KeyEventKind::Repeat
-                {
-                    if let Some(intent) = state.handle_key(key) {
-                        if matches!(intent, Intent::Quit) {
-                            break;
+            loop {
+                if let Event::Key(key) = event::read().map_err(|e| MpdError::Io(e.to_string()))? {
+                    if key.kind == event::KeyEventKind::Press
+                        || key.kind == event::KeyEventKind::Repeat
+                    {
+                        if let Some(intent) = state.handle_key(key) {
+                            if matches!(intent, Intent::Quit) {
+                                quit = true;
+                                break;
+                            }
+                            intents.push(intent);
                         }
-                        execute(conn, state, intent);
-                        sync_title(terminal, state, &mut last_title);
-                        sync_art(state, host, port);
                     }
                 }
+                // Stop once the queue drains; next iteration's poll(POLL) waits.
+                if !event::poll(Duration::ZERO).map_err(|e| MpdError::Io(e.to_string()))? {
+                    break;
+                }
             }
+        }
+        if quit {
+            break;
+        }
+        if !intents.is_empty() {
+            run_batch(conn, state, state::coalesce_intents(intents));
+            sync_title(terminal, state, &mut last_title);
+            // A play/next/prev in the batch can change the track; keep album art in
+            // step immediately instead of waiting for the 1s tick. sync_art is a
+            // cheap no-op when the uri is unchanged.
+            sync_art(state, host, port);
         }
 
         // Independently, tick roughly once a second: keep now-playing live, and
@@ -137,6 +163,31 @@ fn sync_title(
     if title != *last {
         terminal.backend_mut().execute(SetTitle(&title)).ok();
         *last = title;
+    }
+}
+
+/// Run a whole frame's (coalesced) intents, then refresh ONCE. Command intents
+/// run without their own per-intent refresh - a held-key burst then costs N cheap
+/// commands + a SINGLE refresh instead of N refreshes, which is what keeps the UI
+/// tracking the input in real time. Non-Command intents (browse/nl/confirm) are
+/// rare-fire and keep their own execute() handling.
+fn run_batch(conn: &mut MpdConn, state: &mut TuiState, intents: Vec<Intent>) {
+    let mut ran_command = false;
+    for intent in intents {
+        match intent {
+            Intent::Command(line) => match conn.command(&line) {
+                Ok(_) => ran_command = true,
+                Err(MpdError::Ack(m)) => state.status_msg = Some(map_ack_reason(&m)),
+                Err(_) => {
+                    state.mark_disconnected();
+                    return;
+                }
+            },
+            other => execute(conn, state, other),
+        }
+    }
+    if ran_command {
+        refresh(conn, state);
     }
 }
 
