@@ -304,7 +304,13 @@ fn arm(conn: &mut MpdConn, state: &mut TuiState) {
     }
 }
 
-/// Re-read status + currentsong + playlistinfo and apply the snapshot.
+/// Re-read now-playing and, only when the queue actually changed, the full queue.
+///
+/// `status` carries the MPD queue version (`playlist:`); the expensive
+/// `playlistinfo` (the whole queue) is re-fetched ONLY when that version differs
+/// from the one backing the held queue. The common actions - fav, volume, pause,
+/// seek, next/prev - never bump the queue version, so they cost two cheap commands
+/// (`status` + `currentsong`, ~1ms) instead of a whole-queue round-trip.
 fn refresh(conn: &mut MpdConn, state: &mut TuiState) {
     let status = match conn.command("status") {
         Ok(p) => p,
@@ -318,11 +324,24 @@ fn refresh(conn: &mut MpdConn, state: &mut TuiState) {
         Ok(p) => p,
         Err(_) => return state.mark_disconnected(),
     };
+    let now = now_playing(&status, &current);
+    let version = status
+        .iter()
+        .find(|(k, _)| k == "playlist")
+        .and_then(|(_, v)| v.parse::<u64>().ok());
+    // Fast path: queue version unchanged (and known) -> keep the held queue, update
+    // only the now-playing card. Slow path (first refresh, version change, or a
+    // server that omits the version) -> re-fetch the full queue.
+    if version.is_some() && version == state.queue_version {
+        state.apply_now(now);
+        return;
+    }
     let queue = match conn.command("playlistinfo") {
         Ok(p) => p,
         Err(_) => return state.mark_disconnected(),
     };
-    state.apply_snapshot(now_playing(&status, &current), parse_queue(&queue));
+    state.apply_snapshot(now, parse_queue(&queue));
+    state.queue_version = version;
 }
 
 /// While disconnected, try to open a fresh socket; on success swap it in.

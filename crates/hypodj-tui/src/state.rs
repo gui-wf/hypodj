@@ -241,6 +241,11 @@ pub struct TuiState {
     pub pending: Option<Pending>,
     pub status_msg: Option<String>,
     pub connected: bool,
+    /// The MPD queue version (`playlist:` in `status`) of the currently-held
+    /// `queue`. A refresh re-fetches the (expensive) full `playlistinfo` ONLY when
+    /// this changes, so the common actions that never touch the queue (fav, volume,
+    /// pause, seek) cost two cheap commands instead of a whole-queue round-trip.
+    pub queue_version: Option<u64>,
 }
 
 impl Default for TuiState {
@@ -258,6 +263,7 @@ impl Default for TuiState {
             pending: None,
             status_msg: None,
             connected: true,
+            queue_version: None,
         }
     }
 }
@@ -279,6 +285,12 @@ impl TuiState {
         }
     }
 
+    /// Update only the now-playing card, leaving the queue (and cursor) untouched.
+    /// Used by the fast refresh path when the queue version is unchanged.
+    pub fn apply_now(&mut self, now: NowPlaying) {
+        self.now = now;
+    }
+
     /// Enter the confirm popup for a pending plan.
     pub fn enter_confirm(&mut self, pending: Pending) {
         self.pending = Some(pending);
@@ -292,6 +304,9 @@ impl TuiState {
         self.connected = false;
         self.pending = None;
         self.mode = Mode::Normal;
+        // Force a full queue re-fetch on reconnect: the queue may have changed while
+        // we were away, and the fresh socket's version numbering may differ.
+        self.queue_version = None;
         // Browse caches were fetched on the dead socket; drop them so a reconnect
         // re-fetches on the next screen visit.
         self.albums.loaded = false;
@@ -865,6 +880,21 @@ mod tests {
         assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("stop".into())));
         assert_eq!(s.handle_key(ch('>')), Some(Intent::Command("next".into())));
         assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("knob up".into())));
+    }
+
+    #[test]
+    fn apply_now_keeps_queue_and_cursor() {
+        // The fast refresh path (queue version unchanged) updates only now-playing
+        // and must NOT touch the held queue or the cursor.
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1), item(2)]);
+        s.selected = 2;
+        let mut np = NowPlaying::default();
+        np.title = Some("New Track".into());
+        s.apply_now(np);
+        assert_eq!(s.now.title.as_deref(), Some("New Track"), "now-playing updated");
+        assert_eq!(s.queue.len(), 3, "queue untouched");
+        assert_eq!(s.selected, 2, "cursor untouched");
     }
 
     #[test]
