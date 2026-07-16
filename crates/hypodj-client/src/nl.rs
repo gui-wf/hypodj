@@ -16,6 +16,20 @@ pub fn nl_request(phrase: &str) -> String {
     format!("nl \"{escaped}\"")
 }
 
+/// Quote an arbitrary value as a SINGLE MPD command argument, mirroring the
+/// daemon tokenizer (`crates/hypodj-core/src/mpd.rs`): FIRST every '\' -> '\\',
+/// THEN every '"' -> '\"', wrapped in double quotes. Without this a value with a
+/// space (an album/song uri, a playlist name like `Chill Vibes`) is split by the
+/// tokenizer into several args and the server acts on the wrong/truncated value.
+/// Newlines/CR collapse to spaces (MPD is line-based, no newline escape).
+pub fn quote_arg(value: &str) -> String {
+    let escaped = value
+        .replace(['\n', '\r'], " ")
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
 /// Extract the token value (nl-<hex>) from the nl_token pair, if present.
 pub fn token_from_pairs(pairs: &[(String, String)]) -> Option<String> {
     pairs.iter().find(|(k, _)| k == "nl_token").map(|(_, v)| v.clone())
@@ -116,6 +130,15 @@ mod tests {
         // input:  a\b"c   -> escape \ first (a\\b"c), then " (a\\b\"c)
         let got = nl_request("a\\b\"c");
         assert_eq!(got, "nl \"a\\\\b\\\"c\"");
+    }
+
+    #[test]
+    fn quote_arg_wraps_spaces_and_escapes() {
+        // A uri/playlist name with a space stays a single tokenizer argument.
+        assert_eq!(quote_arg("song/al 1/track 2"), "\"song/al 1/track 2\"");
+        assert_eq!(quote_arg("Chill Vibes"), "\"Chill Vibes\"");
+        // Backslash escaped before quote, mirroring the daemon tokenizer.
+        assert_eq!(quote_arg("a\\b\"c"), "\"a\\\\b\\\"c\"");
     }
 
     #[test]
