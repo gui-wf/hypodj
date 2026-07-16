@@ -4,6 +4,7 @@
 //! and the blocking event loop. The pure logic lives in state.rs; rendering in
 //! ui.rs.
 
+mod art;
 mod state;
 mod ui;
 
@@ -44,6 +45,7 @@ fn run() -> Result<(), MpdError> {
     let mut state = TuiState::new();
     // Prime the panes before the first draw.
     refresh(&mut conn, &mut state);
+    sync_art(&mut state, &host, port);
 
     let res = event_loop(&mut terminal, &mut conn, &mut state, &host, port);
 
@@ -78,6 +80,7 @@ fn event_loop(
                         }
                         execute(conn, state, intent);
                         sync_title(terminal, state, &mut last_title);
+                        sync_art(state, host, port);
                     }
                 }
             }
@@ -93,9 +96,30 @@ fn event_loop(
                 try_reconnect(conn, state, host, port);
             }
             sync_title(terminal, state, &mut last_title);
+            sync_art(state, host, port);
         }
     }
     Ok(())
+}
+
+/// Fetch + cache the current track's cover art, but ONLY when the track uri
+/// changes (the fetch/decode is expensive; a stream or missing cover leaves `art`
+/// None and the panel shows a placeholder). Runs on a dedicated connection inside
+/// [`art::AlbumArt::load`], so it never desyncs the session's text socket.
+fn sync_art(state: &mut TuiState, host: &str, port: u16) {
+    let uri = state.now.file.clone();
+    let unchanged = matches!(
+        (&uri, &state.art),
+        (Some(u), Some(a)) if *u == a.uri
+    );
+    if unchanged {
+        return;
+    }
+    state.art = match uri.as_deref() {
+        // Library songs have cover art; a raw stream (http(s) uri) does not.
+        Some(u) if u.starts_with("song/") => art::AlbumArt::load(host, port, u),
+        _ => None,
+    };
 }
 
 /// Emit the OSC terminal title for the current now-playing, but only when it

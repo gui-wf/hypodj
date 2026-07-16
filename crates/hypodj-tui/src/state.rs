@@ -246,6 +246,10 @@ pub struct TuiState {
     /// this changes, so the common actions that never touch the queue (fav, volume,
     /// pause, seek) cost two cheap commands instead of a whole-queue round-trip.
     pub queue_version: Option<u64>,
+    /// Decoded cover art for the current track, cached by its uri (fetched on a
+    /// dedicated connection when the track changes). `None` for a stream, missing
+    /// art, or a fetch/decode failure - the art panel then shows a placeholder.
+    pub art: Option<crate::art::AlbumArt>,
 }
 
 impl Default for TuiState {
@@ -264,6 +268,7 @@ impl Default for TuiState {
             status_msg: None,
             connected: true,
             queue_version: None,
+            art: None,
         }
     }
 }

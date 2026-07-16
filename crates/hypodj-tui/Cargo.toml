@@ -17,3 +17,6 @@ hypodj-client = { path = "../hypodj-client" }
 ratatui.workspace = true
 crossterm.workspace = true
 thiserror.workspace = true
+# Album-art decode only. Trim to the two codecs Subsonic/Navidrome actually serve
+# (JPEG/PNG) so we do not pull the whole codec zoo; no default features.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

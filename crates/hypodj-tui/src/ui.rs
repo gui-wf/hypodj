@@ -1,7 +1,7 @@
 //! Thin TuiState -> Frame render. No state mutation beyond a scratch ListState for
 //! the queue highlight; all decisions come from TuiState.
 
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -11,24 +11,26 @@ use hypodj_client::model::NowPlaying;
 
 use crate::state::{Browse, Mode, Screen, TuiState};
 
-/// Draw the full jukebox: now-playing pane, a screen-tab row, the active list
-/// (Queue/Albums/Playlists), and the command/confirm line.
+/// Draw the full jukebox: the screen-tab row, the active list
+/// (Queue/Albums/Playlists), then the Now Playing pane (album art + up-next
+/// preview), and the command/confirm line. Now Playing sits BELOW the list, just
+/// above the command box.
 pub fn render(f: &mut Frame, state: &TuiState) {
     let chunks = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(1),  // screen tabs
+        Constraint::Min(3),     // active list
+        Constraint::Length(12), // Now Playing: album art + up-next preview
+        Constraint::Length(3),  // command / status
     ])
     .split(f.area());
 
-    render_now(f, chunks[0], &state.now);
-    render_tabs(f, chunks[1], state.screen);
+    render_tabs(f, chunks[0], state.screen);
     match state.screen {
-        Screen::Queue => render_queue(f, chunks[2], state),
-        Screen::Albums => render_browse(f, chunks[2], &state.albums),
-        Screen::Playlists => render_browse(f, chunks[2], &state.playlists),
+        Screen::Queue => render_queue(f, chunks[1], state),
+        Screen::Albums => render_browse(f, chunks[1], &state.albums),
+        Screen::Playlists => render_browse(f, chunks[1], &state.playlists),
     }
+    render_now(f, chunks[2], state);
     render_command(f, chunks[3], state);
 }
 
@@ -83,25 +85,122 @@ fn sanitize_title(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
-fn render_now(f: &mut Frame, area: ratatui::layout::Rect, np: &NowPlaying) {
+/// The Now Playing pane: the current track (album art + title/artist/album) on the
+/// left, a compact 3-track up-next preview on the right.
+fn render_now(f: &mut Frame, area: Rect, state: &TuiState) {
+    let cols = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+        .split(area);
+    render_current(f, cols[0], state);
+    render_next_up(f, cols[1], state);
+}
+
+/// Left of Now Playing: the dithered album art with title/artist/album beneath it.
+fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
+    let np = &state.now;
     let block = Block::default().borders(Borders::ALL).title("Now Playing");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
-    let lines: Vec<Line> = if stopped || empty {
-        vec![Line::from("nothing playing")]
-    } else {
-        let title = np.title.clone().unwrap_or_else(|| "(unknown)".to_string());
-        let sub: Vec<&str> = [np.artist.as_deref(), np.album.as_deref()]
-            .into_iter()
-            .flatten()
-            .collect();
-        vec![
-            Line::from(title),
-            Line::from(sub.join(" - ")),
-            Line::from(status_line(np)),
-        ]
+    if stopped || empty {
+        f.render_widget(Paragraph::new("nothing playing"), inner);
+        return;
+    }
+
+    // Reserve up to 4 rows at the bottom for title/artist/album + the playback
+    // status line (state | volume fader | position); the rest is art.
+    let text_h = 4u16.min(inner.height);
+    let art_h = inner.height.saturating_sub(text_h);
+    if art_h > 0 {
+        // Keep the art roughly square: each cell renders 2 vertical pixels, so a
+        // square cover is about (rows*2) columns wide. Clamp to the pane width.
+        let art_rows = art_h as usize;
+        let art_cols = (art_rows * 2).min(inner.width as usize);
+        let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
+        match &state.art {
+            Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
+            None => f.render_widget(art_placeholder(np), art_area),
+        }
+    }
+
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y + art_h,
+        width: inner.width,
+        height: text_h,
     };
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    let title = np.title.clone().unwrap_or_else(|| "(unknown)".to_string());
+    let mut lines = vec![Line::from(Span::styled(
+        title,
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    if let Some(artist) = np.artist.as_deref() {
+        lines.push(Line::from(artist.to_string()));
+    }
+    if let Some(album) = np.album.as_deref() {
+        lines.push(Line::from(Span::styled(
+            album.to_string(),
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    // Playback status: state | volume fader | N of M | M:SS.
+    lines.push(Line::from(Span::styled(
+        status_line(np),
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    f.render_widget(Paragraph::new(lines), text_area);
+}
+
+/// A dim placeholder shown when there is no cover art (stream, missing, or a fetch
+/// failure): a bordered box with a centered music glyph, so the layout still reads.
+fn art_placeholder(_np: &NowPlaying) -> Paragraph<'static> {
+    Paragraph::new(vec![Line::from("\u{266B}")])
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL))
+        .style(Style::default().add_modifier(Modifier::DIM))
+}
+
+/// Right of Now Playing: a compact preview of the next 3 queued tracks, each a
+/// bold title over a dim artist line - a smaller echo of the current-track card.
+fn render_next_up(f: &mut Frame, area: Rect, state: &TuiState) {
+    let block = Block::default().borders(Borders::ALL).title("Up Next");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    // The next tracks are those after the current song index, in queue order.
+    let start = state.now.song.map(|c| c + 1).unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut count = 0;
+    for it in state.queue.iter().skip(start) {
+        if count >= 3 {
+            break;
+        }
+        lines.push(Line::from(Span::styled(
+            format!("{}. {}", it.pos + 1, it.title),
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        if let Some(a) = it.artist.as_deref() {
+            lines.push(Line::from(Span::styled(
+                format!("   {a}"),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+        lines.push(Line::from(""));
+        count += 1;
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "end of queue",
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// "[playing|paused|stopped] | vol V% | N of M | M:SS" - hide unknown volume,
@@ -309,16 +408,11 @@ fn render_browse(f: &mut Frame, area: ratatui::layout::Rect, browse: &Browse) {
 fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     let block = Block::default().borders(Borders::ALL);
     let lines: Vec<Line> = match state.mode {
-        Mode::Normal => {
-            let hint = "keys: space/bksp=scrub p=pause </>=prev/next ^s=stop j/k=move g/G=top/bot f=fav 9/0=vol enter=play/open 1/2/3=view h=back  /=command  q=quit";
-            match &state.status_msg {
-                Some(msg) => vec![Line::from(msg.replace('\n', " "))],
-                None => vec![Line::from(Span::styled(
-                    hint,
-                    Style::default().add_modifier(Modifier::DIM),
-                ))],
-            }
-        }
+        // Only a status banner here (the key hints were removed); empty otherwise.
+        Mode::Normal => match &state.status_msg {
+            Some(msg) => vec![Line::from(msg.replace('\n', " "))],
+            None => vec![Line::from("")],
+        },
         Mode::Command => vec![Line::from(format!("> {}", state.input))],
         Mode::Confirm => {
             let mut ls = Vec::new();
