@@ -25,7 +25,7 @@ pub mod rules;
 // Echo rendering lives in hypodj-core (the handler renders the echo there and core
 // cannot depend on this crate); re-exported for the round-trip test + callers.
 pub use hypodj_core::echo::{describe_batch, describe_plan, render_dsl};
-pub use llm::{parse_llm_output, LlmRawPlan, LlmTrigger};
+pub use llm::{parse_llm_output, LlmActionKind, LlmRawPlan, LlmWhen};
 pub use rules::RulesTranslator;
 
 #[cfg(feature = "llm")]
@@ -488,14 +488,15 @@ mod tests {
 
     #[test]
     fn canned_constrained_json_parses_to_raw_plan() {
-        // Exactly what a GBNF-constrained decode would emit for the worked example.
-        let json = r#"{"trigger":{"kind":"queue_position","n":3,"base":"current_is_one"},"action":{"act":"fade","dir":"out","secs":30.0},"once":true}"#;
+        // Exactly the FLAT shape Claude emits for the worked example: a `type`
+        // discriminator + flat scalars, with the queue slot on `slot`.
+        let json = r#"{"type":"fade_out","secs":30.0,"when":"queue_position","slot":3,"once":true}"#;
         let raw = parse_llm_output(json).unwrap();
         assert_eq!(
             serde_json::to_value(&raw.trigger).unwrap(),
             serde_json::to_value(&RawTrigger::QueuePosition {
                 n: 3,
-                base: PosBase::CurrentIsOne
+                base: PosBase::Absolute
             })
             .unwrap()
         );

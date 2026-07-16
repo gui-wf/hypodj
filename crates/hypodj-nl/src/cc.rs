@@ -77,10 +77,18 @@ pub fn cc_available() -> bool {
 /// instruction; [`build_prompt`] then carries only the per-request context.
 pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music player. \
     Translate the DJ request into EXACTLY ONE JSON plan object matching the provided \
-    JSON schema, and output nothing else (no prose, no code fence). Only emit actions \
-    the schema allows (fade out/in, stop, pause, set_volume, enqueue query/genre/radio). \
-    If the request cannot be expressed in the schema, still emit your closest valid \
-    single plan.";
+    JSON schema, and output nothing else (no prose, no code fence). The object is FLAT: \
+    a required \"type\" (one of fade_out, fade_in, stop, pause, set_volume, enqueue), an \
+    optional \"when\" (one of now, after_current, after_secs, album_boundary, \
+    queue_position, time_remaining; omit it for an immediate action), and only the flat \
+    scalars the action needs: \"secs\" for a fade, \"level\" for set_volume, \
+    \"query\"/\"genre\"/\"radio\" plus \"count\" for enqueue, \"when_secs\" for \
+    after_secs/time_remaining, \"slot\" for queue_position. Do NOT nest a trigger or a \
+    selector object. If the request cannot be expressed, emit your closest valid single \
+    plan. Examples:\n\
+    Request: queue five calmer tracks -> {\"type\":\"enqueue\",\"query\":\"calmer tracks\",\"count\":5}\n\
+    Request: fade out the current track over 30 seconds -> {\"type\":\"fade_out\",\"secs\":30}\n\
+    Request: stop after this album -> {\"type\":\"stop\",\"when\":\"album_boundary\"}";
 
 /// Build the per-request user prompt: only the small live context the client already
 /// has (queue length, is-playing) plus the utterance, mirroring the local-model prompt
@@ -267,8 +275,7 @@ mod tests {
             "type":"result","subtype":"success","is_error":false,
             "result":"ignored when structured_output is present",
             "structured_output":{
-                "trigger":{"kind":"span_elapsed","secs":300.0},
-                "action":{"act":"fade","dir":"out","secs":10.0}
+                "type":"fade_out","secs":10.0,"when":"after_secs","when_secs":300.0
             }
         }"#;
         let raw = parse_envelope(env).unwrap();
@@ -281,19 +288,29 @@ mod tests {
     fn envelope_result_string_fallback_strips_fence() {
         // No structured_output: fall back to the (fence-wrapped) result string.
         let env = r#"{"type":"result","structured_output":null,
-            "result":"```json\n{\"trigger\":{\"kind\":\"track_after_current\"},\"action\":{\"act\":\"stop\"}}\n```"}"#;
+            "result":"```json\n{\"type\":\"stop\",\"when\":\"after_current\"}\n```"}"#;
         let raw = parse_envelope(env).unwrap();
         assert!(matches!(raw.action, Action::Stop));
+    }
+
+    #[test]
+    fn envelope_wrapper_array_result_parses() {
+        // Claude gravitates to a {"actions":[...]} wrapper in the free-text result;
+        // parse_llm_output tolerates it and plans the first action.
+        let env = r#"{"type":"result","structured_output":null,
+            "result":"{\"actions\":[{\"type\":\"pause\"}]}"}"#;
+        let raw = parse_envelope(env).unwrap();
+        assert!(matches!(raw.action, Action::Pause));
     }
 
     #[test]
     fn envelope_off_surface_body_is_rejected() {
         // A schema-violating / off-surface action (Wake) must map to a loud miss,
         // never a fabricated plan - the whole safety point of the subset re-parse.
-        let env = r#"{"structured_output":{"trigger":{"kind":"track_after_current"},"action":{"act":"wake","count":5}}}"#;
+        let env = r#"{"structured_output":{"type":"wake","count":5}}"#;
         assert!(parse_envelope(env).is_err());
         // A wall_clock trigger is off the model surface too.
-        let env = r#"{"structured_output":{"trigger":{"kind":"wall_clock","at":"2026-01-01T00:00:00Z"},"action":{"act":"stop"}}}"#;
+        let env = r#"{"structured_output":{"type":"stop","when":"wall_clock"}}"#;
         assert!(parse_envelope(env).is_err());
     }
 
