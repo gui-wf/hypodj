@@ -25,8 +25,38 @@ pub enum Action {
     Nl(String),
 }
 
+/// Is `w` one of the favorite/star bare verbs.
+fn is_favorite_verb(w: &str) -> bool {
+    matches!(w, "fav" | "favorite" | "favourite" | "star")
+}
+
+/// Filler words allowed in the tail of a bare-favorite phrase ("favorite THIS
+/// SONG", "star THE CURRENT track"). A superset of `is_filler_noun` plus the
+/// articles/determiners a human sprinkles in. ANY token outside this set in the
+/// tail means a real target ("favorite jazz") and disqualifies the shortcut.
+fn is_filler_word(w: &str) -> bool {
+    is_filler_noun(w) || matches!(w, "the" | "a" | "that" | "my")
+}
+
+/// A bare-favorite is a favorite verb followed only by filler words, at any
+/// length: "favorite this song", "star the current track", "fav this one". This
+/// runs BEFORE the length match so the natural phrasing (used by the ":" NL path
+/// and the DJ/Claude path alike) never reaches a translator that cannot express
+/// favorite and would degrade it to enqueue.
+fn is_bare_favorite(args: &[String]) -> bool {
+    match args.split_first() {
+        Some((verb, rest)) => {
+            is_favorite_verb(verb) && rest.iter().all(|w| is_filler_word(w))
+        }
+        None => false,
+    }
+}
+
 /// Route the argument vector (already split into tokens) to an Action.
 pub fn route(args: &[String]) -> Action {
+    if is_bare_favorite(args) {
+        return Action::FavoriteCurrent;
+    }
     match args.len() {
         0 => Action::NowPlaying,
         1 => route_one(&args[0], args),
@@ -157,6 +187,22 @@ mod tests {
         assert_eq!(r("star song"), Action::FavoriteCurrent);
         // A named target is not "the current track" -> NL (may resolve later).
         assert_eq!(r("favorite miles davis"), Action::Nl("favorite miles davis".into()));
+    }
+
+    #[test]
+    fn route_bare_favorite_natural_phrases() {
+        // Multi-word bare-favorite phrasing (the ":"/DJ NL trap) must resolve to
+        // the verb, never degrade to enqueue.
+        assert_eq!(r("favorite this song"), Action::FavoriteCurrent);
+        assert_eq!(r("star the current track"), Action::FavoriteCurrent);
+        assert_eq!(r("fav this one"), Action::FavoriteCurrent);
+        assert_eq!(r("favourite this"), Action::FavoriteCurrent);
+        assert_eq!(r("star this song"), Action::FavoriteCurrent);
+        // Regression guards: a real target in the tail is NOT a bare favorite.
+        assert_eq!(r("favorite jazz"), Action::Nl("favorite jazz".into()));
+        assert_eq!(r("star rating 5"), Action::Nl("star rating 5".into()));
+        // Unrelated intent untouched.
+        assert_eq!(r("queue jazz"), Action::Nl("queue jazz".into()));
     }
 
     #[test]
