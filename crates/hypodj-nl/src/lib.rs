@@ -13,6 +13,8 @@
 //! the LlmRawPlan <-> RawPlan conversion + the output parse are ALL model-free and
 //! always compiled. Only the constrained-decode BACKEND is behind `feature = "llm"`.
 
+#[cfg(feature = "cc")]
+pub mod cc;
 #[cfg(feature = "llm")]
 pub mod gbnf;
 #[cfg(feature = "llm-llama")]

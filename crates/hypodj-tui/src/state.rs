@@ -221,12 +221,14 @@ pub struct Pending {
 }
 
 /// Which main view is showing. Queue is the live-refreshed default; Albums and
-/// Playlists are lazily-fetched browse screens.
+/// Playlists are lazily-fetched browse screens; Dj is the Claude Code intelligence
+/// pane (right of Queue) that translates a typed NL query into a plan to confirm.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Screen {
     Queue,
     Albums,
     Playlists,
+    Dj,
 }
 
 /// One row in a browse list. `uri` is the server browse path (`album/<id>`,
@@ -318,6 +320,9 @@ pub enum Intent {
     Enqueue { uri: String, play: bool },
     /// Load a playlist by name (`load <name>`), appending to the queue.
     LoadPlaylist(String),
+    /// Translate a DJ View NL query via the Claude Code backend (on the dedicated CC
+    /// worker thread, never the command socket), ending in a Confirm popup.
+    Cc(String),
     /// Leave the session.
     Quit,
 }
@@ -446,6 +451,14 @@ pub struct TuiState {
     /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
     /// reads it as its animation phase. Pure display state - no key/logic meaning.
     pub anim_secs: f64,
+    /// The DJ View "ask>" input line (the NL query being typed on Screen::Dj).
+    pub dj_input: String,
+    /// The DJ View scrollback: coarse CC progress + result lines, newest at the
+    /// bottom. Bounded so a long session never grows without limit.
+    pub dj_log: Vec<String>,
+    /// The current CC phase line (e.g. "thinking..."), shown next to a spinner while
+    /// a call is in flight; `None` when idle.
+    pub dj_phase: Option<String>,
 }
 
 impl Default for TuiState {
@@ -472,6 +485,9 @@ impl Default for TuiState {
             epoch: 0,
             art_req_uri: None,
             anim_secs: 0.0,
+            dj_input: String::new(),
+            dj_log: Vec::new(),
+            dj_phase: None,
         }
     }
 }
@@ -548,6 +564,12 @@ impl TuiState {
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Intent> {
+        // The DJ View captures typing into its own "ask>" line (a DJ query is always
+        // NL), so nav/verb keys never shadow the input. `1`/`2`/`3` still tab away is
+        // NOT wanted here - Esc leaves the pane. Handled before the shared bindings.
+        if self.screen == Screen::Dj {
+            return self.key_dj(key);
+        }
         // Readline-style CONTROL bindings first, so a plain `p`/`n`/`s` never
         // shadows ctrl+p/ctrl+n (cursor), ctrl+f/ctrl+b (scrub), or ctrl+s (fav).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -636,6 +658,12 @@ impl TuiState {
                 self.screen = Screen::Playlists;
                 Some(Intent::ShowScreen(Screen::Playlists))
             }
+            // The DJ View (Claude Code intelligence pane), right of Queue.
+            KeyCode::Char('4') => {
+                self.last_search.clear();
+                self.screen = Screen::Dj;
+                Some(Intent::ShowScreen(Screen::Dj))
+            }
             // Back out of a browse drill-down (Queue: no-op).
             KeyCode::Char('h') | KeyCode::Left => self.browse_back(),
             // Esc backs out one browse level; on Queue / a browse root it no-ops.
@@ -663,7 +691,7 @@ impl TuiState {
     /// since switched screens while the fetch was in flight.
     pub fn browse_for(&mut self, target: Screen) -> Option<&mut Browse> {
         match target {
-            Screen::Queue => None,
+            Screen::Queue | Screen::Dj => None,
             Screen::Albums => Some(&mut self.albums),
             Screen::Playlists => Some(&mut self.playlists),
         }
@@ -672,7 +700,7 @@ impl TuiState {
     /// The active screen's browse list, if the active screen is a browse screen.
     pub fn active_browse(&mut self) -> Option<&mut Browse> {
         match self.screen {
-            Screen::Queue => None,
+            Screen::Queue | Screen::Dj => None,
             Screen::Albums => Some(&mut self.albums),
             Screen::Playlists => Some(&mut self.playlists),
         }
@@ -709,6 +737,8 @@ impl TuiState {
     /// and plays; Playlists loads the selected playlist. Drilling-in moved to `o`.
     fn enter_action(&mut self) -> Option<Intent> {
         match self.screen {
+            // Dj Enter is handled in key_dj (submit the query), never here.
+            Screen::Dj => None,
             Screen::Queue => self
                 .queue
                 .get(self.selected)
@@ -794,13 +824,15 @@ impl TuiState {
                 .collect(),
             Screen::Albums => self.albums.rows.iter().map(|r| r.label.clone()).collect(),
             Screen::Playlists => self.playlists.rows.iter().map(|r| r.label.clone()).collect(),
+            // The DJ pane has no navigable list to search.
+            Screen::Dj => Vec::new(),
         }
     }
 
     /// The active list's current cursor index (Queue or the active browse).
     fn active_cursor(&self) -> usize {
         match self.screen {
-            Screen::Queue => self.selected,
+            Screen::Queue | Screen::Dj => self.selected,
             Screen::Albums => self.albums.selected,
             Screen::Playlists => self.playlists.selected,
         }
@@ -809,7 +841,7 @@ impl TuiState {
     /// Set the active list's cursor index (Queue or the active browse).
     fn set_active_cursor(&mut self, i: usize) {
         match self.screen {
-            Screen::Queue => self.selected = i,
+            Screen::Queue | Screen::Dj => self.selected = i,
             Screen::Albums => self.albums.selected = i,
             Screen::Playlists => self.playlists.selected = i,
         }
@@ -994,6 +1026,49 @@ impl TuiState {
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(Intent::ConfirmArm),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Intent::ConfirmCancel),
             _ => None,
+        }
+    }
+
+    /// DJ View input: printable chars build the "ask>" query, Enter submits it as a
+    /// CC translation (always NL - a DJ query is never a bare verb), Esc leaves back
+    /// to the Queue screen. A blank Enter is a no-op.
+    fn key_dj(&mut self, key: KeyEvent) -> Option<Intent> {
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Queue;
+                self.dj_input.clear();
+                Some(Intent::ShowScreen(Screen::Queue))
+            }
+            KeyCode::Backspace => {
+                self.dj_input.pop();
+                None
+            }
+            KeyCode::Enter => {
+                let phrase = self.dj_input.trim().to_string();
+                self.dj_input.clear();
+                if phrase.is_empty() {
+                    return None;
+                }
+                self.push_dj_log(format!("> {phrase}"));
+                self.dj_phase = Some("thinking...".to_string());
+                Some(Intent::Cc(phrase))
+            }
+            KeyCode::Char(c) => {
+                self.dj_input.push(c);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Append one line to the DJ scrollback, bounding it so a long session never
+    /// grows without limit. Pure (no IO) - folded by the render thread on a CC frame.
+    pub fn push_dj_log(&mut self, line: String) {
+        const MAX_DJ_LOG: usize = 200;
+        self.dj_log.push(line);
+        if self.dj_log.len() > MAX_DJ_LOG {
+            let drop = self.dj_log.len() - MAX_DJ_LOG;
+            self.dj_log.drain(0..drop);
         }
     }
 }
@@ -1655,6 +1730,62 @@ mod tests {
                 song_count: None,
             }
         );
+    }
+
+    #[test]
+    fn key_4_opens_dj_view() {
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ch('4')), Some(Intent::ShowScreen(Screen::Dj)));
+        assert_eq!(s.screen, Screen::Dj);
+    }
+
+    #[test]
+    fn dj_input_builds_and_submits_as_cc() {
+        let mut s = TuiState::new();
+        s.handle_key(ch('4'));
+        assert_eq!(s.screen, Screen::Dj);
+        // Printable chars build the ask> line (never shadowed by nav/verb keys like
+        // `p`/`j`/`q`, which would be transport/nav on other screens).
+        for c in "pause the 3rd".chars() {
+            assert_eq!(s.handle_key(ch(c)), None);
+        }
+        assert_eq!(s.dj_input, "pause the 3rd");
+        // Backspace edits.
+        s.handle_key(key(KeyCode::Backspace));
+        assert_eq!(s.dj_input, "pause the 3r");
+        // Enter submits the whole line as a CC translation (always NL), logs the
+        // query, sets the thinking phase, and clears the input.
+        s.dj_input = "fade out".into();
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::Cc("fade out".into())));
+        assert_eq!(s.dj_input, "");
+        assert_eq!(s.dj_phase.as_deref(), Some("thinking..."));
+        assert!(s.dj_log.iter().any(|l| l == "> fade out"));
+        // A blank Enter is a no-op (no spurious CC call).
+        let mut s2 = TuiState::new();
+        s2.handle_key(ch('4'));
+        assert_eq!(s2.handle_key(key(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn dj_esc_returns_to_queue() {
+        let mut s = TuiState::new();
+        s.handle_key(ch('4'));
+        s.dj_input = "half typed".into();
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::ShowScreen(Screen::Queue)));
+        assert_eq!(s.screen, Screen::Queue);
+        assert_eq!(s.dj_input, "");
+    }
+
+    #[test]
+    fn dj_log_folds_and_bounds() {
+        let mut s = TuiState::new();
+        for i in 0..250 {
+            s.push_dj_log(format!("line {i}"));
+        }
+        // Bounded at 200, newest kept.
+        assert_eq!(s.dj_log.len(), 200);
+        assert_eq!(s.dj_log.last().unwrap(), "line 249");
+        assert_eq!(s.dj_log.first().unwrap(), "line 50");
     }
 
     #[test]

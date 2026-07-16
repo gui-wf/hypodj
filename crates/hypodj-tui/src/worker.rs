@@ -60,6 +60,12 @@ pub enum Req {
     Enqueue { uri: String, play: bool },
     /// `load <name>`, then refresh.
     Load(String),
+    /// Translate a DJ View NL query via the CLIENT-SIDE Claude Code CLI on the
+    /// DEDICATED CC worker (never the command socket, so a multi-second call can
+    /// never head-of-line-block commands). Carries the small context the client
+    /// already has. On a settled validated plan the worker posts a Confirm(Pending{
+    /// command: Some("plan add <dsl>")}), reusing the exact existing confirm path.
+    Cc { phrase: String, queue_len: usize, is_playing: bool },
     /// Run a browse command (`lsinfo <path>` or `listplaylists`), parse rows, reply.
     Browse { target: Screen, command: String, path: String, title: String, restore_sel: Option<usize> },
     /// Drain and stop the worker (quit teardown).
@@ -78,6 +84,17 @@ pub enum Inbound {
     Connected { epoch: u64 },
     /// The command socket dropped; the worker is reconnecting.
     Disconnected,
+    /// A coarse CC phase line (e.g. "thinking...") from the dedicated CC worker.
+    CcProgress(String),
+    /// A CC scrollback line (a settled result summary, or - once the stream-json
+    /// typewriter is enabled - a token delta) to append to the DJ View log.
+    CcDelta(String),
+    /// A settled, validated CC plan ready to confirm. NOT epoch-tagged (the CC worker
+    /// owns no socket), so it is never dropped as stale; it drives the standard
+    /// confirm popup and arms via the command worker's direct-`command` Arm path.
+    /// Only constructed under `feature = "cc"`; the variant stays for match parity.
+    #[cfg_attr(not(feature = "cc"), allow(dead_code))]
+    CcConfirm(Pending),
 }
 
 /// The parsed payload of a command-worker response. The worker parses via the pure
@@ -95,6 +112,9 @@ pub enum RespKind {
 /// The handles the render thread keeps to talk to (and tear down) the workers.
 pub struct Workers {
     pub req_tx: Sender<Req>,
+    /// The dedicated CC worker's request channel (Screen::Dj NL queries). Separate
+    /// from `req_tx` so a multi-second `claude` call never blocks the command socket.
+    pub cc_tx: Sender<Req>,
     pub inbound_rx: Receiver<Inbound>,
     pub art_tx: Sender<String>,
     pub stop: Arc<AtomicBool>,
@@ -139,10 +159,77 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
     // Art worker.
     {
         let host = host.to_string();
-        thread::spawn(move || art_worker(art_rx, in_tx, &host, port));
+        let in_tx_art = in_tx.clone();
+        thread::spawn(move || art_worker(art_rx, in_tx_art, &host, port));
     }
 
-    Ok(Workers { req_tx, inbound_rx: in_rx, art_tx, stop, cmd_shutdown, idle_shutdown })
+    // Dedicated CC worker: owns NO socket (it only shells out to `claude` and posts
+    // progress/confirm frames), so it can block for seconds without touching the
+    // command or idle sockets.
+    let (cc_tx, cc_rx) = mpsc::channel::<Req>();
+    {
+        let stop = stop.clone();
+        thread::spawn(move || cc_worker(cc_rx, in_tx, stop));
+    }
+
+    Ok(Workers { req_tx, cc_tx, inbound_rx: in_rx, art_tx, stop, cmd_shutdown, idle_shutdown })
+}
+
+/// The dedicated CC worker: for each [`Req::Cc`], post a coarse "thinking..." phase,
+/// run the client-side Claude Code CLI (feature = "cc"), and on a settled VALIDATED
+/// plan post a `Confirm(Pending{ command: Some("plan add <dsl>") })` - reusing the
+/// EXACT existing confirm + `Req::Arm` direct-command arm. A miss / disabled build
+/// posts a loud CcProgress line, never a fabricated plan. Owns no socket, so a
+/// multi-second call cannot block commands.
+fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
+    while let Ok(req) = rx.recv() {
+        if stop.load(Ordering::Relaxed) || matches!(req, Req::Shutdown) {
+            break;
+        }
+        let Req::Cc { phrase, queue_len, is_playing } = req else {
+            continue;
+        };
+        if tx.send(Inbound::CcProgress("thinking...".into())).is_err() {
+            break;
+        }
+        #[cfg(feature = "cc")]
+        {
+            match hypodj_nl::cc::run_claude(&phrase, queue_len, is_playing) {
+                Ok(raw) => match hypodj_nl::render_dsl(&raw) {
+                    Some(dsl) => {
+                        let steps = vec![hypodj_nl::describe_plan(&raw)];
+                        let _ = tx.send(Inbound::CcDelta(format!("plan: {}", steps[0])));
+                        let _ = tx.send(Inbound::CcProgress(String::new()));
+                        let _ = tx.send(Inbound::CcConfirm(Pending {
+                            token: None,
+                            command: Some(format!("plan add {dsl}")),
+                            trust: Some("via Claude Code".into()),
+                            steps,
+                            note: None,
+                        }));
+                    }
+                    None => {
+                        let _ = tx.send(Inbound::CcProgress(String::new()));
+                        let _ = tx.send(Inbound::CcDelta(
+                            "that plan can't be expressed as a DSL plan - try rephrasing".into(),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(Inbound::CcProgress(String::new()));
+                    let _ = tx.send(Inbound::CcDelta(format!("Claude Code: {e}")));
+                }
+            }
+        }
+        #[cfg(not(feature = "cc"))]
+        {
+            let _ = (&phrase, queue_len, is_playing);
+            let _ = tx.send(Inbound::CcProgress(String::new()));
+            let _ = tx.send(Inbound::CcDelta(
+                "Claude Code backend not enabled (build dj-gui with --features cc)".into(),
+            ));
+        }
+    }
 }
 
 /// Connect a dedicated idle socket and clear its read timeout so `idle` parks
@@ -335,6 +422,9 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             }
             refresh_after(conn, tx, epoch)
         }
+        // CC requests are routed to the dedicated CC worker, never here; a stray one
+        // on the command socket is a no-op (the socket must not fork a subprocess).
+        Req::Cc { .. } => false,
         Req::Load(name) => match conn.command(&format!("load {}", quote_arg(&name))) {
             Ok(_) => refresh_after(conn, tx, epoch),
             Err(MpdError::Ack(m)) => {

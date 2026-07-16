@@ -544,6 +544,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "hypodj-client",
+ "hypodj-nl",
  "image",
  "ratatui",
  "thiserror",
@@ -954,6 +955,7 @@ name = "hypodj-cli"
 version = "0.1.0"
 dependencies = [
  "hypodj-client",
+ "hypodj-nl",
 ]
 
 [[package]]

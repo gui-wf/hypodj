@@ -10,10 +10,17 @@ name = "dj-gui"
 path = "src/main.rs"
 
 # The interactive jukebox TUI. IO (crossterm/ratatui) stays at the edges (main.rs
-# + ui.rs); the pure, testable core lives in state.rs. Model-free: builds only on
-# hypodj-client, never on hypodj-nl or hypodj-core.
+# + ui.rs); the pure, testable core lives in state.rs. Model-free in the DEFAULT
+# build: hypodj-client only, never hypodj-nl or hypodj-core. The opt-in `cc` feature
+# DELIBERATELY breaks that to pull hypodj-nl (Claude Code CLI backend) for the DJ
+# View - localized to the feature, default build unchanged.
+[features]
+# Client-side Claude Code CLI NL backend, powering the DJ View. Pulls hypodj-nl(cc).
+cc = ["dep:hypodj-nl"]
+
 [dependencies]
 hypodj-client = { path = "../hypodj-client" }
+hypodj-nl = { path = "../hypodj-nl", optional = true, default-features = false, features = ["cc"] }
 ratatui.workspace = true
 crossterm.workspace = true
 thiserror.workspace = true

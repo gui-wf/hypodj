@@ -21,6 +21,13 @@ llm = ["dep:schemars", "hypodj-core/schema"]
 # because llama-cpp-sys compiles llama.cpp via bindgen (needs libclang + a C++
 # toolchain) and a model file - a deployment/ops artifact, not a default/CI build.
 llm-llama = ["llm", "dep:llama-cpp-2"]
+# The CLIENT-SIDE Claude Code CLI backend (feature = "cc"): shells out to the
+# `claude` CLI headlessly, gets a JSON plan matching the LlmRawPlan JSON-Schema,
+# and parses it through the always-compiled parse_llm_output. Pulls `llm` for the
+# schema-derive (schemars) only - NO local model runtime, NO network in the build.
+# The prompt build + envelope parse are model-free and unit-tested with canned
+# strings; only the actual `claude` spawn touches the subscription.
+cc = ["llm"]
 
 [dependencies]
 hypodj-core = { path = "../hypodj-core" }
