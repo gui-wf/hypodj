@@ -1,11 +1,14 @@
-//! The OPTIONAL local-model path.
+//! The OPTIONAL model (Claude Code / local-model) path.
 //!
-//! The RESTRICTED model surface ([`LlmRawPlan`]) is a subset of the P2 IR with
-//! WallClock and Immediate REMOVED (a hallucinated wall-clock or synthetic
-//! add-time edge is off the model surface; those stay Rules-only). The subset
-//! deserializer + the [`From`] conversion + [`parse_llm_output`] are ALWAYS
-//! compiled and model-free (unit-testable with a canned constrained-JSON string,
-//! no model, no network).
+//! The RESTRICTED model surface ([`LlmRawPlan`]) is the TRUST BOUNDARY: it matches
+//! the shape the LIVE Claude 2.1.204 capture proves the CLI emits - a top-level
+//! `{"actions":[ {type, ...flat scalars} ]}` of FLAT, internally-tagged objects on
+//! a CLOSED string enum. Off-surface intents (an unknown action `type`, an
+//! absolute wall-clock instant, an identity-bearing `SongId` selector, or a
+//! `Wake`/`WakeTo`/`ToFloor` fade) are UNREPRESENTABLE in this DTO, so they cannot
+//! be produced no matter what the backend emits. The DTO + the VALIDATING
+//! conversion + [`parse_llm_output`] are ALWAYS compiled and model-free
+//! (unit-testable with a canned JSON string, no model, no network).
 //!
 //! Only the constrained-decode BACKEND ([`LlmBackend`]/[`LlmTranslator`]) and the
 //! GBNF derivation from the JSON-Schema are gated behind `feature = "llm"`.
@@ -14,144 +17,173 @@ use serde::Deserialize;
 
 use hypodj_core::plan::{Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel};
 
-/// The trigger subset the model may emit: RawTrigger MINUS WallClock and
-/// Immediate. No `DateTime` target, no synthetic add-time edge on the model
-/// surface. Wall-clock and immediate intents stay Rules-only.
-#[derive(Clone, Debug, Deserialize)]
+/// Closed action lexicon. fade_out/fade_in are SEPARATE variants (no nested dir
+/// tag), so To/ToFloor/WakeTo/Wake are unrepresentable. An unknown string fails
+/// serde -> rejected. Claude emits this under the key `type` (every live sample);
+/// `action`/`act` are drift aliases.
+#[derive(Clone, Copy, Debug, Deserialize)]
 #[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LlmTrigger {
-    QueuePosition { n: usize, base: PosBase },
-    TrackAfterCurrent,
-    TimeRemaining { track: TrackSel, secs: f64 },
-    AlbumBoundary { track: TrackSel },
-    SpanElapsed { secs: f64 },
-}
-
-impl From<LlmTrigger> for RawTrigger {
-    fn from(t: LlmTrigger) -> Self {
-        match t {
-            LlmTrigger::QueuePosition { n, base } => RawTrigger::QueuePosition { n, base },
-            LlmTrigger::TrackAfterCurrent => RawTrigger::TrackAfterCurrent,
-            LlmTrigger::TimeRemaining { track, secs } => RawTrigger::TimeRemaining { track, secs },
-            LlmTrigger::AlbumBoundary { track } => RawTrigger::AlbumBoundary { track },
-            LlmTrigger::SpanElapsed { secs } => RawTrigger::SpanElapsed { secs },
-        }
-    }
-}
-
-/// The fade directions the model may emit: `Out`/`In` ONLY. The deliberate-cue
-/// (`To`), wind-down (`ToFloor`) and alarm-wake (`WakeTo`) intents are OFF the model
-/// surface - a model must never drive those side-effecting ramps. Each carries a
-/// NAMED `secs` field so it round-trips through serde (an internally-tagged variant
-/// with a struct body, not a primitive newtype).
-#[derive(Clone, Debug, Deserialize)]
-#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
-#[serde(tag = "dir", rename_all = "snake_case")]
-pub enum LlmFade {
-    Out { secs: f64 },
-    In { secs: f64 },
-}
-
-impl From<LlmFade> for FadeIntentIr {
-    fn from(f: LlmFade) -> Self {
-        match f {
-            LlmFade::Out { secs } => FadeIntentIr::Out { secs },
-            LlmFade::In { secs } => FadeIntentIr::In { secs },
-        }
-    }
-}
-
-/// The content selectors the model may emit for an `Enqueue`: free-text `query`,
-/// a closed-lexicon `genre`, or `radio`. The identity-bearing selectors
-/// (`Exact`/`Similar`/`Calmer`, which carry a `SongId`) stay off the model surface -
-/// the model never touches a library id. Each string payload rides in a NAMED field
-/// (`q` / `name`) so serde round-trips it (an internally-tagged newtype wrapping a
-/// bare `String` will NOT (de)serialize).
-#[derive(Clone, Debug, Deserialize)]
-#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
-#[serde(tag = "select", rename_all = "snake_case")]
-pub enum LlmSelector {
-    Query { q: String },
-    Genre { name: String },
-    Radio,
-}
-
-impl From<LlmSelector> for Selector {
-    fn from(s: LlmSelector) -> Self {
-        match s {
-            LlmSelector::Query { q } => Selector::Query(q),
-            LlmSelector::Genre { name } => Selector::Genre(name),
-            LlmSelector::Radio => Selector::Radio,
-        }
-    }
-}
-
-/// The action subset the model may emit - the DOCUMENTED trust surface, mirroring
-/// only the GBNF-advertised kinds. It is a dedicated type (NOT the full
-/// [`Action`]), so the parser can NEVER accept an off-surface action (`Wake`, or a
-/// `WakeTo`/`ToFloor` fade) even if a backend ignores the grammar. `SetVolume`
-/// carries a NAMED `level` field so it round-trips (an internally-tagged newtype
-/// wrapping a bare `u8` will NOT deserialize).
-#[derive(Clone, Debug, Deserialize)]
-#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
-#[serde(tag = "act", rename_all = "snake_case")]
-pub enum LlmAction {
-    Fade(LlmFade),
+#[serde(rename_all = "snake_case")]
+pub enum LlmActionKind {
+    FadeOut,
+    FadeIn,
     Stop,
     Pause,
-    SetVolume { level: u8 },
-    Enqueue { selector: LlmSelector, count: u32 },
+    SetVolume,
+    Enqueue,
 }
 
-impl From<LlmAction> for Action {
-    fn from(a: LlmAction) -> Self {
-        match a {
-            LlmAction::Fade(f) => Action::Fade(f.into()),
-            LlmAction::Stop => Action::Stop,
-            LlmAction::Pause => Action::Pause,
-            LlmAction::SetVolume { level } => Action::SetVolume(level),
-            LlmAction::Enqueue { selector, count } => {
-                Action::Enqueue { selector: selector.into(), count }
-            }
-        }
-    }
+/// Closed trigger lexicon, FLAT. `Now` is the default (most DJ intents are
+/// immediate). No absolute-clock variant and NO DateTime-typed field anywhere ->
+/// an absolute civil instant is unrepresentable.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlmWhen {
+    #[default]
+    Now,
+    AfterCurrent,
+    AfterSecs,
+    AlbumBoundary,
+    QueuePosition,
+    TimeRemaining,
 }
 
-/// The restricted plan the model may emit (the constrained-decode target). Note
-/// `origin` is ABSENT from the surface: the adapter stamps it, never the model.
-/// `action` is the dedicated [`LlmAction`] surface, so an off-surface action can
-/// never deserialize even if a backend ignores the GBNF (F7).
+/// The FLAT model surface: one object, a required closed discriminator plus
+/// OPTIONAL scalars. deny_unknown_fields is deliberately OFF (Claude's payload
+/// key names drift run-to-run); load-bearing fields carry aliases for the names
+/// observed live, stray keys are ignored. Safety does NOT rest on rejecting
+/// stray keys - it rests on the closed action/when enums + presence-only selector
+/// inference, which make off-surface intents unrepresentable regardless of noise.
 #[derive(Clone, Debug, Deserialize)]
 #[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
 pub struct LlmRawPlan {
-    pub trigger: LlmTrigger,
-    pub action: LlmAction,
+    /// REQUIRED closed discriminator. PRIMARY key is `type` (Claude's instinct).
+    #[serde(rename = "type", alias = "action", alias = "act")]
+    pub kind: LlmActionKind,
+
+    /// Flat trigger; DEFAULTS to Now when Claude omits it - the direct fix for the
+    /// omnipresent live "missing field `trigger`".
+    #[serde(default, alias = "trigger")]
+    pub when: LlmWhen,
+
+    // -- action scalars (all optional; cross-checked in TryFrom) --
+    #[serde(default, alias = "seconds", alias = "duration")]
+    pub secs: Option<f64>,
+    #[serde(default, alias = "volume", alias = "vol")]
+    pub level: Option<u8>,
+    #[serde(default, alias = "limit", alias = "n", alias = "amount")]
+    pub count: Option<u32>,
+
+    // -- enqueue selector: inferred by PRESENCE. No source enum, no id field ->
+    //    only Query/Genre/Radio are reachable; Exact/Similar/Calmer (SongId) have
+    //    nowhere to land. --
+    #[serde(default, alias = "q", alias = "value")]
+    pub query: Option<String>,
+    #[serde(default, alias = "name")]
+    pub genre: Option<String>,
+    #[serde(default)]
+    pub radio: bool,
+
+    // -- `when` scalars --
+    #[serde(default, alias = "seconds_remaining")]
+    pub when_secs: Option<f64>,
+    /// 1-based absolute queue slot for when = queue_position. NOT named `position`:
+    /// Claude uses `position` for STRING hints ("end") that we must IGNORE, and a
+    /// usize-typed `position` field would hard-fail deserialization on that string.
+    #[serde(default, alias = "queue_slot")]
+    pub slot: Option<usize>,
+
     #[serde(default)]
     pub once: bool,
 }
 
-impl From<LlmRawPlan> for RawPlan {
-    /// Stamp `version = 1` and leave `origin` empty (the adapter fills
-    /// `nl:llm:<model>`, never the model).
-    fn from(p: LlmRawPlan) -> Self {
-        RawPlan {
-            version: 1,
-            trigger: p.trigger.into(),
-            action: p.action.into(),
-            once: p.once,
-            origin: String::new(),
-        }
+/// VALIDATING conversion (fallible: a flat bag needs cross-field checks). Every
+/// candidate crosses here on the way to plan.rs validate/clamp. Nothing off-surface
+/// is constructible (no Wake action, no To/ToFloor/WakeTo fade, no SongId-bearing
+/// selector, no wall-clock). count is clamped to MAX_ENQUEUE downstream in
+/// plan::validate; version=1 and origin="" (the adapter stamps nl:cc:<model>).
+impl TryFrom<LlmRawPlan> for RawPlan {
+    type Error = String;
+    fn try_from(p: LlmRawPlan) -> Result<Self, String> {
+        // plan.rs validate() clamps fade secs to [min_dur, max_dur], so any
+        // default is safe; only supplied so an omitted duration still plans.
+        const DEFAULT_FADE_SECS: f64 = 5.0;
+
+        let trigger = match p.when {
+            // Claude routinely omits `when` (-> Now) yet still expresses a delay
+            // via when_secs/slot alone. Treating that as Immediate would silently
+            // drop the delay and fire NOW, so infer the trigger from the timing
+            // scalar rather than discarding it: a bare when_secs is a span, a bare
+            // slot is a queue position. Only a truly bare Now stays Immediate.
+            LlmWhen::Now => match (p.when_secs, p.slot) {
+                (Some(secs), _) => RawTrigger::SpanElapsed { secs },
+                (None, Some(n)) => RawTrigger::QueuePosition { n, base: PosBase::Absolute },
+                (None, None) => RawTrigger::Immediate,
+            },
+            LlmWhen::AfterCurrent => RawTrigger::TrackAfterCurrent,
+            LlmWhen::AfterSecs => RawTrigger::SpanElapsed {
+                secs: p.when_secs.ok_or("after_secs needs when_secs")?,
+            },
+            LlmWhen::AlbumBoundary => RawTrigger::AlbumBoundary { track: TrackSel::Current },
+            LlmWhen::QueuePosition => RawTrigger::QueuePosition {
+                n: p.slot.ok_or("queue_position needs slot")?,
+                base: PosBase::Absolute,
+            },
+            LlmWhen::TimeRemaining => RawTrigger::TimeRemaining {
+                track: TrackSel::Current,
+                secs: p.when_secs.ok_or("time_remaining needs when_secs")?,
+            },
+        };
+
+        let action = match p.kind {
+            LlmActionKind::FadeOut => {
+                Action::Fade(FadeIntentIr::Out { secs: p.secs.unwrap_or(DEFAULT_FADE_SECS) })
+            }
+            LlmActionKind::FadeIn => {
+                Action::Fade(FadeIntentIr::In { secs: p.secs.unwrap_or(DEFAULT_FADE_SECS) })
+            }
+            LlmActionKind::Stop => Action::Stop,
+            LlmActionKind::Pause => Action::Pause,
+            LlmActionKind::SetVolume => Action::SetVolume(p.level.ok_or("set_volume needs level")?),
+            LlmActionKind::Enqueue => {
+                // Presence-only inference: radio wins, then genre, then query.
+                // No SongId path exists, so this can only build Query/Genre/Radio.
+                let selector = if p.radio {
+                    Selector::Radio
+                } else if let Some(g) = p.genre {
+                    Selector::Genre(g)
+                } else if let Some(q) = p.query {
+                    Selector::Query(q)
+                } else {
+                    return Err("enqueue needs query, genre, or radio".into());
+                };
+                Action::Enqueue { selector, count: p.count.unwrap_or(1) }
+            }
+        };
+
+        // origin stays empty; the adapter stamps nl:cc:<model>, never the model.
+        Ok(RawPlan { version: 1, trigger, action, once: p.once, origin: String::new() })
     }
 }
 
-/// Parse one constrained-JSON string (exactly what a GBNF-constrained decode
-/// yields) into a [`RawPlan`]. Model-free + always compiled. A grammar can only
-/// produce a valid subset object, but we still parse defensively and surface a
-/// readable error rather than panicking.
+/// Parse Claude's reply into a validated RawPlan. Tolerates the
+/// {"actions":[ {...} ]} wrapper Claude gravitates to (live capture) AND a bare
+/// flat object. Takes actions[0] (one plan per utterance). Model-free + always
+/// compiled - the SINGLE model-free choke point. An off-surface or malformed reply
+/// surfaces a readable error rather than panicking or fabricating a plan.
 pub fn parse_llm_output(json: &str) -> Result<RawPlan, String> {
-    let plan: LlmRawPlan = serde_json::from_str(json.trim()).map_err(|e| e.to_string())?;
-    Ok(plan.into())
+    #[derive(Deserialize)]
+    struct Wrapper {
+        actions: Vec<LlmRawPlan>,
+    }
+
+    let t = json.trim();
+    let flat: LlmRawPlan = match serde_json::from_str::<Wrapper>(t) {
+        Ok(w) => w.actions.into_iter().next().ok_or("empty actions array")?,
+        Err(_) => serde_json::from_str::<LlmRawPlan>(t).map_err(|e| e.to_string())?,
+    };
+    RawPlan::try_from(flat)
 }
 
 // ── constrained-decode backend (feature = "llm") ─────────────────────────────
@@ -211,50 +243,43 @@ mod tests {
     use super::*;
     use hypodj_core::plan::{Action, FadeIntentIr, Selector};
 
-    // F4: EVERY action the GBNF advertises must round-trip through parse_llm_output.
-    // enqueue(query/genre/radio) + set_volume were previously REJECTED (serde cannot
-    // (de)serialize an internally-tagged newtype wrapping a bare String/u8); the
-    // named-field surface fixes that.
+    // EVERY allowed action AND trigger must round-trip through parse_llm_output on
+    // the FLAT surface Claude actually emits (`type` discriminator + flat scalars),
+    // including the omitted-trigger case that defaults to Now/Immediate.
     #[test]
     fn parse_round_trips_every_action_kind() {
-        // fade out
+        // fade out with an explicit span trigger.
         let p = parse_llm_output(
-            r#"{"trigger":{"kind":"span_elapsed","secs":300.0},"action":{"act":"fade","dir":"out","secs":10.0}}"#,
+            r#"{"type":"fade_out","secs":10.0,"when":"after_secs","when_secs":300.0}"#,
         )
         .unwrap();
         assert!(matches!(p.action, Action::Fade(FadeIntentIr::Out { .. })));
+        assert!(matches!(p.trigger, RawTrigger::SpanElapsed { .. }));
 
-        // fade in
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"span_elapsed","secs":300.0},"action":{"act":"fade","dir":"in","secs":10.0}}"#,
-        )
-        .unwrap();
+        // fade in.
+        let p = parse_llm_output(r#"{"type":"fade_in","secs":10.0}"#).unwrap();
         assert!(matches!(p.action, Action::Fade(FadeIntentIr::In { .. })));
 
-        // stop / pause
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"stop"}}"#,
-        )
-        .unwrap();
+        // OMITTED trigger => Now => Immediate (the direct fix for "missing field
+        // `trigger`"); omitted fade secs still plans (clamped downstream).
+        let p = parse_llm_output(r#"{"type":"fade_out"}"#).unwrap();
+        assert!(matches!(p.action, Action::Fade(FadeIntentIr::Out { .. })));
+        assert!(matches!(p.trigger, RawTrigger::Immediate));
+
+        // stop / pause, immediate.
+        let p = parse_llm_output(r#"{"type":"stop"}"#).unwrap();
         assert!(matches!(p.action, Action::Stop));
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"pause"}}"#,
-        )
-        .unwrap();
+        assert!(matches!(p.trigger, RawTrigger::Immediate));
+        let p = parse_llm_output(r#"{"type":"pause"}"#).unwrap();
         assert!(matches!(p.action, Action::Pause));
 
-        // set_volume(level) - previously un-parseable.
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"set_volume","level":42}}"#,
-        )
-        .unwrap();
+        // set_volume(level), immediate.
+        let p = parse_llm_output(r#"{"type":"set_volume","level":42}"#).unwrap();
         assert!(matches!(p.action, Action::SetVolume(42)));
 
-        // enqueue(query) - previously un-parseable.
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"query","q":"bon iver"},"count":5}}"#,
-        )
-        .unwrap();
+        // enqueue(query).
+        let p =
+            parse_llm_output(r#"{"type":"enqueue","query":"bon iver","count":5}"#).unwrap();
         match p.action {
             Action::Enqueue { selector: Selector::Query(q), count } => {
                 assert_eq!(q, "bon iver");
@@ -263,11 +288,8 @@ mod tests {
             other => panic!("expected enqueue(query), got {other:?}"),
         }
 
-        // enqueue(genre) - previously un-parseable.
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"genre","name":"jazz"},"count":3}}"#,
-        )
-        .unwrap();
+        // enqueue(genre).
+        let p = parse_llm_output(r#"{"type":"enqueue","genre":"jazz","count":3}"#).unwrap();
         match p.action {
             Action::Enqueue { selector: Selector::Genre(g), count } => {
                 assert_eq!(g, "jazz");
@@ -276,41 +298,84 @@ mod tests {
             other => panic!("expected enqueue(genre), got {other:?}"),
         }
 
-        // enqueue(radio)
-        let p = parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"enqueue","selector":{"select":"radio"},"count":5}}"#,
-        )
-        .unwrap();
+        // enqueue(radio); omitted count defaults to 1.
+        let p = parse_llm_output(r#"{"type":"enqueue","radio":true}"#).unwrap();
         assert!(matches!(
             p.action,
-            Action::Enqueue { selector: Selector::Radio, .. }
+            Action::Enqueue { selector: Selector::Radio, count: 1 }
         ));
+
+        // The {"actions":[...]} wrapper Claude gravitates to; first action wins.
+        let p = parse_llm_output(r#"{"actions":[{"type":"pause"}]}"#).unwrap();
+        assert!(matches!(p.action, Action::Pause));
+
+        // Every FLAT trigger kind maps to its IR trigger.
+        let p = parse_llm_output(r#"{"type":"stop","when":"after_current"}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::TrackAfterCurrent));
+        let p = parse_llm_output(r#"{"type":"stop","when":"album_boundary"}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::AlbumBoundary { .. }));
+        let p =
+            parse_llm_output(r#"{"type":"stop","when":"queue_position","slot":3}"#).unwrap();
+        assert!(matches!(
+            p.trigger,
+            RawTrigger::QueuePosition { n: 3, base: PosBase::Absolute }
+        ));
+        let p = parse_llm_output(
+            r#"{"type":"fade_out","secs":10.0,"when":"time_remaining","when_secs":30.0}"#,
+        )
+        .unwrap();
+        assert!(matches!(p.trigger, RawTrigger::TimeRemaining { .. }));
     }
 
-    // F7: an OFF-surface action must be REJECTED even if a backend ignores the
-    // grammar. `wake`, and the `wake_to`/`to_floor` fade dirs, are not in LlmAction /
-    // LlmFade, so serde fails loud instead of arming an off-surface effect.
+    // A delay expressed ONLY via when_secs/slot (Claude omitted the `when` tag, so
+    // it defaults to Now) must NOT be silently dropped and fired immediately: the
+    // timing scalar drives the trigger.
+    #[test]
+    fn parse_infers_delay_when_when_tag_omitted() {
+        // stop "in 300s" with no `when` tag => span, not immediate.
+        let p = parse_llm_output(r#"{"type":"stop","when_secs":300.0}"#).unwrap();
+        match p.trigger {
+            RawTrigger::SpanElapsed { secs } => assert_eq!(secs, 300.0),
+            other => panic!("expected SpanElapsed, got {other:?}"),
+        }
+        // fade_out with when_secs but no `when` tag => span, not immediate.
+        let p = parse_llm_output(r#"{"type":"fade_out","secs":10.0,"when_secs":300.0}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::SpanElapsed { .. }));
+        // slot-only queue_position intent with no `when` tag => queue position.
+        let p = parse_llm_output(r#"{"type":"stop","slot":3}"#).unwrap();
+        assert!(matches!(
+            p.trigger,
+            RawTrigger::QueuePosition { n: 3, base: PosBase::Absolute }
+        ));
+        // Truly bare Now stays Immediate.
+        let p = parse_llm_output(r#"{"type":"stop"}"#).unwrap();
+        assert!(matches!(p.trigger, RawTrigger::Immediate));
+    }
+
+    // An OFF-surface intent must be REJECTED even if a backend ignores the schema.
+    // The closed `type`/`when` enums + presence-only selector inference make every
+    // off-surface effect UNREPRESENTABLE, so serde/TryFrom fails loud instead of
+    // arming it.
     #[test]
     fn parse_rejects_off_surface_actions() {
-        // Action::Wake is off-surface.
+        // An unknown action `type` (Action::Wake and friends) is not in the lexicon.
+        assert!(parse_llm_output(r#"{"type":"wake","count":5}"#).is_err());
+        // The nested fade dirs (wake_to / to_floor / to) have NO representation:
+        // there is no `dir` field and no such action `type`.
+        assert!(parse_llm_output(r#"{"type":"wake_to","secs":10.0}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"to_floor","secs":10.0}"#).is_err());
+        // A wall_clock trigger is off the `when` lexicon; an absolute datetime has
+        // nowhere to land (no variant, no DateTime field).
+        assert!(parse_llm_output(r#"{"type":"stop","when":"wall_clock"}"#).is_err());
         assert!(parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"wake","count":5}}"#,
+            r#"{"type":"stop","when":"wall_clock","at":"2026-01-01T00:00:00Z"}"#
         )
         .is_err());
-        // A wake_to fade is off-surface.
-        assert!(parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"fade","dir":"wake_to","target_db":-10.0,"vol":50,"secs":10.0}}"#,
-        )
-        .is_err());
-        // A to_floor fade is off-surface.
-        assert!(parse_llm_output(
-            r#"{"trigger":{"kind":"track_after_current"},"action":{"act":"fade","dir":"to_floor","secs":10.0}}"#,
-        )
-        .is_err());
-        // A wall_clock trigger is off the model surface too.
-        assert!(parse_llm_output(
-            r#"{"trigger":{"kind":"wall_clock","at":"2026-01-01T00:00:00Z"},"action":{"act":"stop"}}"#,
-        )
-        .is_err());
+        // An identity-bearing selector cannot be built: an `id`/`song_id` field is
+        // ignored, and with no query/genre/radio the enqueue conversion fails loud
+        // rather than fabricating a SongId selector.
+        assert!(parse_llm_output(r#"{"type":"enqueue","id":"song-42"}"#).is_err());
+        // A missing discriminator is rejected (no default for the action kind).
+        assert!(parse_llm_output(r#"{"when":"now"}"#).is_err());
     }
 }
