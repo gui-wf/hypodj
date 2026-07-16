@@ -338,7 +338,7 @@ impl FadeSlot {
     /// across any await (it does not await at all). The manual `player.set_volume`
     /// is sequenced by the caller AFTER this returns; the abort+join here
     /// guarantees the outgoing fade has fully stopped writing the sink first.
-    async fn cancel_with(&self, apply: impl FnOnce()) {
+    async fn cancel_with<R>(&self, apply: impl FnOnce() -> R) -> R {
         let mut slot = self.inner.lock().await;
         if let Some(mut h) = slot.take() {
             h.abort.abort();
@@ -346,7 +346,7 @@ impl FadeSlot {
                 let _ = join.await;
             }
         }
-        apply();
+        apply()
     }
 
     /// Atomically replace the active fade: validate/build the new fade FIRST, and
@@ -2172,35 +2172,73 @@ impl HypodjHandler {
         }
     }
 
-    /// Unpause from silence, then sub-JND ramp back to the pre-pause baseline. Force
-    /// start-from-silence FIRST (cancel any in-flight fade AND drop the live gain to
-    /// the synth floor atomically under the slot lock, then set mpv volume 0) so the
-    /// ramp genuinely rises from silence rather than snapping to the prior level. The
-    /// ramp reuses [`FadeIntent::WakeTo`] verbatim (identical to the wake path).
+    /// Resume playback the startle-safe way, ramping UP to the pre-pause baseline.
+    /// Distinguishes TWO live cases (keyed off the RAW player state, not the pending
+    /// intent), because the pre-pause fade may be either settled or still in flight.
+    /// The SETTLED vs IN-FLIGHT decision is made INSIDE the cancel closure, under the
+    /// slot lock, AFTER the in-flight fade's abort+join - so a racing Terminal::Pause
+    /// can never flip the state between the decision and the cancel (the TOCTOU that
+    /// would otherwise leave the deck mpv-Paused with no resume()):
+    ///
+    ///   - SETTLED pause (mpv raw-Paused at silence): the deck already faded to
+    ///     silence and froze, so the ResumeIn MUST start from silence. Under the same
+    ///     slot lock drop the live gain to the synth floor, then set mpv volume 0,
+    ///     unpause, and ramp UP from silence to the baseline.
+    ///
+    ///   - IN-FLIGHT PauseOut (mpv raw-Playing, the ramp mid-descent above silence):
+    ///     this is the F5 resume-during-window abort. mpv never paused and the live
+    ///     gain is at e.g. 50%, so forcing to silence first would be a VISIBLE snap to
+    ///     0 followed by a fade up. Instead SUPERSEDE the PauseOut and ramp UP from the
+    ///     CURRENT live gain (a normal ResumeIn whose from_db is read live inside the
+    ///     slot lock) - a smooth, monotonic un-dip with no snap to silence and no
+    ///     set_volume(0). No resume() either: the deck was never frozen.
+    ///
+    /// Either way the pending-pause intent is cleared and the resume ramp reuses
+    /// [`FadeIntent::ResumeIn`] verbatim, so it never drops below the current gain.
     async fn resume_with_fade(&self) -> Result<(), PlayerError> {
         // The level to restore: the baseline preserved across the pause.
         let vol = self.state.lock().unwrap().target_volume;
         let synth_floor = self.fade_cfg.synth_floor_db;
-        // Atomically cancel the (possibly still-running) pause fade AND force the
-        // live gain to silence AND clear the pending-pause intent, so no straggler
-        // write races the set_volume(0) below and the reported state flips to Playing
-        // (this also ABORTS an in-flight pause-out fade - the F5 resume-during-window
-        // path). If the pause fade was superseded here BEFORE its Terminal::Pause
-        // ran, mpv is still Playing; if it already froze, resume() unpauses it.
-        self.fade
+        // Decide SETTLED vs IN-FLIGHT atomically INSIDE the cancel_with closure, which
+        // runs under the slot lock AFTER the abort+join has driven any racing
+        // Terminal::Pause to completion (the terminal holds the slot lock across its
+        // whole check-and-act). Reading the raw player state here - not before the
+        // cancel - closes the TOCTOU window: a PauseOut fade whose Terminal::Pause is
+        // racing the same lock can no longer flip the deck to Paused between the read
+        // and the cancel, because the cancel already joined it before this closure
+        // observes the state.
+        //   - Paused => the pause fade SETTLED and froze the deck at silence: force the
+        //     live gain to the synth floor so the ResumeIn ramps UP from silence, then
+        //     (below) set mpv volume 0 and unpause.
+        //   - Playing => IN-FLIGHT PauseOut abort (un-dip): leave the live gain at its
+        //     mid-descent value so the ResumeIn ramps UP from there, no set_volume(0),
+        //     no resume() - the deck was never frozen.
+        let settled = self
+            .fade
             .cancel_with(|| {
+                let is_paused = matches!(self.player.state(), PlayState::Paused);
                 let mut st = self.state.lock().unwrap();
-                st.live_gain_db = synth_floor;
+                if is_paused {
+                    st.live_gain_db = synth_floor;
+                }
+                // Clear the pending-pause intent either way so the reported state flips
+                // to Playing.
                 st.pending_pause = false;
+                is_paused
             })
             .await;
-        let _ = self.player.set_volume(0).await;
-        // Unpause from silence.
-        let r = self.player.resume().await;
+        let mut r = Ok(());
+        if settled {
+            let _ = self.player.set_volume(0).await;
+            // Unpause from silence.
+            r = self.player.resume().await;
+        }
         // Reflect the Playing edge immediately so the MPRIS widget flips to a pause
         // symbol without waiting for the ramp to finish.
         self.notify_change();
-        // Short DELIBERATE ramp silence -> the saved level (ResumeIn: SetBaseline).
+        // Short DELIBERATE ramp -> the saved level (ResumeIn: SetBaseline). from_db is
+        // read live inside the slot lock: silence for a settled pause, the mid-fade
+        // gain for an in-flight abort. Either way the ramp only rises (never re-dips).
         // A user resume is responsive, not the long sub-JND alarm wake.
         let dur = self.pause_fade_dur();
         let intent = FadeIntent::ResumeIn { target_db: mpv_volume_to_db(vol as f64), vol };
@@ -6127,6 +6165,60 @@ mod tests {
         h.wait_for_fade().await;
         // The resume ramp restored the baseline; the deck is audibly playing.
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
+        assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0);
+    }
+
+    // F5 (un-dip): resuming while the PauseOut is STILL IN FLIGHT (mpv raw-Playing,
+    // the ramp mid-descent well above silence) must ramp UP from the CURRENT gain, NOT
+    // snap to silence and fade up. The gain must be monotonic-up: it never dips below
+    // the mid-fade level it was at when resume was pressed.
+    #[tokio::test(start_paused = true)]
+    async fn resume_mid_pause_undips_without_snapping_to_silence() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        // Pause, then advance the clock so the PauseOut is roughly halfway down: the
+        // gain is well above silence and the deck is STILL raw-Playing (fade THEN
+        // pause), so a resume here is the in-flight-abort case, not the settled case.
+        h.set_pause(Some(true)).await.unwrap();
+        pump(250, 7).await;
+        assert!(h.fade_active().await, "pause fade in flight");
+        assert_eq!(h.player.state(), PlayState::Playing, "not frozen yet: still ramping");
+        let mid = h.live_gain_db();
+        assert!(
+            mid > SYNTH_FLOOR_DB + 5.0 && mid < -1.0,
+            "gain is mid-descent, above silence (was {mid})"
+        );
+
+        // Resume mid-fade: it must un-dip from `mid`, never snap to 0 first.
+        h.set_pause(Some(false)).await.unwrap();
+        assert_eq!(h.reported_play_state(), PlayState::Playing, "no longer pending");
+        assert_eq!(h.player.state(), PlayState::Playing, "no spurious re-pause");
+        // (a) NO drop to silence: the very next observable gain is at/above `mid`.
+        assert!(
+            h.live_gain_db() >= mid - 1e-6,
+            "resume must not snap below the mid-fade gain (mid={mid}, now={})",
+            h.live_gain_db()
+        );
+
+        // (b) it ramps UP, monotonically, back toward the baseline: sample across the
+        // ramp and assert the gain never dips below `mid`.
+        let mut prev = h.live_gain_db();
+        for _ in 0..40 {
+            pump(20, 1).await;
+            let now = h.live_gain_db();
+            assert!(now >= mid - 1e-6, "gain dipped below the mid-fade level: {now} < {mid}");
+            assert!(now >= prev - 1e-6, "gain must be monotonic up: {now} < {prev}");
+            prev = now;
+            if !h.fade_active().await {
+                break;
+            }
+        }
+        h.wait_for_fade().await;
+        // (c) ends Playing at the baseline.
+        assert_eq!(h.player.state(), PlayState::Playing);
+        assert_eq!(h.state.lock().unwrap().reported_volume(), 100, "back at the baseline");
         assert!(h.live_gain_db() > SYNTH_FLOOR_DB + 5.0);
     }
 
