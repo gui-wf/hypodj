@@ -238,17 +238,16 @@ fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
 }
 
 /// The Claude Code client-side NL handshake. Reads the small context the client
-/// already has (queue length, is-playing) from `status`, spawns `claude` on a
-/// worker thread with a stderr "thinking..." spinner (stdout stays clean), then on
-/// the settled validated RawPlan echoes describe_plan + reuses the existing y/N
-/// confirm, and arms via `plan add <dsl>`. Returns Ok(true) when it handled the
-/// phrase (armed, cancelled, or a loud user-facing miss), Ok(false) to fall through
-/// to the daemon `nl` path (spawn/parse failure, or a plan not DSL-expressible).
+/// already has (queue length, is-playing) from `status`, then streams `claude` in
+/// `--output-format stream-json` mode: each token delta is typed out live to stderr
+/// (stdout stays clean for the echo + confirm), and the settled VALIDATED RawPlan
+/// (from the last complete result line, or a non-streamed fallback on claude 2.1.204
+/// which truncates the final line) is echoed via describe_plan, confirmed y/N, and
+/// armed via `plan add <dsl>`. Returns Ok(true) when it handled the phrase (armed,
+/// cancelled, or a loud user-facing miss), Ok(false) to fall through to the daemon
+/// `nl` path (spawn/parse failure, or a plan not DSL-expressible).
 #[cfg(feature = "cc")]
 fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
-    use std::sync::mpsc;
-    use std::time::Duration;
-
     let status = conn.command("status")?;
     let queue_len = status
         .iter()
@@ -261,32 +260,25 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
         .map(|(_, v)| v == "play")
         .unwrap_or(false);
 
-    // Run the multi-second call off the main thread so the spinner can tick.
-    let (tx, rx) = mpsc::channel();
-    let p = phrase.to_string();
-    std::thread::spawn(move || {
-        let _ = tx.send(hypodj_nl::cc::run_claude(&p, queue_len, is_playing));
-    });
-
-    // Coarse stderr spinner: thinking -> planning after a couple seconds. Carriage
-    // return keeps it on one line; stdout is untouched.
-    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
-    let mut i = 0usize;
-    let result = loop {
-        match rx.try_recv() {
-            Ok(r) => break r,
-            Err(mpsc::TryRecvError::Empty) => {
-                let phase = if i < 20 { "thinking" } else { "planning" };
-                eprint!("\r{} Claude Code {}...  ", FRAMES[i % 4], phase);
-                let _ = std::io::stderr().flush();
-                i += 1;
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(mpsc::TryRecvError::Disconnected) => break Err("claude worker vanished".into()),
-        }
-    };
-    eprint!("\r\x1b[2K"); // clear the spinner line
+    // Live typewriter: stream the model's token deltas to stderr (stdout stays clean
+    // for the echo + y/N). The blocking multi-second call is fine here - the CLI is a
+    // one-shot; the deltas keep it from ever looking frozen. The settled plan comes
+    // from the last complete result line, or the non-streamed fallback on 2.1.204.
+    eprint!("Claude Code: ");
     let _ = std::io::stderr().flush();
+    let mut any_delta = false;
+    let result = hypodj_nl::cc::run_claude_streaming(phrase, queue_len, is_playing, |frag| {
+        any_delta = true;
+        eprint!("{frag}");
+        let _ = std::io::stderr().flush();
+    });
+    if any_delta {
+        eprintln!();
+    } else {
+        // Nothing streamed (e.g. immediate error): clear the prefix line.
+        eprint!("\r\x1b[2K");
+        let _ = std::io::stderr().flush();
+    }
 
     let raw = match result {
         Ok(raw) => raw,

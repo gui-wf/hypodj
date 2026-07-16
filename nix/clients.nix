@@ -1,13 +1,25 @@
 { lib
 , rustPlatform
+, pkg-config
+, mpv-unwrapped
+, makeWrapper
 }:
 
 # The HypoDJ clients: the `dj` jukebox CLI and the `dj-gui` interactive TUI.
-# Both are pure MPD/TCP over the shared hypodj-client lib - they never link
-# libmpv, so this derivation needs no pkg-config, no mpv, and no wrap (unlike
-# the daemon in package.nix). `cargo build --bin dj --bin dj-gui` only compiles
-# the dependency graph of those two bins (hypodj-client + hypodj-cli/-tui);
-# hypodj-core/-daemon and libmpv2-sys are never touched.
+#
+# The `cc` feature is now DEFAULT (a plain `cargo build` compiles the client-side
+# Claude Code CLI backend), so both bins pull `hypodj-nl` -> `hypodj-core`. That
+# transitively links libmpv (hypodj-core's real player), so - unlike the old
+# thin-client build - this derivation DOES need mpv at build + link time. The owner
+# deliberately dropped the thin-client "never link libmpv" invariant to make cc the
+# default. `cargo build --bin dj --bin dj-gui` still only compiles the dependency
+# graph of the two bins (now including hypodj-nl + hypodj-core, not hypodj-daemon).
+#
+# Runtime cc is gated on `claude` being on PATH (cc_available), so this package runs
+# unchanged on a machine without it (falls back to the daemon `nl` path). The check
+# phase is CERTLESS + network-less: cc_available() is false, so no live `claude`
+# call ever runs - only the PURE cc unit tests (prompt build, NDJSON parse, envelope
+# + stream-json settle/fallback) execute.
 rustPlatform.buildRustPackage {
   pname = "hypodj-clients";
   version = "0.1.0";
@@ -16,11 +28,31 @@ rustPlatform.buildRustPackage {
 
   cargoLock.lockFile = ../Cargo.lock;
 
+  nativeBuildInputs = [ pkg-config makeWrapper ];
+  # mpv.pc (for libmpv2-sys at build, pulled transitively via hypodj-core) +
+  # libmpv.so (DT_NEEDED at link/runtime).
+  buildInputs = [ mpv-unwrapped ];
+
   cargoBuildFlags = [ "--bin" "dj" "--bin" "dj-gui" ];
 
-  # Test only the client crates (offline, no mpv, no network).
+  # Test only the client crates (offline, no network). The cc tests are pure - a
+  # missing `claude` just means cc_available() is false, never a live call.
   doCheck = true;
   cargoTestFlags = [ "-p" "hypodj-client" "-p" "hypodj-cli" "-p" "dj-gui" ];
+
+  # libmpv2-sys uses pkg-config to find mpv at build time.
+  PKG_CONFIG_PATH = "${mpv-unwrapped.dev}/lib/pkgconfig";
+
+  # libmpv2-sys emits a bare `cargo:rustc-link-lib=mpv` (hard DT_NEEDED libmpv.so.2)
+  # with no link-search, so the RPATH is not reliably baked. Wrap both bins so
+  # ld.so finds libmpv.so.2 at exec (the clients never call the player, but the
+  # hard DT_NEEDED must still resolve).
+  postInstall = ''
+    for b in dj dj-gui; do
+      wrapProgram $out/bin/$b \
+        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [ mpv-unwrapped ]}
+    done
+  '';
 
   meta = {
     description = "HypoDJ clients: the dj jukebox CLI + dj-gui interactive TUI";

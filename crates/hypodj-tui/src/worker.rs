@@ -86,9 +86,18 @@ pub enum Inbound {
     Disconnected,
     /// A coarse CC phase line (e.g. "thinking...") from the dedicated CC worker.
     CcProgress(String),
-    /// A CC scrollback line (a settled result summary, or - once the stream-json
-    /// typewriter is enabled - a token delta) to append to the DJ View log.
+    /// A live stream-json token fragment: APPENDED to the current DJ View scrollback
+    /// line (the typewriter), never a new line, so tokens flow inline. Only sent
+    /// under `feature = "cc"`; the variant stays for match parity.
+    #[cfg_attr(not(feature = "cc"), allow(dead_code))]
     CcDelta(String),
+    /// A DISCRETE full DJ View scrollback line (a result summary, a miss notice, or
+    /// an error) - ends any in-flight token stream, then pushed as its own line.
+    CcLine(String),
+    /// The token stream is complete (settle/fallback done): close the current
+    /// streaming line so later deltas start fresh. Only sent under `feature = "cc"`.
+    #[cfg_attr(not(feature = "cc"), allow(dead_code))]
+    CcDone,
     /// A settled, validated CC plan ready to confirm. NOT epoch-tagged (the CC worker
     /// owns no socket), so it is never dropped as stale; it drives the standard
     /// confirm popup and arms via the command worker's direct-`command` Arm path.
@@ -194,12 +203,23 @@ fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
         }
         #[cfg(feature = "cc")]
         {
-            match hypodj_nl::cc::run_claude(&phrase, queue_len, is_playing) {
+            // Live typewriter: each stream-json token delta becomes an APPEND-ed
+            // CcDelta so the DJ View types out; the settled plan (last complete result
+            // line, or a non-streamed fallback on claude 2.1.204) drives the confirm.
+            let delta_tx = tx.clone();
+            let on_delta = |frag: &str| {
+                let _ = delta_tx.send(Inbound::CcDelta(frag.to_string()));
+            };
+            let settled =
+                hypodj_nl::cc::run_claude_streaming(&phrase, queue_len, is_playing, on_delta);
+            // Close the streaming line and drop the "thinking..." spinner.
+            let _ = tx.send(Inbound::CcDone);
+            let _ = tx.send(Inbound::CcProgress(String::new()));
+            match settled {
                 Ok(raw) => match hypodj_nl::render_dsl(&raw) {
                     Some(dsl) => {
                         let steps = vec![hypodj_nl::describe_plan(&raw)];
-                        let _ = tx.send(Inbound::CcDelta(format!("plan: {}", steps[0])));
-                        let _ = tx.send(Inbound::CcProgress(String::new()));
+                        let _ = tx.send(Inbound::CcLine(format!("plan: {}", steps[0])));
                         let _ = tx.send(Inbound::CcConfirm(Pending {
                             token: None,
                             command: Some(format!("plan add {dsl}")),
@@ -209,15 +229,13 @@ fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
                         }));
                     }
                     None => {
-                        let _ = tx.send(Inbound::CcProgress(String::new()));
-                        let _ = tx.send(Inbound::CcDelta(
+                        let _ = tx.send(Inbound::CcLine(
                             "that plan can't be expressed as a DSL plan - try rephrasing".into(),
                         ));
                     }
                 },
                 Err(e) => {
-                    let _ = tx.send(Inbound::CcProgress(String::new()));
-                    let _ = tx.send(Inbound::CcDelta(format!("Claude Code: {e}")));
+                    let _ = tx.send(Inbound::CcLine(format!("Claude Code: {e}")));
                 }
             }
         }
@@ -225,8 +243,8 @@ fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
         {
             let _ = (&phrase, queue_len, is_playing);
             let _ = tx.send(Inbound::CcProgress(String::new()));
-            let _ = tx.send(Inbound::CcDelta(
-                "Claude Code backend not enabled (build dj-gui with --features cc)".into(),
+            let _ = tx.send(Inbound::CcLine(
+                "Claude Code backend not enabled in this build".into(),
             ));
         }
     }
