@@ -459,6 +459,10 @@ pub struct TuiState {
     /// The current CC phase line (e.g. "thinking..."), shown next to a spinner while
     /// a call is in flight; `None` when idle.
     pub dj_phase: Option<String>,
+    /// True while a stream-json token stream is flowing: subsequent CcDelta fragments
+    /// APPEND to the last scrollback line (the typewriter) instead of starting a new
+    /// line. Reset by [`TuiState::end_dj_stream`] when the call settles.
+    pub dj_streaming: bool,
 }
 
 impl Default for TuiState {
@@ -488,6 +492,7 @@ impl Default for TuiState {
             dj_input: String::new(),
             dj_log: Vec::new(),
             dj_phase: None,
+            dj_streaming: false,
         }
     }
 }
@@ -1071,6 +1076,38 @@ impl TuiState {
             self.dj_log.drain(0..drop);
         }
     }
+
+    /// Append a live stream-json token fragment to the DJ scrollback, TYPING it onto
+    /// the current streaming line. A newline in the fragment (or overflow past
+    /// [`STREAM_LINE_MAX`]) wraps to a fresh line, so the whole stream stays inside
+    /// the [`push_dj_log`](Self::push_dj_log) bound (oldest lines drop) and a long
+    /// stream can never grow memory unbounded. Pure. The first fragment of a stream
+    /// opens a new line; call [`Self::end_dj_stream`] when the call settles.
+    pub fn push_dj_delta(&mut self, frag: &str) {
+        /// Wrap the streaming transcript at this width so one line never grows huge.
+        const STREAM_LINE_MAX: usize = 100;
+        if !self.dj_streaming {
+            self.dj_streaming = true;
+            self.push_dj_log(String::new());
+        }
+        for ch in frag.chars() {
+            if ch == '\n' {
+                self.push_dj_log(String::new());
+                continue;
+            }
+            match self.dj_log.last_mut() {
+                Some(last) if last.chars().count() < STREAM_LINE_MAX => last.push(ch),
+                _ => self.push_dj_log(ch.to_string()),
+            }
+        }
+    }
+
+    /// Close the current token stream so the next [`Self::push_dj_delta`] opens a
+    /// fresh line and any later discrete [`push_dj_log`](Self::push_dj_log) stands on
+    /// its own. Pure.
+    pub fn end_dj_stream(&mut self) {
+        self.dj_streaming = false;
+    }
 }
 
 #[cfg(test)]
@@ -1317,6 +1354,46 @@ mod tests {
         s.now.file = None;
         assert_eq!(s.handle_key(ctrl('s')), None);
         assert!(s.status_msg.is_some());
+    }
+
+    #[test]
+    fn dj_delta_types_onto_one_line_then_a_discrete_line_stands_alone() {
+        let mut s = TuiState::new();
+        // A stream of fragments types onto ONE scrollback line (the typewriter).
+        s.push_dj_delta("Fad");
+        s.push_dj_delta("ing ");
+        s.push_dj_delta("out");
+        assert_eq!(s.dj_log, vec!["Fading out".to_string()]);
+        assert!(s.dj_streaming);
+        // A newline in a fragment wraps to a fresh line.
+        s.push_dj_delta("\nnext");
+        assert_eq!(s.dj_log, vec!["Fading out".to_string(), "next".to_string()]);
+        // Ending the stream + a discrete line stands on its own, and a later delta
+        // opens a brand-new streaming line.
+        s.end_dj_stream();
+        s.push_dj_log("plan: stop after this track".into());
+        s.push_dj_delta("Q2");
+        assert_eq!(
+            s.dj_log,
+            vec![
+                "Fading out".to_string(),
+                "next".to_string(),
+                "plan: stop after this track".to_string(),
+                "Q2".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dj_delta_wraps_long_stream_and_stays_bounded() {
+        let mut s = TuiState::new();
+        // A very long single stream cannot grow one line unbounded (wraps at 100) and
+        // the scrollback Vec stays bounded to its 200-line cap (oldest drop).
+        for _ in 0..50_000 {
+            s.push_dj_delta("x");
+        }
+        assert!(s.dj_log.len() <= 200, "scrollback stayed bounded");
+        assert!(s.dj_log.iter().all(|l| l.chars().count() <= 100), "each line wrapped at 100");
     }
 
     #[test]

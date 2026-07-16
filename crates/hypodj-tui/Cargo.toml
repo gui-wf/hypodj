@@ -10,12 +10,19 @@ name = "dj-gui"
 path = "src/main.rs"
 
 # The interactive jukebox TUI. IO (crossterm/ratatui) stays at the edges (main.rs
-# + ui.rs); the pure, testable core lives in state.rs. Model-free in the DEFAULT
-# build: hypodj-client only, never hypodj-nl or hypodj-core. The opt-in `cc` feature
-# DELIBERATELY breaks that to pull hypodj-nl (Claude Code CLI backend) for the DJ
-# View - localized to the feature, default build unchanged.
+# + ui.rs); the pure, testable core lives in state.rs. The `cc` feature is now
+# DEFAULT (a plain `cargo build` and the nix clients package compile the Claude Code
+# CLI backend that powers the DJ View): the thin-client invariant is deliberately
+# dropped - the TUI pulls hypodj-nl. Build with `--no-default-features` for the
+# model-free TUI. The shipped daemon stays model-free: the nix daemon package builds
+# `--bin hypodj` in isolation, so neither cc nor hypodj-core/schema is compiled into
+# it. CAVEAT: a plain workspace `cargo build` unifies features (resolver 2), so cc
+# here turns on hypodj-core/schema for the whole build and the dev daemon bin links
+# it too; that is a dev-build artifact only and does not reach the shipped daemon.
 [features]
-# Client-side Claude Code CLI NL backend, powering the DJ View. Pulls hypodj-nl(cc).
+# ON by default: the client-side Claude Code CLI NL backend, powering the DJ View.
+# Pulls hypodj-nl(cc). Runtime is still gated on `claude` being on PATH.
+default = ["cc"]
 cc = ["dep:hypodj-nl"]
 
 [dependencies]

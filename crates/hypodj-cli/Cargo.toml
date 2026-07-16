@@ -11,14 +11,22 @@ path = "src/main.rs"
 
 # Depends on the shared hypodj-client for the one client implementation (MpdConn,
 # nl handshake seams, config, and the NowPlaying/queue parsing). This crate keeps
-# only the text card/queue formatters and the argv/handshake glue. Model-free by
-# construction in the DEFAULT build: no dependency on hypodj-nl, hypodj-core, or any
-# model. The opt-in `cc` feature DELIBERATELY breaks that thin-client invariant to
-# pull hypodj-nl (Claude Code CLI backend) - localized to the feature, default build
-# unchanged and still model-free.
+# only the text card/queue formatters and the argv/handshake glue. The `cc` feature
+# is now DEFAULT (a plain `cargo build` and the nix clients package compile the
+# Claude Code CLI backend): the thin-client invariant is deliberately dropped - the
+# CLI pulls hypodj-nl for client-side NL translation. Build with
+# `--no-default-features` for the model-free CLI (no hypodj-nl). The shipped daemon
+# stays model-free: the nix daemon package builds `--bin hypodj` in isolation, so
+# neither cc nor hypodj-core/schema is compiled into it. CAVEAT: a plain workspace
+# `cargo build` unifies features (resolver 2), so cc here turns on hypodj-core/schema
+# for the whole build and the dev daemon bin links it too; that is a dev-build
+# artifact only and does not reach the shipped daemon.
 [features]
-# Client-side Claude Code CLI NL backend. Pulls hypodj-nl(cc) for the prompt build,
-# LlmRawPlan JSON-Schema, envelope parse, render_dsl, and describe_plan.
+# ON by default: the client-side Claude Code CLI NL backend. Pulls hypodj-nl(cc) for
+# the prompt build, LlmRawPlan JSON-Schema, stream-json parse, envelope parse,
+# render_dsl, and describe_plan. Runtime is still gated on `claude` being on PATH
+# (cc_available), so a machine without it falls back to the daemon `nl` path.
+default = ["cc"]
 cc = ["dep:hypodj-nl"]
 
 [dependencies]

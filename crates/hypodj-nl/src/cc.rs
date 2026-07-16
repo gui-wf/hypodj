@@ -19,8 +19,9 @@
 //! NEVER invoke this in a nix doCheck sandbox (the live test is `#[ignore]` +
 //! availability-gated).
 
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use hypodj_core::plan::RawPlan;
@@ -125,9 +126,11 @@ pub fn parse_envelope(envelope: &str) -> Result<RawPlan, String> {
     Err("claude envelope had no structured_output or result".to_string())
 }
 
-/// One event from the DEFERRED `--output-format stream-json` NDJSON stream. Kept
-/// unit-covered ahead of enabling the token typewriter (installed claude 2.1.204
-/// truncates the final stream-json result line; needs 2.1.208+). Pure.
+/// One event from the `--output-format stream-json` NDJSON stream (the live token
+/// typewriter). Installed claude 2.1.204 TRUNCATES the final stream-json result line
+/// (fixed in 2.1.208+), so the settled plan is taken from the last COMPLETE result
+/// line that parses, and a non-streamed fallback guarantees a plan when none does.
+/// Pure and unit-tested.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CcStreamEvent {
     /// A partial assistant text delta (typewriter fragment).
@@ -156,10 +159,14 @@ pub fn parse_ndjson_line(line: &str) -> CcStreamEvent {
     match v.get("type").and_then(|s| s.as_str()) {
         Some("result") => CcStreamEvent::Final(t.to_string()),
         Some("assistant") | Some("stream_event") => {
-            // Best-effort text delta extraction (partial-message shape varies).
+            // Best-effort text delta extraction (partial-message shape varies). The
+            // real `--include-partial-messages` shape is a `stream_event` carrying an
+            // `event.content_block_delta` with a `delta.text_delta`, i.e.
+            // `/event/delta/text`; the others cover older/settled-assistant shapes.
             let text = v
-                .pointer("/message/content/0/text")
+                .pointer("/event/delta/text")
                 .or_else(|| v.pointer("/delta/text"))
+                .or_else(|| v.pointer("/message/content/0/text"))
                 .and_then(|s| s.as_str());
             match text {
                 Some(s) if !s.is_empty() => CcStreamEvent::Delta(s.to_string()),
@@ -264,6 +271,178 @@ pub fn run_claude(utterance: &str, queue_len: usize, is_playing: bool) -> Result
     parse_envelope(&String::from_utf8_lossy(&stdout))
 }
 
+/// Pure accumulator for a `stream-json` run. Fed each raw NDJSON stdout line in
+/// order, it (a) returns the typewriter fragment for a `text_delta` line so the
+/// caller can render it live, and (b) remembers the plan from the LAST COMPLETE
+/// `result` line that parses through [`parse_envelope`]. On claude 2.1.204 the final
+/// `result` line is truncated - it fails to parse, so [`Self::settled`] stays `None`
+/// and the caller falls back to a non-streamed call. Pure and unit-tested.
+#[derive(Default)]
+pub struct StreamAcc {
+    /// The full concatenated delta text seen so far (the typewriter transcript).
+    pub text: String,
+    settled: Option<RawPlan>,
+}
+
+impl StreamAcc {
+    /// Feed one raw NDJSON line. Returns `Some(fragment)` when the line carried a
+    /// text delta (the caller streams it live); records a settled plan when the line
+    /// is a complete, valid `result` envelope. Pure.
+    pub fn feed(&mut self, line: &str) -> Option<String> {
+        match parse_ndjson_line(line) {
+            CcStreamEvent::Delta(s) => {
+                self.text.push_str(&s);
+                Some(s)
+            }
+            CcStreamEvent::Final(l) => {
+                // The LAST complete result line that parses wins; a truncated one
+                // fails here and leaves the prior settled value (usually None) intact.
+                if let Ok(plan) = parse_envelope(&l) {
+                    self.settled = Some(plan);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// The settled plan, if any complete `result` line parsed. `None` means the
+    /// stream never landed a valid settled plan (truncation) - fall back.
+    pub fn into_settled(self) -> Option<RawPlan> {
+        self.settled
+    }
+}
+
+/// Run ONE headless `claude` call in `--output-format stream-json` mode, invoking
+/// `on_delta` for each live token fragment and returning the settled plan IF a
+/// complete `result` line parsed. `Ok(Some(plan))` = a live-streamed, settled,
+/// VALIDATED plan; `Ok(None)` = the stream typed out but never landed a parseable
+/// settled plan (claude 2.1.204 truncates the final line) - the caller must fall
+/// back; `Err` = a hard failure (spawn/timeout). Blocks (multi-second), so callers
+/// MUST run it off any render/UI thread. Same SAFETY boundary as [`run_claude`]: the
+/// settled bytes cross [`parse_envelope`], so an off-surface plan is rejected. The
+/// prompt is an argv element (no shell), so the utterance is never interpolated.
+pub fn run_claude_stream<F: FnMut(&str)>(
+    utterance: &str,
+    queue_len: usize,
+    is_playing: bool,
+    mut on_delta: F,
+) -> Result<Option<RawPlan>, String> {
+    let prompt = build_prompt(utterance, queue_len, is_playing);
+    let mut child = Command::new("claude")
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--include-partial-messages")
+        .arg("--json-schema")
+        .arg(schema_json())
+        .arg("--bare")
+        .arg("--max-turns")
+        .arg("1")
+        .arg("--max-budget-usd")
+        .arg("0.05")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run claude: {e}"))?;
+
+    // Reader thread: forward stdout NDJSON lines over a channel so the main loop can
+    // enforce the wall-clock deadline (a blocking `lines()` read could otherwise hang
+    // forever on a stalled child). Drain stderr on its own thread so a full stderr
+    // pipe can never deadlock the child.
+    let stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    let reader = std::thread::spawn(move || {
+        if let Some(p) = stdout_pipe {
+            for line in BufReader::new(p).lines() {
+                match line {
+                    Ok(l) => {
+                        if line_tx.send(l).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = stderr_pipe.as_mut() {
+            let _ = p.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let mut acc = StreamAcc::default();
+    let deadline = Instant::now() + CLAUDE_TIMEOUT;
+    loop {
+        // Enforce the wall-clock deadline on EVERY iteration, not only on idle
+        // timeout: a claude that streams stream-json lines continuously (gaps <
+        // 100ms, never landing the final EOF - a chatty/runaway or stuck-but-emitting
+        // session) would otherwise always hit the Ok arm, never return Timeout, and
+        // so never be bounded. Checking here kills such a child and stops StreamAcc
+        // plus the downstream Inbound queue from growing without bound.
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = reader.join();
+            let _ = err_h.join();
+            return Err(format!("claude timed out after {}s", CLAUDE_TIMEOUT.as_secs()));
+        }
+        match line_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if let Some(frag) = acc.feed(&line) {
+                    on_delta(&frag);
+                }
+            }
+            // Reader finished (stdout EOF): the stream is complete.
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            // Idle: no line within the poll window. The deadline check at the top of
+            // the loop does the killing; just re-poll.
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+
+    let _ = reader.join();
+    let status = child.wait().map_err(|e| format!("waiting on claude failed: {e}"))?;
+    let stderr = err_h.join().unwrap_or_default();
+    if !status.success() && acc.settled.is_none() {
+        let err = String::from_utf8_lossy(&stderr);
+        let err = err.trim();
+        return Err(if err.is_empty() {
+            format!("claude exited with {status}")
+        } else {
+            format!("claude failed: {err}")
+        });
+    }
+    Ok(acc.into_settled())
+}
+
+/// The client entry point: stream a live typewriter via [`run_claude_stream`], and if
+/// the stream never lands a parseable settled plan (claude 2.1.204 truncates the
+/// final `result` line) or fails outright, FALL BACK to the reliable non-streamed
+/// [`run_claude`] so a valid VALIDATED plan ALWAYS lands. `on_delta` renders each
+/// live fragment; the fallback path returns the settled plan silently (the live
+/// typewriter has already been shown). Blocks (multi-second) - run off the UI thread.
+pub fn run_claude_streaming<F: FnMut(&str)>(
+    utterance: &str,
+    queue_len: usize,
+    is_playing: bool,
+    on_delta: F,
+) -> Result<RawPlan, String> {
+    match run_claude_stream(utterance, queue_len, is_playing, on_delta) {
+        Ok(Some(plan)) => Ok(plan),
+        // Stream typed out but truncated the settled line, OR a hard failure: the
+        // non-streamed call is the reliable settle path on 2.1.204.
+        Ok(None) | Err(_) => run_claude(utterance, queue_len, is_playing),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,6 +527,54 @@ mod tests {
         assert_eq!(parse_ndjson_line(r#"{"type":"system","subtype":"init"}"#), CcStreamEvent::Progress);
         assert_eq!(parse_ndjson_line("   "), CcStreamEvent::Ignore);
         assert_eq!(parse_ndjson_line("{oops"), CcStreamEvent::Ignore);
+    }
+
+    #[test]
+    fn stream_acc_types_deltas_and_settles_last_complete_result() {
+        // The real --include-partial-messages delta shape: stream_event ->
+        // content_block_delta -> text_delta at /event/delta/text.
+        let mut acc = StreamAcc::default();
+        let deltas: Vec<String> = ["Fad", "ing ", "out"]
+            .iter()
+            .map(|t| {
+                acc.feed(&format!(
+                    r#"{{"type":"stream_event","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"{t}"}}}}}}"#
+                ))
+                .unwrap()
+            })
+            .collect();
+        // Each delta line yields its fragment for the live typewriter, and the full
+        // transcript accumulates.
+        assert_eq!(deltas, vec!["Fad", "ing ", "out"]);
+        assert_eq!(acc.text, "Fading out");
+        // A complete result line settles a validated plan.
+        acc.feed(r#"{"type":"result","structured_output":{"trigger":{"kind":"track_after_current"},"action":{"act":"stop"}}}"#);
+        let plan = acc.into_settled().expect("a complete result line settles");
+        assert!(matches!(plan.action, Action::Stop));
+    }
+
+    #[test]
+    fn stream_acc_truncated_result_forces_fallback() {
+        // claude 2.1.204 truncates the final result line: it is not valid JSON, so it
+        // never settles - into_settled() is None and the caller must fall back.
+        let mut acc = StreamAcc::default();
+        assert!(acc
+            .feed(r#"{"type":"stream_event","event":{"delta":{"text":"stop"}}}"#)
+            .is_some());
+        // A truncated result line (cut mid-object) parses as Ignore, not Final.
+        acc.feed(r#"{"type":"result","structured_output":{"trigger":{"kind":"track_af"#);
+        assert!(acc.into_settled().is_none(), "a truncated result must not settle");
+    }
+
+    #[test]
+    fn stream_acc_last_valid_result_wins_over_off_surface() {
+        // An off-surface result line does not settle (parse_envelope rejects it), so a
+        // later valid line is the one that wins.
+        let mut acc = StreamAcc::default();
+        acc.feed(r#"{"type":"result","structured_output":{"trigger":{"kind":"wall_clock","at":"2026-01-01T00:00:00Z"},"action":{"act":"stop"}}}"#);
+        assert!(acc.settled.is_none());
+        acc.feed(r#"{"type":"result","structured_output":{"trigger":{"kind":"track_after_current"},"action":{"act":"pause"}}}"#);
+        assert!(matches!(acc.into_settled().unwrap().action, Action::Pause));
     }
 
     #[test]
