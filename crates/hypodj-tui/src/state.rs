@@ -642,24 +642,24 @@ impl TuiState {
             }
             // `o` OPENS (drills into) the selected browse directory.
             KeyCode::Char('o') => self.open_selected(),
-            // Screen switch: 1/2/3 select the view; main.rs lazily fetches it.
-            KeyCode::Char('1') => {
+            // Screen switch: F1/F2/F3 select the view; main.rs lazily fetches it.
+            KeyCode::F(1) => {
                 self.last_search.clear();
                 self.screen = Screen::Queue;
                 Some(Intent::ShowScreen(Screen::Queue))
             }
-            KeyCode::Char('2') => {
+            KeyCode::F(2) => {
                 self.last_search.clear();
                 self.screen = Screen::Albums;
                 Some(Intent::ShowScreen(Screen::Albums))
             }
-            KeyCode::Char('3') => {
+            KeyCode::F(3) => {
                 self.last_search.clear();
                 self.screen = Screen::Playlists;
                 Some(Intent::ShowScreen(Screen::Playlists))
             }
             // The DJ View (Claude Code intelligence pane), right of Queue.
-            KeyCode::Char('4') => {
+            KeyCode::F(4) => {
                 self.last_search.clear();
                 self.screen = Screen::Dj;
                 Some(Intent::ShowScreen(Screen::Dj))
@@ -1217,7 +1217,7 @@ mod tests {
         s.handle_key(ch('N'));
         assert_eq!(s.albums.selected, 3);
         // A screen switch clears the standing search (no stale highlight/jump).
-        s.handle_key(ch('1'));
+        s.handle_key(key(KeyCode::F(1)));
         assert_eq!(s.last_search, "");
     }
 
@@ -1605,11 +1605,11 @@ mod tests {
     #[test]
     fn screen_switch_keys_set_screen_and_intent() {
         let mut s = TuiState::new();
-        assert_eq!(s.handle_key(ch('2')), Some(Intent::ShowScreen(Screen::Albums)));
+        assert_eq!(s.handle_key(key(KeyCode::F(2))), Some(Intent::ShowScreen(Screen::Albums)));
         assert_eq!(s.screen, Screen::Albums);
-        assert_eq!(s.handle_key(ch('3')), Some(Intent::ShowScreen(Screen::Playlists)));
+        assert_eq!(s.handle_key(key(KeyCode::F(3))), Some(Intent::ShowScreen(Screen::Playlists)));
         assert_eq!(s.screen, Screen::Playlists);
-        assert_eq!(s.handle_key(ch('1')), Some(Intent::ShowScreen(Screen::Queue)));
+        assert_eq!(s.handle_key(key(KeyCode::F(1))), Some(Intent::ShowScreen(Screen::Queue)));
         assert_eq!(s.screen, Screen::Queue);
     }
 
@@ -1734,16 +1734,16 @@ mod tests {
     }
 
     #[test]
-    fn key_4_opens_dj_view() {
+    fn key_f4_opens_dj_view() {
         let mut s = TuiState::new();
-        assert_eq!(s.handle_key(ch('4')), Some(Intent::ShowScreen(Screen::Dj)));
+        assert_eq!(s.handle_key(key(KeyCode::F(4))), Some(Intent::ShowScreen(Screen::Dj)));
         assert_eq!(s.screen, Screen::Dj);
     }
 
     #[test]
     fn dj_input_builds_and_submits_as_cc() {
         let mut s = TuiState::new();
-        s.handle_key(ch('4'));
+        s.handle_key(key(KeyCode::F(4)));
         assert_eq!(s.screen, Screen::Dj);
         // Printable chars build the ask> line (never shadowed by nav/verb keys like
         // `p`/`j`/`q`, which would be transport/nav on other screens).
@@ -1763,14 +1763,14 @@ mod tests {
         assert!(s.dj_log.iter().any(|l| l == "> fade out"));
         // A blank Enter is a no-op (no spurious CC call).
         let mut s2 = TuiState::new();
-        s2.handle_key(ch('4'));
+        s2.handle_key(key(KeyCode::F(4)));
         assert_eq!(s2.handle_key(key(KeyCode::Enter)), None);
     }
 
     #[test]
     fn dj_esc_returns_to_queue() {
         let mut s = TuiState::new();
-        s.handle_key(ch('4'));
+        s.handle_key(key(KeyCode::F(4)));
         s.dj_input = "half typed".into();
         assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::ShowScreen(Screen::Queue)));
         assert_eq!(s.screen, Screen::Queue);

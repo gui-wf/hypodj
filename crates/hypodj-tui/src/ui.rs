@@ -131,10 +131,10 @@ fn hit_style() -> Style {
 /// A one-line tab strip: the active screen is REVERSED, the rest dim.
 fn render_tabs(f: &mut Frame, area: ratatui::layout::Rect, screen: Screen) {
     let labels = [
-        (Screen::Queue, "[1]Queue"),
-        (Screen::Albums, "[2]Albums"),
-        (Screen::Playlists, "[3]Playlists"),
-        (Screen::Dj, "[4]DJ"),
+        (Screen::Queue, "[F1]Queue"),
+        (Screen::Albums, "[F2]Albums"),
+        (Screen::Playlists, "[F3]Playlists"),
+        (Screen::Dj, "[F4]DJ"),
     ];
     let mut spans = Vec::new();
     for (i, (s, label)) in labels.iter().enumerate() {
@@ -566,7 +566,7 @@ mod tests {
         assert!(out.contains("ask>"), "input prompt drawn:\n{out}");
         assert!(out.contains("> fade out"), "scrollback shows the query:\n{out}");
         // The DJ tab is in the strip and the Queue still shares the top region.
-        assert!(out.contains("[4]DJ"), "DJ tab present:\n{out}");
+        assert!(out.contains("[F4]DJ"), "DJ tab present:\n{out}");
         assert!(out.contains("Queue"), "Queue shares the split:\n{out}");
     }
 
