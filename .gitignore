@@ -1,4 +1,7 @@
 /target
+# nix build / nixos-rebuild output symlinks (result, result-1, ...)
+/result
+/result-*
 /subsonity.local.toml
 /subsonity.validate.toml
 .direnv/
