@@ -85,9 +85,32 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     \"query\"/\"genre\"/\"radio\" plus \"count\" for enqueue, \"when_secs\" for \
     after_secs/time_remaining, \"slot\" for queue_position. Do NOT nest a trigger or a \
     selector object. If the request cannot be expressed, emit your closest valid single \
-    plan. Examples:\n\
-    Request: queue five calmer tracks -> {\"type\":\"enqueue\",\"query\":\"calmer tracks\",\"count\":5}\n\
+    plan.\n\
+    Rules:\n\
+    - enqueue selector: a music GENRE (jazz, ambient, bossa nova, techno...) -> \"genre\"; \
+    a mood/descriptive phrase (calmer, upbeat, calmer tracks) -> \"query\"; \"radio\"/\"station\" \
+    -> \"radio\":true (never a \"query\"). Set exactly ONE of them.\n\
+    - count from vague quantity: \"a couple\"=2, \"a few\"=3, \"some\"/\"a bunch\"/a bare plural \
+    (\"some jazz\", \"radio station\")=5, \"a track\"/\"a song\"/singular=1. Never default a \
+    plural request to 1.\n\
+    - placement: \"at the end\", \"next\", \"now\", or plain appends are IMMEDIATE - OMIT \"when\" \
+    entirely (do NOT emit after_current or queue_position for these). Use \"when\":\"after_current\" \
+    ONLY when the words say after the current track/song. Use \"when\":\"queue_position\"+\"slot\" \
+    for \"after N songs\". Use \"when\":\"album_boundary\" for \"after this album\". Use \
+    \"when\":\"time_remaining\"+\"when_secs\" for \"X before the track ends\" (that duration is the \
+    trigger timing, not a fade length). Emit only ONE placement; never mix an append with a \
+    trigger.\n\
+    Examples:\n\
+    Request: play some jazz -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":5}\n\
+    Request: queue a couple of bossa nova tracks -> {\"type\":\"enqueue\",\"genre\":\"bossa nova\",\"count\":2}\n\
+    Request: play a few ambient tracks -> {\"type\":\"enqueue\",\"genre\":\"ambient\",\"count\":3}\n\
+    Request: queue five calmer tracks at the end -> {\"type\":\"enqueue\",\"query\":\"calmer tracks\",\"count\":5}\n\
+    Request: queue some jazz tracks next -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":5}\n\
+    Request: add three upbeat songs after the current track -> {\"type\":\"enqueue\",\"query\":\"upbeat songs\",\"count\":3,\"when\":\"after_current\"}\n\
+    Request: put on a radio station -> {\"type\":\"enqueue\",\"radio\":true,\"count\":5}\n\
+    Request: queue a jazz track after 3 songs -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":1,\"when\":\"queue_position\",\"slot\":3}\n\
     Request: fade out the current track over 30 seconds -> {\"type\":\"fade_out\",\"secs\":30}\n\
+    Request: fade out 2 minutes before the track ends -> {\"type\":\"fade_out\",\"when\":\"time_remaining\",\"when_secs\":120}\n\
     Request: stop after this album -> {\"type\":\"stop\",\"when\":\"album_boundary\"}";
 
 /// Build the per-request user prompt: only the small live context the client already
