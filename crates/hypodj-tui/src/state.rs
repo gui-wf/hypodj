@@ -14,8 +14,34 @@ use hypodj_client::route::{route, Action};
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
 const SCROLLOFF: usize = 3;
 
-/// Scrub step in seconds for Space (forward) / Backspace (back).
+/// Scrub step in seconds for ctrl+f (forward) / ctrl+b (back).
 const SCRUB_STEP: i32 = 5;
+
+/// Incremental jump-to-match search over an active list. Case-insensitive
+/// `contains`, scanning from `origin` forward and wrapping once through the whole
+/// list. Pure and testable - no self, no IO.
+///
+/// - empty query -> `Some(origin)` (cursor stays put)
+/// - no match -> `None`
+/// - empty list -> `None`
+pub fn search_jump(labels: &[&str], query: &str, origin: usize) -> Option<usize> {
+    if query.is_empty() {
+        return Some(origin);
+    }
+    let n = labels.len();
+    if n == 0 {
+        return None;
+    }
+    let q = query.to_lowercase();
+    let start = origin % n;
+    for step in 0..n {
+        let i = (start + step) % n;
+        if labels[i].to_lowercase().contains(&q) {
+            return Some(i);
+        }
+    }
+    None
+}
 
 /// Derive the top visible row for a scrolloff viewport. Pure and testable: given
 /// the selected row `sel`, the queue length `n`, the viewport height `h`, and the
@@ -107,6 +133,8 @@ pub enum Mode {
     Normal,
     /// The bottom command line (bare verb OR natural-language phrase).
     Command,
+    /// Incremental jump-to-match search over the active list (`/`).
+    Search,
     /// The y/N confirm popup for an armed plan (NL echo) or a destructive verb.
     Confirm,
 }
@@ -250,6 +278,9 @@ pub struct TuiState {
     /// dedicated connection when the track changes). `None` for a stream, missing
     /// art, or a fetch/decode failure - the art panel then shows a placeholder.
     pub art: Option<crate::art::AlbumArt>,
+    /// The active cursor saved when `/` is pressed, so Esc can restore it after a
+    /// non-destructive jump-to-match search.
+    pub search_origin: usize,
 }
 
 impl Default for TuiState {
@@ -269,6 +300,7 @@ impl Default for TuiState {
             connected: true,
             queue_version: None,
             art: None,
+            search_origin: 0,
         }
     }
 }
@@ -332,13 +364,14 @@ impl TuiState {
         match self.mode {
             Mode::Normal => self.key_normal(key),
             Mode::Command => self.key_command(key),
+            Mode::Search => self.key_search(key),
             Mode::Confirm => self.key_confirm(key),
         }
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Intent> {
         // Readline-style CONTROL bindings first, so a plain `p`/`n`/`s` never
-        // shadows ctrl+p/ctrl+n (cursor) or ctrl+s (stop).
+        // shadows ctrl+p/ctrl+n (cursor), ctrl+f/ctrl+b (scrub), or ctrl+s (fav).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             return match key.code {
                 KeyCode::Char('n') => {
@@ -349,14 +382,20 @@ impl TuiState {
                     self.move_selection(-1);
                     None
                 }
-                KeyCode::Char('s') => Some(Intent::Command("stop".into())),
+                // Scrub the current track (relative seekcur); space vacated scrub.
+                KeyCode::Char('f') => Some(Intent::Command(format!("seekcur +{SCRUB_STEP}"))),
+                KeyCode::Char('b') => Some(Intent::Command(format!("seekcur -{SCRUB_STEP}"))),
+                // Favorite the CURRENT playing track; stop moved to the `:stop` line.
+                KeyCode::Char('s') => self.favorite_current(),
                 _ => None,
             };
         }
         match key.code {
-            // Space/Backspace scrub the current track (relative seekcur).
-            KeyCode::Char(' ') => Some(Intent::Command(format!("seekcur +{SCRUB_STEP}"))),
-            KeyCode::Backspace => Some(Intent::Command(format!("seekcur -{SCRUB_STEP}"))),
+            // Space ADDS the selected browse row to the queue (no play) and advances
+            // the cursor for rapid multi-add; Queue has nothing to add -> no-op.
+            KeyCode::Char(' ') => self.enqueue_selected(),
+            // Backspace is a safe no-op (browse-back lives on h/Left/Esc).
+            KeyCode::Backspace => None,
             KeyCode::Char('p') => Some(Intent::Command("pause".into())),
             // `<`/`>` arrive as Char with SHIFT; the char value already encodes it.
             KeyCode::Char('<') => Some(Intent::Command("previous".into())),
@@ -387,7 +426,11 @@ impl TuiState {
                 self.go_bottom();
                 None
             }
-            KeyCode::Char('f') => self.favorite_selected(),
+            // `s` stars the SELECTED row; `f` is freed (vim find idiom now on `/`).
+            KeyCode::Char('s') => self.favorite_selected(),
+            KeyCode::Char('f') => None,
+            // `o` OPENS (drills into) the selected browse directory.
+            KeyCode::Char('o') => self.open_selected(),
             // Screen switch: 1/2/3 select the view; main.rs lazily fetches it.
             KeyCode::Char('1') => {
                 self.screen = Screen::Queue;
@@ -403,10 +446,18 @@ impl TuiState {
             }
             // Back out of a browse drill-down (Queue: no-op).
             KeyCode::Char('h') | KeyCode::Left => self.browse_back(),
+            // Esc backs out one browse level; on Queue / a browse root it no-ops.
+            KeyCode::Esc => self.browse_back(),
             KeyCode::Enter => self.enter_action(),
-            KeyCode::Char('/') | KeyCode::Char(':') => {
+            KeyCode::Char(':') => {
                 self.mode = Mode::Command;
                 self.input.clear();
+                None
+            }
+            KeyCode::Char('/') => {
+                self.search_origin = self.active_cursor();
+                self.input.clear();
+                self.mode = Mode::Search;
                 None
             }
             KeyCode::Char('q') => Some(Intent::Quit),
@@ -449,8 +500,9 @@ impl TuiState {
         }
     }
 
-    /// Enter behaviour per screen: Queue plays the selected row; Albums drills into
-    /// a directory or enqueues+plays a song; Playlists loads the selected playlist.
+    /// Enter always PLAYS the selection: Queue plays the selected row; an album/dir
+    /// row enqueues the whole album and plays its first track; a song row enqueues
+    /// and plays; Playlists loads the selected playlist. Drilling-in moved to `o`.
     fn enter_action(&mut self) -> Option<Intent> {
         match self.screen {
             Screen::Queue => self
@@ -459,11 +511,7 @@ impl TuiState {
                 .map(|it| Intent::Command(format!("play {}", it.pos))),
             Screen::Albums => {
                 let row = self.albums.rows.get(self.albums.selected)?;
-                if row.is_dir {
-                    Some(Intent::BrowseInto(row.uri.clone()))
-                } else {
-                    Some(Intent::Enqueue { uri: row.uri.clone(), play: true })
-                }
+                Some(Intent::Enqueue { uri: row.uri.clone(), play: true })
             }
             Screen::Playlists => {
                 let row = self.playlists.rows.get(self.playlists.selected)?;
@@ -494,6 +542,110 @@ impl TuiState {
                 None
             }
             None => None,
+        }
+    }
+
+    /// Space: enqueue the selected browse row (no play) and advance the cursor one
+    /// row for rapid multi-add. On Playlists a row name is not a file URI, so it
+    /// loads via `LoadPlaylist` (mirrors Enter's semantics without playing); an
+    /// Albums/dir/song row enqueues with `add <uri>`. Queue has nothing to add ->
+    /// no-op.
+    fn enqueue_selected(&mut self) -> Option<Intent> {
+        let intent = match self.active_browse() {
+            Some(b) => {
+                let uri = b.rows.get(b.selected).map(|r| r.uri.clone())?;
+                match self.screen {
+                    Screen::Playlists => Intent::LoadPlaylist(uri),
+                    _ => Intent::Enqueue { uri, play: false },
+                }
+            }
+            None => return None,
+        };
+        self.move_selection(1);
+        Some(intent)
+    }
+
+    /// `o`: OPEN (drill into) the selected browse directory. A song row or the Queue
+    /// screen is a no-op (Enter is the play verb there).
+    fn open_selected(&mut self) -> Option<Intent> {
+        let b = self.active_browse()?;
+        let row = b.rows.get(b.selected)?;
+        if row.is_dir {
+            Some(Intent::BrowseInto(row.uri.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// The labels of the active list, as the eye sees them, for search matching.
+    fn active_labels(&self) -> Vec<String> {
+        match self.screen {
+            Screen::Queue => self
+                .queue
+                .iter()
+                .map(|it| match &it.artist {
+                    Some(a) => format!("{} - {}", it.title, a),
+                    None => it.title.clone(),
+                })
+                .collect(),
+            Screen::Albums => self.albums.rows.iter().map(|r| r.label.clone()).collect(),
+            Screen::Playlists => self.playlists.rows.iter().map(|r| r.label.clone()).collect(),
+        }
+    }
+
+    /// The active list's current cursor index (Queue or the active browse).
+    fn active_cursor(&self) -> usize {
+        match self.screen {
+            Screen::Queue => self.selected,
+            Screen::Albums => self.albums.selected,
+            Screen::Playlists => self.playlists.selected,
+        }
+    }
+
+    /// Set the active list's cursor index (Queue or the active browse).
+    fn set_active_cursor(&mut self, i: usize) {
+        match self.screen {
+            Screen::Queue => self.selected = i,
+            Screen::Albums => self.albums.selected = i,
+            Screen::Playlists => self.playlists.selected = i,
+        }
+    }
+
+    /// Re-run the incremental search from `search_origin` against the current input,
+    /// moving the active cursor to the match (or sticking at the origin on no match).
+    fn run_search(&mut self) {
+        let labels = self.active_labels();
+        let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+        let i = search_jump(&refs, &self.input, self.search_origin).unwrap_or(self.search_origin);
+        self.set_active_cursor(i);
+    }
+
+    /// Incremental jump-to-match search: Char/Backspace re-run the jump, Enter
+    /// accepts in place, Esc restores the pre-search cursor. Non-destructive.
+    fn key_search(&mut self, key: KeyEvent) -> Option<Intent> {
+        match key.code {
+            KeyCode::Esc => {
+                self.set_active_cursor(self.search_origin);
+                self.mode = Mode::Normal;
+                self.input.clear();
+                None
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                self.input.clear();
+                None
+            }
+            KeyCode::Backspace => {
+                self.input.pop();
+                self.run_search();
+                None
+            }
+            KeyCode::Char(c) => {
+                self.input.push(c);
+                self.run_search();
+                None
+            }
+            _ => None,
         }
     }
 
@@ -628,24 +780,45 @@ mod tests {
     #[test]
     fn normal_transport_keys() {
         let mut s = TuiState::new();
-        // Space/Backspace scrub (relative seekcur), NOT pause.
-        assert_eq!(s.handle_key(ch(' ')), Some(Intent::Command("seekcur +5".into())));
-        assert_eq!(
-            s.handle_key(key(KeyCode::Backspace)),
-            Some(Intent::Command("seekcur -5".into()))
-        );
-        // Pause moved to bare `p`.
+        // Space is enqueue-selected (Queue: no-op); Backspace is a safe no-op.
+        assert_eq!(s.handle_key(ch(' ')), None);
+        assert_eq!(s.handle_key(key(KeyCode::Backspace)), None);
+        // Pause on bare `p`.
         assert_eq!(s.handle_key(ch('p')), Some(Intent::Command("pause".into())));
         // `<`/`>` are prev/next.
         assert_eq!(s.handle_key(ch('<')), Some(Intent::Command("previous".into())));
         assert_eq!(s.handle_key(ch('>')), Some(Intent::Command("next".into())));
-        // ctrl+s stops.
-        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("stop".into())));
         assert_eq!(s.handle_key(ch('q')), Some(Intent::Quit));
-        // Bare n/b/s are freed - no transport.
+        // Bare n/b/f are freed - no transport.
         assert_eq!(s.handle_key(ch('n')), None);
         assert_eq!(s.handle_key(ch('b')), None);
-        assert_eq!(s.handle_key(ch('s')), None);
+        assert_eq!(s.handle_key(ch('f')), None);
+    }
+
+    #[test]
+    fn ctrl_f_and_b_scrub() {
+        let mut s = TuiState::new();
+        assert_eq!(s.handle_key(ctrl('f')), Some(Intent::Command("seekcur +5".into())));
+        assert_eq!(s.handle_key(ctrl('b')), Some(Intent::Command("seekcur -5".into())));
+    }
+
+    #[test]
+    fn ctrl_s_favorites_current() {
+        let mut s = TuiState::new();
+        // Current song row -> star it.
+        s.now.file = Some("song/3".into());
+        assert_eq!(
+            s.handle_key(ctrl('s')),
+            Some(Intent::Command("playlistadd Starred song/3".into()))
+        );
+        // A stream -> friendly status, no command.
+        s.now.file = Some("http://stream.example/live".into());
+        assert_eq!(s.handle_key(ctrl('s')), None);
+        assert!(s.status_msg.is_some());
+        // Nothing playing -> friendly status.
+        s.now.file = None;
+        assert_eq!(s.handle_key(ctrl('s')), None);
+        assert!(s.status_msg.is_some());
     }
 
     #[test]
@@ -678,24 +851,141 @@ mod tests {
     }
 
     #[test]
-    fn f_favorites_selected_row() {
+    fn s_favorites_selected_row() {
         let mut s = TuiState::new();
         s.apply_snapshot(NowPlaying::default(), vec![item(6), item(7)]);
         s.selected = 1;
         assert_eq!(
-            s.handle_key(ch('f')),
+            s.handle_key(ch('s')),
             Some(Intent::Command("playlistadd Starred song/7".into()))
         );
         // A stream row (URL uri) is a friendly status, not a command.
         s.queue[1].uri = Some("http://stream.example/live".into());
-        assert_eq!(s.handle_key(ch('f')), None);
+        assert_eq!(s.handle_key(ch('s')), None);
         assert!(s.status_msg.is_some());
         // No uri at all -> silent no-op.
         s.queue[1].uri = None;
-        assert_eq!(s.handle_key(ch('f')), None);
+        assert_eq!(s.handle_key(ch('s')), None);
         // Empty queue -> no-op.
         s.apply_snapshot(NowPlaying::default(), vec![]);
-        assert_eq!(s.handle_key(ch('f')), None);
+        assert_eq!(s.handle_key(ch('s')), None);
+    }
+
+    #[test]
+    fn space_enqueues_and_advances_on_browse() {
+        let mut s = TuiState::new();
+        // Queue: space is a no-op and leaves the cursor put.
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        assert_eq!(s.handle_key(ch(' ')), None);
+        assert_eq!(s.selected, 0);
+        // Browse: space enqueues the selected uri (no play) and advances the cursor.
+        s.albums.rows = vec![brow("a", "song/1", false), brow("b", "song/2", false)];
+        s.screen = Screen::Albums;
+        assert_eq!(
+            s.handle_key(ch(' ')),
+            Some(Intent::Enqueue { uri: "song/1".into(), play: false })
+        );
+        assert_eq!(s.albums.selected, 1);
+        // Playlists: space loads the playlist (a name is not a file uri) and advances.
+        s.playlists.rows = vec![brow("Starred", "Starred", false), brow("Chill", "Chill", false)];
+        s.screen = Screen::Playlists;
+        assert_eq!(s.handle_key(ch(' ')), Some(Intent::LoadPlaylist("Starred".into())));
+        assert_eq!(s.playlists.selected, 1);
+    }
+
+    #[test]
+    fn o_opens_selected_dir() {
+        let mut s = TuiState::new();
+        s.albums.rows = vec![brow("X", "album/9", true), brow("song", "song/7", false)];
+        s.screen = Screen::Albums;
+        // A dir row -> BrowseInto.
+        assert_eq!(s.handle_key(ch('o')), Some(Intent::BrowseInto("album/9".into())));
+        // A song row -> no-op.
+        s.albums.selected = 1;
+        assert_eq!(s.handle_key(ch('o')), None);
+        // Queue -> no-op.
+        s.screen = Screen::Queue;
+        assert_eq!(s.handle_key(ch('o')), None);
+    }
+
+    #[test]
+    fn esc_in_normal_backs_out_browse() {
+        let mut s = TuiState::new();
+        // Queue: Esc is a no-op.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
+        s.screen = Screen::Albums;
+        // Browse root (empty stack) -> no-op.
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), None);
+        // Browse sub-level (non-empty stack) -> BrowseBack.
+        s.albums.stack.push(("list/newest".into(), 0));
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), Some(Intent::BrowseBack));
+    }
+
+    #[test]
+    fn colon_opens_command_slash_opens_search() {
+        let mut s = TuiState::new();
+        s.apply_snapshot(NowPlaying::default(), vec![item(0), item(1)]);
+        s.selected = 1;
+        // `:` -> Command mode.
+        assert_eq!(s.handle_key(ch(':')), None);
+        assert_eq!(s.mode, Mode::Command);
+        s.handle_key(key(KeyCode::Esc));
+        // `/` -> Search mode, seeding search_origin from the active cursor.
+        assert_eq!(s.handle_key(ch('/')), None);
+        assert_eq!(s.mode, Mode::Search);
+        assert_eq!(s.search_origin, 1);
+    }
+
+    #[test]
+    fn search_jump_matches_wraps_and_cases() {
+        let labels = ["Alpha", "Beta", "Gamma", "beta two"];
+        // Forward match from origin 0.
+        assert_eq!(search_jump(&labels, "Beta", 0), Some(1));
+        // Case-insensitive.
+        assert_eq!(search_jump(&labels, "gamma", 0), Some(2));
+        // Wrap-around from a late origin: from 3, "alpha" wraps to index 0.
+        assert_eq!(search_jump(&labels, "alpha", 3), Some(0));
+        // From origin 2, "beta" finds index 3 first (forward), not 1.
+        assert_eq!(search_jump(&labels, "beta", 2), Some(3));
+        // Empty query keeps the cursor at origin.
+        assert_eq!(search_jump(&labels, "", 2), Some(2));
+        // No match -> None.
+        assert_eq!(search_jump(&labels, "zzz", 0), None);
+        // Empty list -> None.
+        assert_eq!(search_jump(&[], "x", 0), None);
+    }
+
+    #[test]
+    fn search_mode_transitions() {
+        let mut s = TuiState::new();
+        s.albums.rows = vec![
+            brow("Alpha", "song/1", false),
+            brow("Beta", "song/2", false),
+            brow("Gamma", "song/3", false),
+        ];
+        s.screen = Screen::Albums;
+        s.albums.selected = 0;
+        // Enter search, seeding origin.
+        s.handle_key(ch('/'));
+        assert_eq!(s.search_origin, 0);
+        // Typing a matching char jumps the active cursor.
+        s.handle_key(ch('g'));
+        assert_eq!(s.albums.selected, 2);
+        // Enter accepts in place and returns to Normal.
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.mode, Mode::Normal);
+        assert_eq!(s.albums.selected, 2);
+        // A no-match char leaves the cursor at origin (never jumps to 0 blindly).
+        s.albums.selected = 1;
+        s.handle_key(ch('/'));
+        assert_eq!(s.search_origin, 1);
+        s.handle_key(ch('z'));
+        assert_eq!(s.albums.selected, 1);
+        // Esc restores the pre-search cursor (origin 1), even after it moved.
+        s.albums.selected = 2;
+        s.handle_key(key(KeyCode::Esc));
+        assert_eq!(s.mode, Mode::Normal);
+        assert_eq!(s.albums.selected, 1);
     }
 
     #[test]
@@ -756,7 +1046,7 @@ mod tests {
     #[test]
     fn command_mode_edit() {
         let mut s = TuiState::new();
-        s.handle_key(ch('/'));
+        s.handle_key(ch(':'));
         assert_eq!(s.mode, Mode::Command);
         s.handle_key(ch('a'));
         s.handle_key(ch('b'));
@@ -848,10 +1138,13 @@ mod tests {
         s.selected = 1;
         // Queue: play selected pos.
         assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::Command("play 5".into())));
-        // Albums dir -> BrowseInto; song -> Enqueue.
+        // Albums: Enter now PLAYS both a dir (enqueue album + play first) and a song.
         s.albums.rows = vec![brow("X", "album/9", true), brow("song", "song/7", false)];
         s.screen = Screen::Albums;
-        assert_eq!(s.handle_key(key(KeyCode::Enter)), Some(Intent::BrowseInto("album/9".into())));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Enqueue { uri: "album/9".into(), play: true })
+        );
         s.albums.selected = 1;
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
@@ -880,9 +1173,8 @@ mod tests {
     fn transport_keys_work_on_every_screen() {
         let mut s = TuiState::new();
         s.screen = Screen::Albums;
-        assert_eq!(s.handle_key(ch(' ')), Some(Intent::Command("seekcur +5".into())));
+        assert_eq!(s.handle_key(ctrl('f')), Some(Intent::Command("seekcur +5".into())));
         assert_eq!(s.handle_key(ch('p')), Some(Intent::Command("pause".into())));
-        assert_eq!(s.handle_key(ctrl('s')), Some(Intent::Command("stop".into())));
         assert_eq!(s.handle_key(ch('>')), Some(Intent::Command("next".into())));
         assert_eq!(s.handle_key(ch('0')), Some(Intent::Command("knob up".into())));
     }

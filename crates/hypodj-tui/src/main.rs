@@ -29,6 +29,9 @@ use state::{Intent, Pending, Screen, TuiState};
 const POLL: Duration = Duration::from_millis(250);
 const REFRESH_EVERY: Duration = Duration::from_secs(1);
 
+/// Volume detent for the knob->setvol fallback, matching the server's step.
+const KNOB_STEP: i32 = 5;
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("hypodj-tui: {e}");
@@ -143,7 +146,18 @@ fn execute(conn: &mut MpdConn, state: &mut TuiState, intent: Intent) {
     match intent {
         Intent::Command(line) => match conn.command(&line) {
             Ok(_) => refresh(conn, state),
-            Err(MpdError::Ack(m)) => state.status_msg = Some(map_ack_reason(&m)),
+            Err(MpdError::Ack(m)) => {
+                // Graceful knob -> setvol fallback: an OLD daemon ACKs `unknown
+                // command "knob"`. ONLY for the exact knob lines AND an unknown-
+                // command ACK, compute a setvol from the last-known volume so the
+                // volume keys work against both old and new daemons; every other
+                // ACK still flows to map_ack_reason untouched.
+                if (line == "knob up" || line == "knob down") && m.contains("unknown command") {
+                    knob_setvol_fallback(conn, state, &line);
+                } else {
+                    state.status_msg = Some(map_ack_reason(&m));
+                }
+            }
             Err(_) => state.mark_disconnected(),
         },
         Intent::Nl(phrase) => match conn.command(&nl_request(&phrase)) {
@@ -277,25 +291,52 @@ fn browse_title(path: &str) -> String {
     }
 }
 
-/// Enqueue a browse uri (`add <uri>`); when `play`, jump to the freshly-added tail
-/// by reading the queue length back from a fresh status.
+/// Enqueue a browse uri (`add <uri>`); when `play`, play the FIRST freshly-added
+/// track. `add <dir>` appends a whole album, so the first new track is at the queue
+/// length captured BEFORE the add (playing `len_after - 1` would start the LAST
+/// album track). For a single song, before == tail, so this is unchanged.
 fn enqueue(conn: &mut MpdConn, state: &mut TuiState, uri: String, play: bool) {
+    let len_before = if play {
+        run_pairs(conn, state, "status").map(|status| {
+            status
+                .iter()
+                .find(|(k, _)| k == "playlistlength")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    } else {
+        None
+    };
     if run_pairs(conn, state, &format!("add {}", quote_arg(&uri))).is_none() {
         return;
     }
     if play {
-        if let Some(status) = run_pairs(conn, state, "status") {
-            let len = status
-                .iter()
-                .find(|(k, _)| k == "playlistlength")
-                .and_then(|(_, v)| v.parse::<usize>().ok())
-                .unwrap_or(0);
-            if len > 0 {
-                let _ = conn.command(&format!("play {}", len - 1));
-            }
+        if let Some(before) = len_before {
+            let _ = conn.command(&format!("play {before}"));
         }
     }
     refresh(conn, state);
+}
+
+/// Compute and send a `setvol` from the last-known volume for an old daemon that
+/// does not know `knob`. When the volume was never polled (unknown) there is no
+/// base to step from, so show a banner and skip rather than jumping to a raw step.
+fn knob_setvol_fallback(conn: &mut MpdConn, state: &mut TuiState, line: &str) {
+    let base = match state.now.volume {
+        Some(v) if v >= 0 => v,
+        _ => {
+            state.status_msg =
+                Some("volume unknown - can't step it on this older daemon".into());
+            return;
+        }
+    };
+    let delta = if line == "knob up" { KNOB_STEP } else { -KNOB_STEP };
+    let new = (base + delta).clamp(0, 100);
+    match conn.command(&format!("setvol {new}")) {
+        Ok(_) => refresh(conn, state),
+        Err(MpdError::Ack(m)) => state.status_msg = Some(map_ack_reason(&m)),
+        Err(_) => state.mark_disconnected(),
+    }
 }
 
 /// Arm the pending plan: a direct command (destructive verb) OR `nl confirm
