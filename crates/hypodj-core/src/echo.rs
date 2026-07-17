@@ -3,7 +3,10 @@
 //! the same IR), plus a short human sentence for the confirmation prompt.
 
 use crate::nl::NlSource;
-use crate::plan::{Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel};
+use crate::plan::{
+    Action, ClearScope, FadeIntentIr, MoveDest, PosBase, QueueSelector, RawPlan, RawTrigger,
+    Selector, TrackSel,
+};
 
 /// Format an f64 seconds value without a trailing `.0` (so `parse_secs` re-reads
 /// it): `30.0 -> "30"`, `1200.0 -> "1200"`, `30.5 -> "30.5"`.
@@ -88,11 +91,38 @@ fn action_dsl(a: &Action) -> Option<String> {
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
+        Action::Remove { sel } => format!("action remove {}", qselector_dsl(sel)?),
+        Action::Play { sel } => format!("action play {}", qselector_dsl(sel)?),
+        Action::Noop => "action noop".into(),
+        Action::Clear { scope } => match scope {
+            ClearScope::All => "action clear all".into(),
+            ClearScope::AfterCurrent => "action clear after".into(),
+            ClearScope::Range { start, end } => format!("action clear range {start} {end}"),
+        },
+        Action::Move { sel, dest } => {
+            let d = match dest {
+                MoveDest::Position(p) => format!("pos {p}"),
+                MoveDest::Relative(r) => format!("rel {r}"),
+            };
+            format!("action move {} to {}", qselector_dsl(sel)?, d)
+        }
         // ToFloor/WakeTo/Wake are built only by the convenience sleep/winddown/wake
         // commands, not the keyword `plan add` DSL - so they are not round-tripped.
         Action::Fade(FadeIntentIr::ToFloor { .. })
         | Action::Fade(FadeIntentIr::WakeTo { .. })
         | Action::Wake { .. } => return None,
+    })
+}
+
+/// Render a [`QueueSelector`] to its `plan add` DSL fragment. `None` when a query
+/// value carries a control char (see [`dsl_value`]) - the caller then arms directly.
+fn qselector_dsl(sel: &QueueSelector) -> Option<String> {
+    Some(match sel {
+        QueueSelector::Current => "current".into(),
+        QueueSelector::Position(p) => format!("pos {p}"),
+        QueueSelector::Last(n) => format!("last {n}"),
+        QueueSelector::Range { start, end } => format!("range {start} {end}"),
+        QueueSelector::QueryMatch(q) => format!("match {}", dsl_value(q)?),
     })
 }
 
@@ -169,6 +199,23 @@ pub fn describe_plan(raw: &RawPlan) -> String {
             }
             None => "wake: ramp up from silence to the saved comfort level".to_string(),
         },
+        Action::Remove { sel } => format!("REMOVE {} from the queue", describe_qselector(sel)),
+        Action::Play { sel } => format!("jump playback to {}", describe_qselector(sel)),
+        Action::Move { sel, dest } => {
+            let d = match dest {
+                MoveDest::Position(p) => format!("position {p}"),
+                MoveDest::Relative(r) => format!("{r} relative to the current track"),
+            };
+            format!("MOVE {} to {}", describe_qselector(sel), d)
+        }
+        Action::Clear { scope } => match scope {
+            ClearScope::All => "CLEAR the whole queue".to_string(),
+            ClearScope::AfterCurrent => "CLEAR everything after the current track".to_string(),
+            ClearScope::Range { start, end } => {
+                format!("CLEAR queue positions {start} through {end}")
+            }
+        },
+        Action::Noop => "do nothing (no valid action for this request)".to_string(),
     };
     format!("{what} {when}")
 }
@@ -194,6 +241,23 @@ pub fn describe_batch(plans: &[RawPlan], src: NlSource) -> String {
     // Single line: an MPD pair value must not embed a newline (the wire frames
     // pairs as `key: value\n`). Join the clauses with a visible separator.
     lines.join(" | ")
+}
+
+/// A short human phrase for a queue selector (the confirmation surface).
+fn describe_qselector(sel: &QueueSelector) -> String {
+    match sel {
+        QueueSelector::Current => "the current track".to_string(),
+        QueueSelector::Position(p) => format!("the {} track", ordinal(*p)),
+        QueueSelector::Last(n) => {
+            if *n == 1 {
+                "the last track".to_string()
+            } else {
+                format!("the last {n} tracks")
+            }
+        }
+        QueueSelector::Range { start, end } => format!("tracks {start} through {end}"),
+        QueueSelector::QueryMatch(q) => format!("tracks matching \"{q}\""),
+    }
 }
 
 fn ordinal(n: usize) -> String {
@@ -283,6 +347,45 @@ mod tests {
             once: true,
             origin: String::new(),
         });
+    }
+
+    #[test]
+    fn render_dsl_round_trips_queue_edit_actions() {
+        use crate::plan::{ClearScope, MoveDest, QueueSelector};
+        let imm = |action| RawPlan {
+            version: 1,
+            trigger: RawTrigger::Immediate,
+            action,
+            once: false,
+            origin: String::new(),
+        };
+        // Every selector variant through Remove.
+        for sel in [
+            QueueSelector::Current,
+            QueueSelector::Position(3),
+            QueueSelector::Last(2),
+            QueueSelector::Range { start: 2, end: 5 },
+            QueueSelector::QueryMatch("blue in green".into()),
+        ] {
+            assert_round_trip(&imm(Action::Remove { sel }));
+        }
+        // Play + clear scopes.
+        assert_round_trip(&imm(Action::Play { sel: QueueSelector::Position(6) }));
+        assert_round_trip(&imm(Action::Play { sel: QueueSelector::QueryMatch("so what".into()) }));
+        assert_round_trip(&imm(Action::Clear { scope: ClearScope::All }));
+        assert_round_trip(&imm(Action::Clear { scope: ClearScope::AfterCurrent }));
+        assert_round_trip(&imm(Action::Clear { scope: ClearScope::Range { start: 3, end: 7 } }));
+        // Move with both destination kinds.
+        assert_round_trip(&imm(Action::Move {
+            sel: QueueSelector::Last(1),
+            dest: MoveDest::Position(1),
+        }));
+        assert_round_trip(&imm(Action::Move {
+            sel: QueueSelector::Position(4),
+            dest: MoveDest::Relative(-2),
+        }));
+        // Noop round-trips too.
+        assert_round_trip(&imm(Action::Noop));
     }
 
     #[test]

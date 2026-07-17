@@ -35,7 +35,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
 use crate::plan::{
-    Action, FadeIntentIr, PlanId, PosBase, RawPlan, RawTrigger, Selector, TrackSel,
+    Action, ClearScope, FadeIntentIr, MoveDest, PlanId, PosBase, QueueSelector, RawPlan,
+    RawTrigger, Selector, TrackSel,
 };
 
 /// Advertised MPD protocol version in the greeting.
@@ -562,6 +563,53 @@ fn parse_plan_action(toks: &[String]) -> Option<Action> {
             let count = toks.get(sel.1).and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
             Some(Action::Enqueue { selector: sel.0, count })
         }
+        // ── queue-edit actions (echo-before-arm round-trip; see echo.rs) ──────
+        "remove" => Some(Action::Remove { sel: parse_qselector(&toks[1..])? }),
+        "play" => Some(Action::Play { sel: parse_qselector(&toks[1..])? }),
+        "noop" => Some(Action::Noop),
+        "clear" => match toks.get(1)?.to_lowercase().as_str() {
+            "all" => Some(Action::Clear { scope: ClearScope::All }),
+            "after" => Some(Action::Clear { scope: ClearScope::AfterCurrent }),
+            "range" => Some(Action::Clear {
+                scope: ClearScope::Range {
+                    start: toks.get(2)?.parse().ok()?,
+                    end: toks.get(3)?.parse().ok()?,
+                },
+            }),
+            _ => None,
+        },
+        "move" => {
+            let to = toks.iter().position(|t| t.eq_ignore_ascii_case("to"))?;
+            let sel = parse_qselector(&toks[1..to])?;
+            let dest = parse_movedest(&toks[to + 1..])?;
+            Some(Action::Move { sel, dest })
+        }
+        _ => None,
+    }
+}
+
+/// Parse a queue selector off the leading tokens: `current` | `pos <n>` |
+/// `last <n>` | `range <start> <end>` | `match <query>`. Positions are 1-based.
+fn parse_qselector(toks: &[String]) -> Option<QueueSelector> {
+    match toks.first()?.to_lowercase().as_str() {
+        "current" => Some(QueueSelector::Current),
+        "pos" => Some(QueueSelector::Position(toks.get(1)?.parse().ok()?)),
+        "last" => Some(QueueSelector::Last(toks.get(1)?.parse().ok()?)),
+        "range" => Some(QueueSelector::Range {
+            start: toks.get(1)?.parse().ok()?,
+            end: toks.get(2)?.parse().ok()?,
+        }),
+        "match" => Some(QueueSelector::QueryMatch(toks.get(1)?.clone())),
+        _ => None,
+    }
+}
+
+/// Parse a move destination: `pos <n>` (1-based absolute) | `rel <d>` (signed,
+/// relative to the current track).
+fn parse_movedest(toks: &[String]) -> Option<MoveDest> {
+    match toks.first()?.to_lowercase().as_str() {
+        "pos" => Some(MoveDest::Position(toks.get(1)?.parse().ok()?)),
+        "rel" => Some(MoveDest::Relative(toks.get(1)?.parse().ok()?)),
         _ => None,
     }
 }

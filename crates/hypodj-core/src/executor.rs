@@ -404,6 +404,14 @@ async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action) {
         Action::Wake { selector, count } => {
             handler.wake_now(selector.clone(), *count).await
         }
+        // DETERMINISTIC queue edits: the selector resolves against the LIVE queue
+        // inside plan_queue_edit; a no-match is a clean no-op (count 0), never a
+        // wrong-target delete. Destructive ops reach here only past the confirm gate.
+        Action::Remove { .. }
+        | Action::Move { .. }
+        | Action::Clear { .. }
+        | Action::Play { .. }
+        | Action::Noop => handler.plan_queue_edit(&action).await.map(|_| ()),
     };
     if let Err(e) = r {
         tracing::error!(plan = id.0, error = %e, "plan action failed (log-and-continue)");

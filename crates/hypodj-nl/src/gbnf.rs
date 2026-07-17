@@ -24,7 +24,7 @@ pub fn schema_json() -> String {
 /// diffable; the drift test asserts the schema it targets is unchanged, and the
 /// round-trip test asserts every canned corpus JSON still deserializes.
 pub const GBNF: &str = r##"root   ::= "{" ws "\"type\"" ws ":" ws actkind rest ws "}"
-actkind ::= "\"fade_out\"" | "\"fade_in\"" | "\"stop\"" | "\"pause\"" | "\"set_volume\"" | "\"enqueue\""
+actkind ::= "\"fade_out\"" | "\"fade_in\"" | "\"stop\"" | "\"pause\"" | "\"set_volume\"" | "\"enqueue\"" | "\"remove\"" | "\"move\"" | "\"clear\"" | "\"play\"" | "\"noop\""
 rest ::= ( ws "," ws string ws ":" ws value )*
 value ::= object | array | string | number | bool
 object ::= "{" ws ( string ws ":" ws value ( ws "," ws string ws ":" ws value )* )? ws "}"

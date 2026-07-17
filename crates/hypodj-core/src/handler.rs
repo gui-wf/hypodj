@@ -1603,6 +1603,191 @@ impl HypodjHandler {
         Ok(n)
     }
 
+    /// The searchable text for one queue entry (title + artist + album), used by a
+    /// [`QueueSelector::QueryMatch`]. Pure over the entry.
+    fn item_search_text(entry: &QueueEntry) -> String {
+        match entry {
+            QueueEntry::Song(s) => {
+                let mut t = s.title.clone();
+                if let Some(a) = &s.artist {
+                    t.push(' ');
+                    t.push_str(a);
+                }
+                if let Some(al) = &s.album {
+                    t.push(' ');
+                    t.push_str(al);
+                }
+                t
+            }
+            QueueEntry::Stream { title, .. } => title.clone(),
+        }
+    }
+
+    /// Snapshot the per-entry search text + current index under the lock, so the
+    /// pure [`crate::plan::resolve_selector`] can resolve a selector without holding
+    /// the lock across the match.
+    fn queue_texts(&self) -> (Vec<String>, Option<usize>) {
+        let st = self.state.lock().unwrap();
+        let texts = st.queue.iter().map(|it| Self::item_search_text(&it.entry)).collect();
+        (texts, st.current)
+    }
+
+    /// DETERMINISTIC queue-edit executor for the confirmed [`Action::Remove`] /
+    /// [`Action::Move`] / [`Action::Clear`] / [`Action::Play`] plan actions. The
+    /// selector resolves against the LIVE queue here (never pre-baked to indices),
+    /// so a NO-MATCH is a clean no-op - never a wrong-target delete. Returns the
+    /// number of entries affected (0 = clean no-op). Preserves the current-track
+    /// identity across a rebuild by tracking its stable id.
+    pub async fn plan_queue_edit(&self, action: &Action) -> Result<usize, String> {
+        match action {
+            Action::Remove { sel } => {
+                let (texts, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                Ok(self.remove_indices(&idxs).await)
+            }
+            Action::Clear { scope } => match scope {
+                crate::plan::ClearScope::All => {
+                    let n = self.state.lock().unwrap().queue.len();
+                    self.handle(MpdCommand::Clear).await;
+                    Ok(n)
+                }
+                crate::plan::ClearScope::AfterCurrent => {
+                    let idxs: Vec<usize> = {
+                        let st = self.state.lock().unwrap();
+                        match st.current {
+                            Some(c) => ((c + 1)..st.queue.len()).collect(),
+                            // Nothing is playing: there is no "after current", so this
+                            // is a clean no-op rather than a surprise clear-all.
+                            None => Vec::new(),
+                        }
+                    };
+                    Ok(self.remove_indices(&idxs).await)
+                }
+                crate::plan::ClearScope::Range { start, end } => {
+                    let (texts, current) = self.queue_texts();
+                    let idxs = crate::plan::resolve_selector(
+                        &crate::plan::QueueSelector::Range { start: *start, end: *end },
+                        &texts,
+                        current,
+                    );
+                    Ok(self.remove_indices(&idxs).await)
+                }
+            },
+            Action::Move { sel, dest } => {
+                let (texts, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                Ok(self.move_indices(&idxs, *dest).await)
+            }
+            Action::Play { sel } => {
+                let (texts, current) = self.queue_texts();
+                let idxs = crate::plan::resolve_selector(sel, &texts, current);
+                match idxs.first() {
+                    Some(&idx) => {
+                        self.play_index(idx).await?;
+                        Ok(1)
+                    }
+                    None => Ok(0),
+                }
+            }
+            Action::Noop => Ok(0),
+            other => Err(format!("not a queue-edit action: {other:?}")),
+        }
+    }
+
+    /// Remove the 0-based `idxs` from the queue (descending, so the earlier indices
+    /// stay valid), fixing up the current index by the stable id of the current
+    /// track. If the currently-PLAYING entry is removed, playback is stopped (never
+    /// left dangling on a gone track). Returns the count removed.
+    async fn remove_indices(&self, idxs: &[usize]) -> usize {
+        if idxs.is_empty() {
+            return 0;
+        }
+        let mut sorted: Vec<usize> = idxs.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let (removed, current_gone) = {
+            let mut st = self.state.lock().unwrap();
+            let len = st.queue.len();
+            let cur_id = st.current.and_then(|c| st.queue.get(c).map(|it| it.id));
+            let mut removed = 0usize;
+            for &i in sorted.iter().rev() {
+                if i < st.queue.len() && i < len {
+                    st.queue.remove(i);
+                    removed += 1;
+                }
+            }
+            if removed > 0 {
+                st.playlist_version += 1;
+                // Re-anchor current by the tracked id; None if it was removed.
+                st.current = cur_id.and_then(|id| st.queue.iter().position(|it| it.id == id));
+            }
+            (removed, removed > 0 && cur_id.is_some() && st.current.is_none())
+        };
+        if current_gone {
+            // The playing entry itself was removed: stop rather than leave the player
+            // running a track no longer in the queue.
+            let _ = self.player.stop().await;
+        }
+        if removed > 0 {
+            self.notify_change();
+        }
+        removed
+    }
+
+    /// Move the 0-based `idxs` (order preserved) to `dest`, tracking the current
+    /// track's id so playback never jumps to a neighbour. Returns the count moved.
+    async fn move_indices(&self, idxs: &[usize], dest: crate::plan::MoveDest) -> usize {
+        if idxs.is_empty() {
+            return 0;
+        }
+        let mut sorted: Vec<usize> = idxs.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let moved = {
+            let mut st = self.state.lock().unwrap();
+            let len = st.queue.len();
+            if sorted.iter().any(|&i| i >= len) {
+                return 0;
+            }
+            let cur_id = st.current.and_then(|c| st.queue.get(c).map(|it| it.id));
+            // Extract the moving items in order; keep the remainder.
+            let selset: std::collections::HashSet<usize> = sorted.iter().copied().collect();
+            let mut moving: Vec<QueueItem> = Vec::with_capacity(sorted.len());
+            let mut rest: Vec<QueueItem> = Vec::with_capacity(len - sorted.len());
+            for (i, it) in st.queue.drain(..).enumerate() {
+                if selset.contains(&i) {
+                    moving.push(it);
+                } else {
+                    rest.push(it);
+                }
+            }
+            // Compute the insertion point among the REMAINING items.
+            let insert_at = match dest {
+                crate::plan::MoveDest::Position(p) => p.saturating_sub(1).min(rest.len()),
+                crate::plan::MoveDest::Relative(d) => {
+                    // Relative to where the current track sits among the remainder.
+                    let base = cur_id
+                        .and_then(|id| rest.iter().position(|it| it.id == id))
+                        .unwrap_or(0) as i64;
+                    (base + d as i64).clamp(0, rest.len() as i64) as usize
+                }
+            };
+            let moved = moving.len();
+            let mut out = rest;
+            for (k, it) in moving.into_iter().enumerate() {
+                out.insert(insert_at + k, it);
+            }
+            st.queue = out;
+            st.playlist_version += 1;
+            st.current = cur_id.and_then(|id| st.queue.iter().position(|it| it.id == id));
+            moved
+        };
+        if moved > 0 {
+            self.notify_change();
+        }
+        moved
+    }
+
     /// Dispatch a parsed `plan` MPD command to the registry, mapping a
     /// [`PlanError`] 1:1 to a fail-loud ACK. Sync (registry ops never `.await`).
     fn handle_plan(&self, cmd: PlanCmd) -> MpdResponse {
@@ -5155,6 +5340,116 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("s-2")).await;
         let ids = h.queue_song_ids();
         assert_eq!(ids, vec![SongId("s-1".into()), SongId("s-2".into())]);
+    }
+
+    // ── queue-edit executor (Part B): deterministic remove/move/clear over the
+    //    live queue; a no-match is a clean no-op, never a wrong-target delete. ──
+    async fn seed_queue(h: &HypodjHandler, n: usize) {
+        for i in 1..=n {
+            h.enqueue_song_for_test(playlist_test_song(&format!("s-{i}"))).await;
+        }
+    }
+
+    fn ids(h: &HypodjHandler) -> Vec<String> {
+        h.queue_song_ids().into_iter().map(|s| s.0).collect()
+    }
+
+    #[tokio::test]
+    async fn queue_edit_remove_last_and_range_and_query() {
+        use crate::plan::{Action, QueueSelector};
+        // remove last 2 -> the tail is gone, order preserved.
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        let n = h.plan_queue_edit(&Action::Remove { sel: QueueSelector::Last(2) }).await.unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(ids(&h), vec!["s-1", "s-2", "s-3"]);
+
+        // remove a 1-based inclusive range (2..=3 -> s-2, s-3).
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        let n = h
+            .plan_queue_edit(&Action::Remove { sel: QueueSelector::Range { start: 2, end: 3 } })
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(ids(&h), vec!["s-1", "s-4", "s-5"]);
+
+        // remove by query match (title contains "s-4").
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        let n = h
+            .plan_queue_edit(&Action::Remove { sel: QueueSelector::QueryMatch("s-4".into()) })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(ids(&h), vec!["s-1", "s-2", "s-3", "s-5"]);
+    }
+
+    #[tokio::test]
+    async fn queue_edit_no_match_is_clean_noop() {
+        use crate::plan::{Action, QueueSelector};
+        // A query that matches nothing removes NOTHING (never a wrong-target delete).
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        let n = h
+            .plan_queue_edit(&Action::Remove { sel: QueueSelector::QueryMatch("nonesuch".into()) })
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(ids(&h), vec!["s-1", "s-2", "s-3"]);
+        // An out-of-range position is likewise a clean no-op.
+        let n = h
+            .plan_queue_edit(&Action::Remove { sel: QueueSelector::Position(99) })
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(ids(&h), vec!["s-1", "s-2", "s-3"]);
+        // Noop does nothing.
+        assert_eq!(h.plan_queue_edit(&Action::Noop).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn queue_edit_clear_scopes() {
+        use crate::plan::{Action, ClearScope};
+        // clear all -> empty.
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 4).await;
+        h.plan_queue_edit(&Action::Clear { scope: ClearScope::All }).await.unwrap();
+        assert!(ids(&h).is_empty());
+
+        // clear range 2..=3.
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        h.plan_queue_edit(&Action::Clear { scope: ClearScope::Range { start: 2, end: 3 } })
+            .await
+            .unwrap();
+        assert_eq!(ids(&h), vec!["s-1", "s-4", "s-5"]);
+
+        // clear after_current with nothing playing -> clean no-op (no surprise wipe).
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 3).await;
+        let n = h
+            .plan_queue_edit(&Action::Clear { scope: ClearScope::AfterCurrent })
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(ids(&h), vec!["s-1", "s-2", "s-3"]);
+    }
+
+    #[tokio::test]
+    async fn queue_edit_move_last_to_top() {
+        use crate::plan::{Action, MoveDest, QueueSelector};
+        let Some((h, _e)) = handler_with_null_player() else { return };
+        seed_queue(&h, 5).await;
+        let n = h
+            .plan_queue_edit(&Action::Move {
+                sel: QueueSelector::Last(1),
+                dest: MoveDest::Position(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(ids(&h), vec!["s-5", "s-1", "s-2", "s-3", "s-4"]);
     }
 
     #[tokio::test]

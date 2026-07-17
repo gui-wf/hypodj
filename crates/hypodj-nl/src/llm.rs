@@ -15,7 +15,10 @@
 
 use serde::Deserialize;
 
-use hypodj_core::plan::{Action, FadeIntentIr, PosBase, RawPlan, RawTrigger, Selector, TrackSel};
+use hypodj_core::plan::{
+    Action, ClearScope, FadeIntentIr, MoveDest, PosBase, QueueSelector, RawPlan, RawTrigger,
+    Selector, TrackSel,
+};
 
 /// Closed action lexicon. fade_out/fade_in are SEPARATE variants (no nested dir
 /// tag), so To/ToFloor/WakeTo/Wake are unrepresentable. An unknown string fails
@@ -31,6 +34,48 @@ pub enum LlmActionKind {
     Pause,
     SetVolume,
     Enqueue,
+    /// Remove queue entries a selector resolves (destructive; through the gate).
+    Remove,
+    /// Move selected entries to a destination.
+    Move,
+    /// Clear part or all of the queue (destructive; through the gate).
+    Clear,
+    /// Jump playback to the selected track.
+    Play,
+    /// Honest "no action": an off-topic / non-music / non-queue request. Prevents
+    /// fabricating a wrong enqueue for a request that has no valid action.
+    Noop,
+}
+
+/// Closed queue-selector lexicon (FLAT). An unknown string fails serde -> rejected.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlmQSel {
+    Current,
+    Position,
+    Range,
+    Query,
+    Last,
+}
+
+/// Closed move-destination lexicon (FLAT).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlmMoveDest {
+    Position,
+    Relative,
+}
+
+/// Closed clear-scope lexicon (FLAT).
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[cfg_attr(feature = "llm", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum LlmClearScope {
+    All,
+    AfterCurrent,
+    Range,
 }
 
 /// Closed trigger lexicon, FLAT. `Now` is the default (most DJ intents are
@@ -94,8 +139,43 @@ pub struct LlmRawPlan {
     #[serde(default, alias = "queue_slot")]
     pub slot: Option<usize>,
 
+    // -- queue-edit scalars (Remove/Move/Clear/Play). The selector reuses `slot`
+    //    (position), `count` (last-n), `query` (query match); range + dest + scope
+    //    carry their own flat fields. All closed enums, so nothing off-surface. --
+    #[serde(default)]
+    pub sel: Option<LlmQSel>,
+    #[serde(default, alias = "range_from")]
+    pub range_start: Option<usize>,
+    #[serde(default, alias = "range_to")]
+    pub range_end: Option<usize>,
+    #[serde(default)]
+    pub dest: Option<LlmMoveDest>,
+    #[serde(default)]
+    pub dest_slot: Option<usize>,
+    #[serde(default)]
+    pub dest_rel: Option<i32>,
+    #[serde(default)]
+    pub scope: Option<LlmClearScope>,
+
     #[serde(default)]
     pub once: bool,
+}
+
+/// Build a [`QueueSelector`] from the flat selector fields. Closed `sel` lexicon +
+/// presence-checked scalars, so nothing off-surface is constructible.
+fn build_qsel(p: &LlmRawPlan) -> Result<QueueSelector, String> {
+    match p.sel.ok_or("queue action needs a `sel`")? {
+        LlmQSel::Current => Ok(QueueSelector::Current),
+        LlmQSel::Position => Ok(QueueSelector::Position(p.slot.ok_or("sel=position needs slot")?)),
+        LlmQSel::Last => Ok(QueueSelector::Last(p.count.ok_or("sel=last needs count")? as usize)),
+        LlmQSel::Range => Ok(QueueSelector::Range {
+            start: p.range_start.ok_or("sel=range needs range_start")?,
+            end: p.range_end.ok_or("sel=range needs range_end")?,
+        }),
+        LlmQSel::Query => Ok(QueueSelector::QueryMatch(
+            p.query.clone().ok_or("sel=query needs query")?,
+        )),
+    }
 }
 
 /// VALIDATING conversion (fallible: a flat bag needs cross-field checks). Every
@@ -159,6 +239,32 @@ impl TryFrom<LlmRawPlan> for RawPlan {
                     return Err("enqueue needs query, genre, or radio".into());
                 };
                 Action::Enqueue { selector, count: p.count.unwrap_or(1) }
+            }
+            LlmActionKind::Remove => Action::Remove { sel: build_qsel(&p)? },
+            LlmActionKind::Play => Action::Play { sel: build_qsel(&p)? },
+            LlmActionKind::Noop => Action::Noop,
+            LlmActionKind::Clear => {
+                let scope = match p.scope.unwrap_or(LlmClearScope::All) {
+                    LlmClearScope::All => ClearScope::All,
+                    LlmClearScope::AfterCurrent => ClearScope::AfterCurrent,
+                    LlmClearScope::Range => ClearScope::Range {
+                        start: p.range_start.ok_or("scope=range needs range_start")?,
+                        end: p.range_end.ok_or("scope=range needs range_end")?,
+                    },
+                };
+                Action::Clear { scope }
+            }
+            LlmActionKind::Move => {
+                let sel = build_qsel(&p)?;
+                let dest = match p.dest.ok_or("move needs a `dest`")? {
+                    LlmMoveDest::Position => {
+                        MoveDest::Position(p.dest_slot.ok_or("dest=position needs dest_slot")?)
+                    }
+                    LlmMoveDest::Relative => {
+                        MoveDest::Relative(p.dest_rel.ok_or("dest=relative needs dest_rel")?)
+                    }
+                };
+                Action::Move { sel, dest }
             }
         };
 
@@ -352,6 +458,91 @@ mod tests {
         assert!(matches!(p.trigger, RawTrigger::Immediate));
     }
 
+    // The queue-edit actions (remove/move/clear/play) + the noop class round-trip
+    // through the FLAT surface Claude emits, building the intended selector/scope/dest.
+    #[test]
+    fn parse_round_trips_queue_edit_actions() {
+        use hypodj_core::plan::{ClearScope, MoveDest, QueueSelector};
+
+        // remove last 3.
+        let p = parse_llm_output(r#"{"type":"remove","sel":"last","count":3}"#).unwrap();
+        assert!(matches!(
+            p.action,
+            Action::Remove { sel: QueueSelector::Last(3) }
+        ));
+        // remove current.
+        let p = parse_llm_output(r#"{"type":"remove","sel":"current"}"#).unwrap();
+        assert!(matches!(p.action, Action::Remove { sel: QueueSelector::Current }));
+        // remove by query.
+        let p = parse_llm_output(r#"{"type":"remove","sel":"query","query":"so what"}"#).unwrap();
+        match p.action {
+            Action::Remove { sel: QueueSelector::QueryMatch(q) } => assert_eq!(q, "so what"),
+            other => panic!("got {other:?}"),
+        }
+        // remove a range.
+        let p = parse_llm_output(
+            r#"{"type":"remove","sel":"range","range_start":2,"range_end":5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            p.action,
+            Action::Remove { sel: QueueSelector::Range { start: 2, end: 5 } }
+        ));
+        // clear after_current / all / range.
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"clear","scope":"after_current"}"#).unwrap().action,
+            Action::Clear { scope: ClearScope::AfterCurrent }
+        ));
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"clear","scope":"all"}"#).unwrap().action,
+            Action::Clear { scope: ClearScope::All }
+        ));
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"clear"}"#).unwrap().action,
+            Action::Clear { scope: ClearScope::All }
+        ));
+        // move last->top and a relative move.
+        assert!(matches!(
+            parse_llm_output(
+                r#"{"type":"move","sel":"last","count":1,"dest":"position","dest_slot":1}"#
+            )
+            .unwrap()
+            .action,
+            Action::Move { sel: QueueSelector::Last(1), dest: MoveDest::Position(1) }
+        ));
+        assert!(matches!(
+            parse_llm_output(
+                r#"{"type":"move","sel":"position","slot":4,"dest":"relative","dest_rel":-2}"#
+            )
+            .unwrap()
+            .action,
+            Action::Move { sel: QueueSelector::Position(4), dest: MoveDest::Relative(-2) }
+        ));
+        // play by query / position.
+        match parse_llm_output(r#"{"type":"play","sel":"query","query":"blue"}"#).unwrap().action {
+            Action::Play { sel: QueueSelector::QueryMatch(q) } => assert_eq!(q, "blue"),
+            other => panic!("got {other:?}"),
+        }
+        assert!(matches!(
+            parse_llm_output(r#"{"type":"play","sel":"position","slot":6}"#).unwrap().action,
+            Action::Play { sel: QueueSelector::Position(6) }
+        ));
+        // noop: honest no-action for an off-topic ask (never a fabricated enqueue).
+        assert!(matches!(parse_llm_output(r#"{"type":"noop"}"#).unwrap().action, Action::Noop));
+    }
+
+    // A queue-edit action with a MISSING required scalar fails loud (no fabricated
+    // wrong-target op): a remove with a `sel` but no supporting field is rejected.
+    #[test]
+    fn parse_rejects_incomplete_queue_edits() {
+        assert!(parse_llm_output(r#"{"type":"remove"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"remove","sel":"last"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"remove","sel":"query"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"move","sel":"current"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"move","sel":"current","dest":"relative"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"play"}"#).is_err());
+    }
+
     // An OFF-surface intent must be REJECTED even if a backend ignores the schema.
     // The closed `type`/`when` enums + presence-only selector inference make every
     // off-surface effect UNREPRESENTABLE, so serde/TryFrom fails loud instead of
@@ -377,5 +568,9 @@ mod tests {
         assert!(parse_llm_output(r#"{"type":"enqueue","id":"song-42"}"#).is_err());
         // A missing discriminator is rejected (no default for the action kind).
         assert!(parse_llm_output(r#"{"when":"now"}"#).is_err());
+        // An unknown queue-selector / clear-scope tag is off the closed lexicon.
+        assert!(parse_llm_output(r#"{"type":"remove","sel":"everything"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"clear","scope":"nuke"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"move","sel":"current","dest":"warp"}"#).is_err());
     }
 }

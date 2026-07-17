@@ -78,14 +78,25 @@ pub fn cc_available() -> bool {
 pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music player. \
     Translate the DJ request into EXACTLY ONE JSON plan object matching the provided \
     JSON schema, and output nothing else (no prose, no code fence). The object is FLAT: \
-    a required \"type\" (one of fade_out, fade_in, stop, pause, set_volume, enqueue), an \
+    a required \"type\" (one of fade_out, fade_in, stop, pause, set_volume, enqueue, \
+    remove, move, clear, play, noop), an \
     optional \"when\" (one of now, after_current, after_secs, album_boundary, \
     queue_position, time_remaining; omit it for an immediate action), and only the flat \
     scalars the action needs: \"secs\" for a fade, \"level\" for set_volume, \
     \"query\"/\"genre\"/\"radio\" plus \"count\" for enqueue, \"when_secs\" for \
     after_secs/time_remaining, \"slot\" for queue_position. Do NOT nest a trigger or a \
-    selector object. If the request cannot be expressed, emit your closest valid single \
-    plan.\n\
+    selector object.\n\
+    Queue-edit actions (remove, move, clear, play) target entries with a FLAT \
+    selector: \"sel\" is one of current, position, range, query, last. sel=position uses \
+    \"slot\" (1-based); sel=last uses \"count\"; sel=range uses \"range_start\"+\"range_end\" \
+    (1-based inclusive); sel=query uses \"query\" (a title/artist substring). For move add \
+    \"dest\" (position -> \"dest_slot\", relative -> \"dest_rel\"). For clear add \"scope\" \
+    (all, after_current, or range with range_start/range_end). play jumps to the first \
+    match. NOTE: favoriting/starring and the bare transport verbs (clear, next, prev, \
+    pause, play with no target) are handled BEFORE you and never reach you. If the \
+    request is NOT about music, the queue, or playback (e.g. trivia, chit-chat, an \
+    off-topic question), emit {\"type\":\"noop\"} - do NOT fabricate an enqueue. Otherwise \
+    emit your closest valid single plan.\n\
     Rules:\n\
     - enqueue selector: a music GENRE (jazz, ambient, bossa nova, techno...) -> \"genre\"; \
     a mood/descriptive phrase (calmer, upbeat, calmer tracks) -> \"query\"; \"radio\"/\"station\" \
@@ -111,7 +122,18 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     Request: queue a jazz track after 3 songs -> {\"type\":\"enqueue\",\"genre\":\"jazz\",\"count\":1,\"when\":\"queue_position\",\"slot\":3}\n\
     Request: fade out the current track over 30 seconds -> {\"type\":\"fade_out\",\"secs\":30}\n\
     Request: fade out 2 minutes before the track ends -> {\"type\":\"fade_out\",\"when\":\"time_remaining\",\"when_secs\":120}\n\
-    Request: stop after this album -> {\"type\":\"stop\",\"when\":\"album_boundary\"}";
+    Request: stop after this album -> {\"type\":\"stop\",\"when\":\"album_boundary\"}\n\
+    Request: remove the last 3 tracks -> {\"type\":\"remove\",\"sel\":\"last\",\"count\":3}\n\
+    Request: remove the current song -> {\"type\":\"remove\",\"sel\":\"current\"}\n\
+    Request: remove the song called blue in green -> {\"type\":\"remove\",\"sel\":\"query\",\"query\":\"blue in green\"}\n\
+    Request: delete tracks 2 to 5 -> {\"type\":\"remove\",\"sel\":\"range\",\"range_start\":2,\"range_end\":5}\n\
+    Request: clear everything after the current track -> {\"type\":\"clear\",\"scope\":\"after_current\"}\n\
+    Request: clear the whole queue -> {\"type\":\"clear\",\"scope\":\"all\"}\n\
+    Request: move the last track to the top -> {\"type\":\"move\",\"sel\":\"last\",\"count\":1,\"dest\":\"position\",\"dest_slot\":1}\n\
+    Request: move track 4 up two spots -> {\"type\":\"move\",\"sel\":\"position\",\"slot\":4,\"dest\":\"relative\",\"dest_rel\":-2}\n\
+    Request: play the track called so what -> {\"type\":\"play\",\"sel\":\"query\",\"query\":\"so what\"}\n\
+    Request: jump to track 6 -> {\"type\":\"play\",\"sel\":\"position\",\"slot\":6}\n\
+    Request: what is the airspeed of an unladen swallow -> {\"type\":\"noop\"}";
 
 /// Build the per-request user prompt: only the small live context the client already
 /// has (queue length, is-playing) plus the utterance, mirroring the local-model prompt
@@ -378,5 +400,38 @@ mod tests {
     fn render_dsl_ok(raw: &RawPlan) -> bool {
         // Any validated plan is fine; just prove it is not an off-surface effect.
         !matches!(raw.action, Action::Wake { .. })
+    }
+
+    // LIVE: a real `claude` call must translate a queue-edit ask into the intended
+    // validated queue action (Part B), and an off-topic ask into a clean Noop (never
+    // a fabricated enqueue). #[ignore] + availability-gated: NEVER runs in doCheck.
+    // Run: `cargo test -p hypodj-nl --features cc -- --ignored live_claude_translates_queue`.
+    #[test]
+    #[ignore]
+    fn live_claude_translates_queue_edits_and_noop() {
+        use hypodj_core::plan::Action as A;
+        if !cc_available() {
+            eprintln!("skipping: claude CLI not available");
+            return;
+        }
+        // remove the last 3 tracks -> Action::Remove.
+        match run_claude("remove the last 3 tracks", 8, true) {
+            Ok(raw) => assert!(matches!(raw.action, A::Remove { .. }), "got {:?}", raw.action),
+            Err(e) => eprintln!("live remove call did not produce a plan (acceptable): {e}"),
+        }
+        // clear everything after the current track -> Action::Clear.
+        match run_claude("clear everything after the current track", 8, true) {
+            Ok(raw) => assert!(matches!(raw.action, A::Clear { .. }), "got {:?}", raw.action),
+            Err(e) => eprintln!("live clear call did not produce a plan (acceptable): {e}"),
+        }
+        // An off-topic ask -> Noop, NEVER a fabricated Enqueue.
+        match run_claude("what is the airspeed of an unladen swallow", 8, true) {
+            Ok(raw) => assert!(
+                !matches!(raw.action, A::Enqueue { .. }),
+                "off-topic ask must not fabricate an enqueue, got {:?}",
+                raw.action
+            ),
+            Err(e) => eprintln!("live noop call did not produce a plan (acceptable): {e}"),
+        }
     }
 }

@@ -134,6 +134,110 @@ pub enum Action {
     /// saved comfort level. ONE atomic effect (enqueue -> silence -> play ->
     /// WakeTo), so the ordering cannot be split across independent timers.
     Wake { selector: Option<Selector>, count: u32 },
+    /// Remove the entries a [`QueueSelector`] resolves against the LIVE queue. The
+    /// selector resolves at EXECUTE time (like [`Action::Enqueue`]'s content
+    /// selector), never pre-baked to indices, so a NO-MATCH is a clean no-op -
+    /// never a wrong-target delete. Destructive: only reachable through the
+    /// echo-before-arm + owner y/N gate.
+    Remove { sel: QueueSelector },
+    /// Move the selected entries to a destination position (order preserved). A
+    /// no-match is a clean no-op. The currently-playing entry is tracked by stable
+    /// id across the rebuild, so playback never jumps to a neighbour.
+    Move { sel: QueueSelector, dest: MoveDest },
+    /// Clear part or all of the queue. Destructive: only through the confirm gate.
+    Clear { scope: ClearScope },
+    /// Jump playback to the FIRST entry the selector resolves. A no-match is a
+    /// clean no-op (playback is left exactly where it was).
+    Play { sel: QueueSelector },
+    /// No operation: an off-topic / non-music / non-queue / non-playback request
+    /// that maps to NO valid action. Emitting this (honest "no action") is how the
+    /// model avoids fabricating a wrong enqueue for a request it cannot express.
+    Noop,
+}
+
+/// Which queue entries a queue-edit action targets. Resolved DETERMINISTICALLY
+/// against the LIVE queue at EXECUTE time by [`resolve_selector`]. Positions are
+/// 1-based (matching the queue the user sees). A no-match resolves to the empty
+/// set - the caller treats that as a clean no-op, never a wrong-target edit.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "qsel", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum QueueSelector {
+    /// The 1-based queue position `n`.
+    Position(usize),
+    /// A 1-based inclusive position range `[start, end]`.
+    Range { start: usize, end: usize },
+    /// Every entry whose title/artist/album contains this (case-insensitive) query.
+    QueryMatch(String),
+    /// The currently-playing track.
+    Current,
+    /// The last `n` entries in the queue.
+    Last(usize),
+}
+
+/// Where an [`Action::Move`] places the selected entries.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "movedest", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MoveDest {
+    /// To the 1-based absolute position among the remaining entries.
+    Position(usize),
+    /// Relative to the current track's position (may be negative: -1 = just before).
+    Relative(i32),
+}
+
+/// How much an [`Action::Clear`] removes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "clearscope", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ClearScope {
+    /// The whole queue.
+    All,
+    /// Everything AFTER the current track (keep the current track and its history).
+    AfterCurrent,
+    /// A 1-based inclusive position range.
+    Range { start: usize, end: usize },
+}
+
+/// PURE. Resolve a [`QueueSelector`] to a sorted set of 0-based queue indices
+/// against a queue described by its per-entry searchable text and current index.
+/// A no-match returns an EMPTY vec (the caller treats that as a clean no-op).
+/// Unit-testable with fabricated text - no queue, no player.
+pub fn resolve_selector(sel: &QueueSelector, texts: &[String], current: Option<usize>) -> Vec<usize> {
+    let n = texts.len();
+    let idx1 = |p: usize| -> Option<usize> {
+        if p >= 1 && p <= n { Some(p - 1) } else { None }
+    };
+    match sel {
+        QueueSelector::Position(p) => idx1(*p).into_iter().collect(),
+        QueueSelector::Range { start, end } => {
+            let (a, b) = if start <= end { (*start, *end) } else { (*end, *start) };
+            (a..=b).filter_map(idx1).collect()
+        }
+        QueueSelector::QueryMatch(q) => {
+            let ql = q.trim().to_lowercase();
+            if ql.is_empty() {
+                return Vec::new();
+            }
+            texts
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.to_lowercase().contains(&ql))
+                .map(|(i, _)| i)
+                .collect()
+        }
+        QueueSelector::Current => current.filter(|c| *c < n).into_iter().collect(),
+        QueueSelector::Last(k) => {
+            if *k == 0 || n == 0 {
+                return Vec::new();
+            }
+            let k = (*k).min(n);
+            (n - k..n).collect()
+        }
+    }
 }
 
 /// A local serde mirror of [`crate::handler::FadeIntent`], plus the duration the
@@ -325,6 +429,14 @@ pub fn clamp_action(action: &Action, bounds: &PlanBounds) -> Action {
         },
         Action::Stop => Action::Stop,
         Action::Pause => Action::Pause,
+        // Queue-edit actions carry only a selector/scope/dest that resolves SAFELY
+        // at execute time (a huge/absent position simply no-matches), so there is no
+        // unbounded numeric to coerce here; pass them through unchanged.
+        Action::Remove { .. }
+        | Action::Move { .. }
+        | Action::Clear { .. }
+        | Action::Play { .. }
+        | Action::Noop => action.clone(),
     }
 }
 
@@ -974,5 +1086,63 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, PlanError::OutOfBounds { .. }), "got {e:?}");
+    }
+
+    // resolve_selector: every selector variant resolves to the intended 0-based
+    // index set, and a no-match (bad position, empty/absent query, empty queue)
+    // is a clean EMPTY set - the caller's clean no-op, never a wrong-target edit.
+    #[test]
+    fn resolve_selector_variants_and_no_match() {
+        let texts: Vec<String> = vec![
+            "Miles Davis - So What".into(),
+            "Bill Evans - Peace Piece".into(),
+            "Miles Davis - Blue in Green".into(),
+            "Aphex Twin - Rhubarb".into(),
+        ];
+        let cur = Some(1usize);
+
+        // Position (1-based) -> single index; out-of-range -> empty.
+        assert_eq!(resolve_selector(&QueueSelector::Position(1), &texts, cur), vec![0]);
+        assert_eq!(resolve_selector(&QueueSelector::Position(4), &texts, cur), vec![3]);
+        assert!(resolve_selector(&QueueSelector::Position(9), &texts, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(0), &texts, cur).is_empty());
+
+        // Range inclusive, order-normalized, clamped to the queue.
+        assert_eq!(
+            resolve_selector(&QueueSelector::Range { start: 2, end: 3 }, &texts, cur),
+            vec![1, 2]
+        );
+        assert_eq!(
+            resolve_selector(&QueueSelector::Range { start: 3, end: 2 }, &texts, cur),
+            vec![1, 2]
+        );
+        assert_eq!(
+            resolve_selector(&QueueSelector::Range { start: 3, end: 99 }, &texts, cur),
+            vec![2, 3]
+        );
+
+        // QueryMatch: case-insensitive substring across all matching entries.
+        assert_eq!(
+            resolve_selector(&QueueSelector::QueryMatch("miles".into()), &texts, cur),
+            vec![0, 2]
+        );
+        assert_eq!(
+            resolve_selector(&QueueSelector::QueryMatch("rhubarb".into()), &texts, cur),
+            vec![3]
+        );
+        // No match / blank query -> clean empty set (the no-op).
+        assert!(resolve_selector(&QueueSelector::QueryMatch("nonesuch".into()), &texts, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::QueryMatch("   ".into()), &texts, cur).is_empty());
+
+        // Current -> the cursor index; guarded against a stale out-of-range cursor.
+        assert_eq!(resolve_selector(&QueueSelector::Current, &texts, cur), vec![1]);
+        assert!(resolve_selector(&QueueSelector::Current, &texts, None).is_empty());
+        assert!(resolve_selector(&QueueSelector::Current, &texts, Some(99)).is_empty());
+
+        // Last(n) -> the tail; clamped to the queue length; 0 / empty -> empty.
+        assert_eq!(resolve_selector(&QueueSelector::Last(2), &texts, cur), vec![2, 3]);
+        assert_eq!(resolve_selector(&QueueSelector::Last(99), &texts, cur), vec![0, 1, 2, 3]);
+        assert!(resolve_selector(&QueueSelector::Last(0), &texts, cur).is_empty());
+        assert!(resolve_selector(&QueueSelector::Position(1), &[], None).is_empty());
     }
 }
