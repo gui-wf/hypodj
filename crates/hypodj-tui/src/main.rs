@@ -114,11 +114,19 @@ fn event_loop(
     let mut last_frame = Instant::now();
     loop {
         let frame_now = Instant::now();
+        let dt = frame_now.duration_since(last_frame).as_secs_f64();
         if state.now.state.as_deref() == Some("play") {
-            anim_accum += frame_now.duration_since(last_frame).as_secs_f64();
+            anim_accum += dt;
         }
         last_frame = frame_now;
         state.anim_secs = anim_accum;
+
+        // Sample the latest-wins viz slot and run the ballistics envelope at the
+        // render dt. When the viz socket is live we draw the REAL post-gain level
+        // field; when it is absent (old daemon / refused / no frame yet) we clear
+        // viz_active and the renderer falls back to the decorative wave. The slot
+        // lock is held only for the brief read, never across IO or the draw.
+        update_viz(state, workers, dt);
 
         terminal
             .draw(|f| ui::render(f, state))
@@ -187,6 +195,48 @@ fn event_loop(
         }
     }
     Ok(())
+}
+
+/// Fold the latest viz level into the render state, running the asymmetric
+/// attack/release envelope at the frame `dt`. Connect-or-fallback: if the viz socket
+/// is not connected (old daemon / refused) `viz_active` is cleared and the renderer
+/// uses the decorative wave. The envelope integrates over frames (persisted in
+/// `state.viz_env`) so ~20 fps network frames render as a smooth field and a fade
+/// settles on the release tau.
+fn update_viz(state: &mut TuiState, workers: &Workers, dt: f64) {
+    use std::sync::atomic::Ordering;
+    if !workers.viz_connected.load(Ordering::Relaxed) {
+        // No live socket: decay the envelope toward rest so a re-connect eases in,
+        // and hand the renderer the fallback wave.
+        state.viz_active = false;
+        state.viz_env = state::envelope_step(state.viz_env, 0.0, dt as f32);
+        return;
+    }
+    // Read the newest sample (lock only for the copy; never across the draw).
+    let sample = workers.viz_slot.lock().ok().and_then(|g| *g);
+    match sample {
+        Some(s) => {
+            // The TUI already knows the MPD transport state; treat anything other than
+            // "play" as not-playing. This is a belt against a daemon that stops
+            // emitting frames on pause/stop without a trailing resting frame (older
+            // builds): without it the stale playing=true slot freezes the field lit.
+            let transport_playing =
+                state.now.state.as_deref().map(|st| st == "play").unwrap_or(true);
+            let playing = s.playing && transport_playing;
+            let target = state::normalize_level(s.post_gain_db());
+            // Only drive up toward the target while playing; a paused/stopped daemon
+            // frame (or a non-play transport) targets rest so the field settles to the
+            // hairline.
+            let target = if playing { target } else { 0.0 };
+            state.viz_env = state::envelope_step(state.viz_env, target, dt as f32);
+            state.viz_playing = playing;
+            state.viz_active = true;
+        }
+        // Connected but no frame yet: keep the fallback until the first level lands.
+        None => {
+            state.viz_active = false;
+        }
+    }
 }
 
 /// Convert a frame's coalesced intents into worker Reqs. Command intents are sent as

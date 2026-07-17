@@ -8,3 +8,4 @@ pub mod model;
 pub mod mpd;
 pub mod nl;
 pub mod route;
+pub mod viz;

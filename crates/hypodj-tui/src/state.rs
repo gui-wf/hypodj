@@ -459,6 +459,41 @@ pub struct TuiState {
     /// The current CC phase line (e.g. "thinking..."), shown next to a spinner while
     /// a call is in flight; `None` when idle.
     pub dj_phase: Option<String>,
+    /// Whether the REAL post-gain level wave is live this frame (the viz socket is
+    /// connected and a frame has landed). `false` => the render draws the decorative
+    /// fallback wave. Set by the render loop from the viz worker's slot.
+    pub viz_active: bool,
+    /// The smoothed normalized level A in `[0, 1]` (the ballistics envelope output),
+    /// persisted across frames so the one-pole attack/release integrates over time.
+    pub viz_env: f32,
+    /// Whether the daemon reports audio is playing (from the latest viz frame); gates
+    /// the level wave between the live field and the resting hairline.
+    pub viz_playing: bool,
+}
+
+/// Perceptual floor / ceiling (dBFS) for the level normalize. Below the floor is
+/// the resting hairline; the loudest music tops out at the ceiling.
+pub const VIZ_FLOOR_DB: f32 = -54.0;
+pub const VIZ_CEIL_DB: f32 = -6.0;
+
+/// Normalize an audible post-gain level (dBFS) into `[0, 1]` in the perceptual dB
+/// domain, with a gentle gamma expand of the quiet range so verses do not flatline.
+/// Pure and testable.
+pub fn normalize_level(post_gain_db: f32) -> f32 {
+    let a = ((post_gain_db - VIZ_FLOOR_DB) / (VIZ_CEIL_DB - VIZ_FLOOR_DB)).clamp(0.0, 1.0);
+    a.powf(0.8)
+}
+
+/// One asymmetric one-pole envelope step on the normalized level, computed at
+/// render `dt` (seconds): quick attack (~60 ms) so a swell feels causal, slow
+/// release (~350 ms) so it falls like a needle with gravity and never snaps. A fade
+/// (falling target) rides the release tau, so the field settles with the audible
+/// sound. Pure and testable (deterministic in `dt`, no wall clock).
+pub fn envelope_step(prev: f32, target: f32, dt: f32) -> f32 {
+    let tau = if target >= prev { 0.060 } else { 0.350 };
+    // alpha = 1 - exp(-dt/tau); guard a zero/negative dt.
+    let alpha = if dt <= 0.0 { 0.0 } else { 1.0 - (-dt / tau).exp() };
+    prev + (target - prev) * alpha.clamp(0.0, 1.0)
 }
 
 impl Default for TuiState {
@@ -488,6 +523,9 @@ impl Default for TuiState {
             dj_input: String::new(),
             dj_log: Vec::new(),
             dj_phase: None,
+            viz_active: false,
+            viz_env: 0.0,
+            viz_playing: false,
         }
     }
 }
@@ -1869,6 +1907,38 @@ mod tests {
         assert_eq!(s.dj_log.len(), 200);
         assert_eq!(s.dj_log.last().unwrap(), "line 249");
         assert_eq!(s.dj_log.first().unwrap(), "line 50");
+    }
+
+    #[test]
+    fn normalize_level_maps_floor_ceiling_and_gamma() {
+        // At/below the floor -> 0; at/above the ceiling -> 1.
+        assert_eq!(normalize_level(-54.0), 0.0);
+        assert_eq!(normalize_level(-90.0), 0.0);
+        assert!((normalize_level(-6.0) - 1.0).abs() < 1e-6);
+        assert!((normalize_level(0.0) - 1.0).abs() < 1e-6);
+        // Midpoint sits above the linear 0.5 because of the <1 gamma (quiet expand).
+        let mid = normalize_level(-30.0);
+        assert!(mid > 0.5 && mid < 1.0, "gamma lifts the mid: {mid}");
+        // Monotone increasing.
+        assert!(normalize_level(-40.0) < normalize_level(-20.0));
+    }
+
+    #[test]
+    fn envelope_attack_faster_than_release() {
+        // From rest, a step UP rises quickly; a step DOWN of the same size falls
+        // slower - the asymmetric ballistics (attack 60ms vs release 350ms).
+        let dt = 0.05; // one ~20fps frame
+        let up = envelope_step(0.0, 1.0, dt);
+        let down = 1.0 - envelope_step(1.0, 0.0, dt);
+        assert!(up > down, "attack ({up}) outpaces release ({down})");
+        // A zero dt makes no move; the envelope converges toward the target over
+        // repeated steps and never overshoots.
+        assert_eq!(envelope_step(0.3, 0.9, 0.0), 0.3);
+        let mut a = 0.0f32;
+        for _ in 0..200 {
+            a = envelope_step(a, 1.0, dt);
+        }
+        assert!(a > 0.99 && a <= 1.0, "converges to the target without overshoot: {a}");
     }
 
     #[test]

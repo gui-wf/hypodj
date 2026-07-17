@@ -46,6 +46,7 @@ use crate::player::{PlayState, PlayerEvent};
 use crate::scrobble::Scrobbler;
 use crate::subsonic::SubsonicClient;
 use crate::timer::{spawn_timer_source, TimerHandle};
+use crate::viz::{VizFrame, VIZ_BROADCAST_CAP};
 
 /// Capacity of the lossy observation broadcast. Sized so a briefly-stalled
 /// observer of high-rate `Tick`s recovers via the watch snapshot rather than
@@ -75,6 +76,11 @@ pub struct DjRuntime {
     pub timers: TimerHandle,
     /// The handler, so P2 can call `queue_snapshot()` on resync.
     pub handler: Arc<HypodjHandler>,
+    /// The DEDICATED cosmetic-viz broadcast (post-gain audio levels, ~20 fps). Kept
+    /// OFF the shared `events` broadcast so its high-rate churn never raises `Lagged`
+    /// for the lossy observers. The daemon's viz socket (`viz::serve_viz`) subscribes
+    /// a fresh receiver per connection; nothing on the lossless edge path touches it.
+    pub viz: broadcast::Sender<VizFrame>,
     triggers: Triggers,
     join: JoinHandle<()>,
 }
@@ -103,6 +109,9 @@ impl DjRuntime {
 struct Publisher<C: Clock> {
     clock: C,
     bcast: broadcast::Sender<DjEvent>,
+    /// The dedicated viz broadcast (see [`DjRuntime::viz`]). Republished onto from
+    /// the `PlayerEvent::Viz` spine arm; isolated from `bcast`.
+    viz: broadcast::Sender<VizFrame>,
     watch: watch::Sender<QueueSnapshot>,
     triggers: Triggers,
     handler: Arc<HypodjHandler>,
@@ -308,6 +317,10 @@ pub fn run<C: Clock>(
     player_events: mpsc::Receiver<PlayerEvent>,
 ) -> DjRuntime {
     let (bcast_tx, _bcast_rx0) = broadcast::channel::<DjEvent>(BROADCAST_CAP);
+    // The dedicated viz broadcast: fresh per-connection receivers subscribe off the
+    // returned `DjRuntime::viz`; no long-lived receiver is held here (a dropped
+    // sender-only channel is fine - `send` just returns Err(no subscribers), ignored).
+    let (viz_tx, _viz_rx0) = broadcast::channel::<VizFrame>(VIZ_BROADCAST_CAP);
     // Seed the watch with the current (at startup, empty) well-formed snapshot.
     let (watch_tx, watch_rx) = watch::channel(handler.queue_snapshot());
     // Register the watch with the handler so OFF-spine queue mutations
@@ -324,6 +337,7 @@ pub fn run<C: Clock>(
     let publisher = Publisher {
         clock: clock.clone(),
         bcast: bcast_tx.clone(),
+        viz: viz_tx.clone(),
         watch: watch_tx,
         triggers: triggers.clone(),
         handler: handler.clone(),
@@ -349,6 +363,7 @@ pub fn run<C: Clock>(
         snapshot: watch_rx,
         timers,
         handler,
+        viz: viz_tx,
         triggers,
         join,
     }
@@ -454,6 +469,13 @@ async fn spine<C: Clock>(
                     }
                     PlayerEvent::StateChanged(PlayState::Stopped, _, _) => {
                         pubr.on_stopped();
+                    }
+                    PlayerEvent::Viz { rms_db, peak_db, gain_db, playing } => {
+                        // Cosmetic level sample: republish on the DEDICATED viz
+                        // broadcast ONLY (never the shared `bcast`, never the lossless
+                        // edge path). `send` returns Err when no viz client is
+                        // connected - ignored (latest-wins, drop-on-no-subscriber).
+                        let _ = pubr.viz.send(VizFrame { rms_db, peak_db, gain_db, playing });
                     }
                     PlayerEvent::StateChanged(PlayState::Paused, song, qid) => {
                         // Paused carries its SongId + queue_id on the player event;
