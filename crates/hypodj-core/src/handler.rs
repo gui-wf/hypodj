@@ -4197,8 +4197,56 @@ impl MpdHandler for HypodjHandler {
                     None => ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index"),
                 }
             }
-            MpdCommand::PlaylistDelete(..) => MpdResponse::ok(),
-            MpdCommand::PlaylistClear(_) => MpdResponse::ok(),
+            MpdCommand::PlaylistDelete(name, pos) => {
+                // A real Navidrome playlist: remove the song at `pos` via
+                // updatePlaylist(songIndexToRemove). Per MPD semantics an unknown
+                // name / out-of-range index is a LOUD ack, never a silent no-op.
+                // Removing the last remaining song deletes the whole playlist
+                // (deletePlaylist) so an empty stored playlist is not left behind.
+                match self.playlist_by_name(&name).await {
+                    Ok(Some(pl)) => {
+                        if pos >= pl.songs.len() {
+                            return ack(ACK_ERROR_NO_EXIST, "playlistdelete", "Bad song index");
+                        }
+                        let result = if pl.songs.len() == 1 {
+                            self.client.delete_playlist(&pl.id).await
+                        } else {
+                            self.client.remove_from_playlist(&pl.id, pos as u32).await
+                        };
+                        match result {
+                            Ok(()) => {
+                                self.notify_change();
+                                MpdResponse::ok()
+                            }
+                            Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
+                        }
+                    }
+                    Ok(None) => ack(ACK_ERROR_NO_EXIST, "playlistdelete", "No such playlist"),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistdelete", &e.to_string()),
+                }
+            }
+            MpdCommand::PlaylistClear(name) if name == "Starred" => {
+                // Starred is the synthetic star-trigger pseudo-playlist, not a real
+                // stored playlist; `playlistclear Starred` must NOT fan out into
+                // mass-unstarring. Keep it a well-formed no-op ok (Starred special).
+                MpdResponse::ok()
+            }
+            MpdCommand::PlaylistClear(name) => {
+                // Clear a real Navidrome playlist by removing it (deletePlaylist).
+                // Unknown name is a LOUD ack; a failed delete surfaces a proper ACK
+                // error rather than a silent success.
+                match self.playlist_by_name(&name).await {
+                    Ok(Some(pl)) => match self.client.delete_playlist(&pl.id).await {
+                        Ok(()) => {
+                            self.notify_change();
+                            MpdResponse::ok()
+                        }
+                        Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e.to_string()),
+                    },
+                    Ok(None) => ack(ACK_ERROR_NO_EXIST, "playlistclear", "No such playlist"),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistclear", &e.to_string()),
+                }
+            }
 
             // ── db browse ──────────────────────────────────────────────────
             MpdCommand::LsInfo(path) => self.lsinfo(path.as_deref()).await,
@@ -5633,6 +5681,62 @@ mod tests {
                 assert_eq!(code, ACK_ERROR_NO_EXIST);
             }
             other => panic!("expected ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn playlistclear_starred_stays_special_noop_ok() {
+        // `playlistclear Starred` must NOT touch the real-playlist delete path
+        // (which would try to deletePlaylist a non-existent "Starred") and must
+        // never fan out into mass-unstarring. It stays a well-formed no-op ok.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h.handle(MpdCommand::PlaylistClear("Starred".into())).await;
+        assert!(
+            matches!(resp, MpdResponse::Pairs(ref p) if p.is_empty()),
+            "playlistclear Starred must be a well-formed ok, got {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn playlistdelete_starred_bad_index_acks_and_stays_special() {
+        // `playlistdelete Starred <pos>` routes through the star order, NOT the
+        // real-playlist path. With no recorded order, pos 0 is a bad index -> a
+        // LOUD ack, proving Starred is still handled specially (no network).
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h.handle(MpdCommand::PlaylistDelete("Starred".into(), 0)).await;
+        match resp {
+            MpdResponse::Ack { command, code, .. } => {
+                assert_eq!(command, "playlistdelete");
+                assert_eq!(code, ACK_ERROR_NO_EXIST);
+            }
+            other => panic!("expected ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn playlistdelete_real_playlist_is_wired_not_silent() {
+        // A non-Starred `playlistdelete <name> <pos>` is no longer a silent no-op:
+        // it reaches Subsonic (get_playlists). With the backend unreachable it must
+        // surface a LOUD ACK, never a silent ok that pretends the delete happened.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h
+            .handle(MpdCommand::PlaylistDelete("Warm Room".into(), 0))
+            .await;
+        match resp {
+            MpdResponse::Ack { command, .. } => assert_eq!(command, "playlistdelete"),
+            other => panic!("expected ACK (wired to Subsonic), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn playlistclear_real_playlist_is_wired_not_silent() {
+        // Same for `playlistclear <name>`: it reaches Subsonic and, with the
+        // backend unreachable, surfaces a LOUD ACK rather than the old silent ok.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h.handle(MpdCommand::PlaylistClear("Warm Room".into())).await;
+        match resp {
+            MpdResponse::Ack { command, .. } => assert_eq!(command, "playlistclear"),
+            other => panic!("expected ACK (wired to Subsonic), got {other:?}"),
         }
     }
 

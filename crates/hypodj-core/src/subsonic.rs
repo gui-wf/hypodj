@@ -556,6 +556,22 @@ impl SubsonicClient {
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
 
+    /// Remove the song at a zero-based position from an EXISTING playlist
+    /// (Subsonic `updatePlaylist` with `songIndexToRemove`). Backs a non-`Starred`
+    /// `playlistdelete <name> <pos>`: no add, no rename - it only ever shrinks the
+    /// playlist by one entry. Any Subsonic error surfaces to the caller so it can
+    /// become a proper ACK rather than a silent no-op.
+    pub async fn remove_from_playlist(
+        &self,
+        id: &PlaylistId,
+        index: u32,
+    ) -> Result<(), SubsonicError> {
+        self.inner
+            .update_playlist(&id.0, None, None, None, &[], &[index as i32])
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
     /// All of the user's stored playlists (Subsonic `getPlaylists`). Songs are
     /// NOT included (`song_count` carries the count); use [`get_playlist`](Self::get_playlist)
     /// for the tracks. NEVER cached here - the handler owns any caching.
@@ -1232,5 +1248,61 @@ mod tests {
             !after.iter().any(|p| p.id == pid),
             "deleted playlist must be gone"
         );
+    }
+
+    // ── LIVE playlist position-delete + whole-clear (Part 1 proof) ─────────
+    //
+    // Proves the two paths a non-`Starred` `playlistdelete`/`playlistclear` drive:
+    // remove a song at a position via updatePlaylist(songIndexToRemove), then
+    // remove the whole playlist via deletePlaylist. `#[ignore]` (certless/no
+    // network in the sandbox); run with `cargo test -p hypodj-core -- --ignored
+    // live_playlist_position_delete_and_clear`. Never prints the password; leaves
+    // no litter.
+    #[tokio::test]
+    #[ignore = "requires a live Navidrome (HYPODJ_TEST_URL/USER/PASS) + three real song ids"]
+    async fn live_playlist_position_delete_and_clear() {
+        let (url, username, password) = match (
+            std::env::var("HYPODJ_TEST_URL"),
+            std::env::var("HYPODJ_TEST_USER"),
+            std::env::var("HYPODJ_TEST_PASS"),
+        ) {
+            (Ok(u), Ok(n), Ok(p)) => (u, n, p),
+            _ => {
+                eprintln!("skipping live delete: HYPODJ_TEST_URL/USER/PASS not set");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username, password, client_name: "hypodj-selftest".into() };
+        let client = SubsonicClient::connect(&cfg).expect("connect");
+        client.ping().await.expect("ping live server");
+
+        let seed = client.random_songs(Some(3)).await.expect("random songs");
+        assert!(seed.len() >= 3, "need at least 3 songs on the server");
+        let song_ids: Vec<SongId> = seed.iter().take(3).map(|s| s.id.clone()).collect();
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("hypodj-selftest-del-{nonce}");
+
+        let pid = client.create_playlist(&name, &song_ids).await.expect("create");
+
+        // Position-delete: drop index 0, then verify that song is gone and the
+        // other two remain (order-independent membership check).
+        let removed = song_ids[0].clone();
+        client.remove_from_playlist(&pid, 0).await.expect("remove_from_playlist");
+        let after_remove = client.get_playlist(&pid).await.expect("get_playlist");
+        let ids: std::collections::HashSet<_> = after_remove.songs.iter().map(|s| &s.id).collect();
+        assert!(!ids.contains(&removed), "position-deleted song must be gone");
+        assert_eq!(after_remove.songs.len(), 2, "exactly one song removed");
+        for want in &song_ids[1..] {
+            assert!(ids.contains(want), "surviving song {want:?} must remain");
+        }
+
+        // Whole-clear: deletePlaylist removes it entirely.
+        client.delete_playlist(&pid).await.expect("delete_playlist");
+        let after = client.get_playlists().await.expect("get_playlists after delete");
+        assert!(!after.iter().any(|p| p.id == pid), "cleared playlist must be gone");
     }
 }

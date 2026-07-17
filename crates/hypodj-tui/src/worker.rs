@@ -123,6 +123,11 @@ pub struct Workers {
     pub cmd_shutdown: TcpStream,
     /// Cloned idle-socket handle (None if the idle socket was not connected at spawn).
     pub idle_shutdown: Option<TcpStream>,
+    /// Shared cloned viz-socket handle, refreshed by the viz worker after each
+    /// (re)connect. `shutdown(Both)` on it unblocks a read parked in the blocking
+    /// `next_sample`, so the viz worker can honor the stop flag at teardown instead
+    /// of hanging until the read timeout fires (mirrors cmd/idle shutdown).
+    pub viz_shutdown: Arc<Mutex<Option<TcpStream>>>,
     /// The LATEST-WINS viz level slot: the dedicated viz worker decodes each frame
     /// into here (std Mutex, locked only for the swap, never across IO), and the
     /// render loop samples it each frame. `None` when no daemon frame has landed yet
@@ -188,12 +193,14 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
     // slot empty and viz_connected false, and the render loop uses the fallback wave.
     let viz_slot: Arc<Mutex<Option<VizSample>>> = Arc::new(Mutex::new(None));
     let viz_connected = Arc::new(AtomicBool::new(false));
+    let viz_shutdown: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     {
         let host = host.to_string();
         let slot = viz_slot.clone();
         let connected = viz_connected.clone();
+        let shutdown = viz_shutdown.clone();
         let stop = stop.clone();
-        thread::spawn(move || viz_worker(&host, port, slot, connected, stop));
+        thread::spawn(move || viz_worker(&host, port, slot, connected, shutdown, stop));
     }
 
     Ok(Workers {
@@ -206,6 +213,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         idle_shutdown,
         viz_slot,
         viz_connected,
+        viz_shutdown,
     })
 }
 
@@ -604,6 +612,7 @@ fn viz_worker(
     mpd_port: u16,
     slot: Arc<Mutex<Option<VizSample>>>,
     connected: Arc<AtomicBool>,
+    shutdown: Arc<Mutex<Option<TcpStream>>>,
     stop: Arc<AtomicBool>,
 ) {
     let viz_port = mpd_port.saturating_add(1);
@@ -616,6 +625,17 @@ fn viz_worker(
             Ok(mut conn) => {
                 backoff = BACKOFF_START;
                 connected.store(true, Ordering::Relaxed);
+                // Publish a cloned socket handle so teardown can shutdown(Both) it
+                // and unblock a read parked in next_sample. Refreshed on every
+                // reconnect; cleared when the connection drops below.
+                if let Ok(mut g) = shutdown.lock() {
+                    *g = conn.shutdown_handle().ok();
+                }
+                // A stop that raced the connect: honor it before parking on a read.
+                if stop.load(Ordering::Relaxed) {
+                    connected.store(false, Ordering::Relaxed);
+                    return;
+                }
                 loop {
                     if stop.load(Ordering::Relaxed) {
                         connected.store(false, Ordering::Relaxed);
@@ -635,9 +655,13 @@ fn viz_worker(
                     }
                 }
                 // Disconnected: mark down and clear the stale level so the render
-                // loop falls back rather than freezing on the last frame.
+                // loop falls back rather than freezing on the last frame. Drop the
+                // stale shutdown handle too (its socket is gone).
                 connected.store(false, Ordering::Relaxed);
                 if let Ok(mut g) = slot.lock() {
+                    *g = None;
+                }
+                if let Ok(mut g) = shutdown.lock() {
                     *g = None;
                 }
             }

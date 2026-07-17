@@ -616,6 +616,12 @@ fn teardown(workers: &Workers) {
     if let Some(h) = &workers.idle_shutdown {
         let _ = h.shutdown(Shutdown::Both);
     }
+    // Unblock the viz worker if it is parked in a blocking next_sample read.
+    if let Ok(g) = workers.viz_shutdown.lock() {
+        if let Some(h) = g.as_ref() {
+            let _ = h.shutdown(Shutdown::Both);
+        }
+    }
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {

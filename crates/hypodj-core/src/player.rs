@@ -1152,27 +1152,46 @@ pub(crate) const VIZ_FLOOR_DBFS: f32 = -120.0;
 /// silence) parses to `f32::NEG_INFINITY`, which we clamp to [`VIZ_FLOOR_DBFS`].
 pub(crate) fn parse_astats_levels(node: libmpv2::mpv_node::MpvNode) -> Option<(f32, f32)> {
     let map = node.map()?;
-    let mut rms: Option<f32> = None;
-    let mut peak: Option<f32> = None;
-    for (key, value) in map {
-        // Values are strings; tolerate a stray numeric node just in case.
-        let parsed: Option<f32> = match value {
+    // The value nodes are strings; tolerate a stray numeric node just in case.
+    // Decoding to `(key, Option<f32>)` keeps the pure key-selection logic in the
+    // testable [`select_astats_levels`] (an MpvNodeMapIter cannot be built offline).
+    select_astats_levels(map.map(|(key, value)| {
+        let parsed = match value {
             libmpv2::mpv_node::MpvNode::String(s) => s.trim().parse::<f32>().ok(),
             libmpv2::mpv_node::MpvNode::Double(d) => Some(d as f32),
             _ => None,
         };
+        (key, parsed)
+    }))
+}
+
+/// Pure key-selection over decoded `(key, Option<f32> dBFS)` pairs: pick the
+/// OVERALL RMS/Peak levels, clamp each to [`VIZ_FLOOR_DBFS`] (mapping non-finite
+/// `-inf` silence to the floor), and mirror a lone level so a subscriber always
+/// gets a usable pair. Returns `None` when NEITHER overall level is present.
+///
+/// Keys are pinned to `...Overall.RMS_level` / `...Overall.Peak_level`. A bare
+/// `ends_with("RMS_level")` would ALSO match per-channel keys
+/// (`lavfi.astats.1.RMS_level`, `...2.RMS_level`), letting a channel level clobber
+/// the Overall one depending on map iteration order - the bug this pins shut.
+fn select_astats_levels<I>(pairs: I) -> Option<(f32, f32)>
+where
+    I: IntoIterator<Item = (String, Option<f32>)>,
+{
+    let mut rms: Option<f32> = None;
+    let mut peak: Option<f32> = None;
+    for (key, parsed) in pairs {
         let Some(v) = parsed else { continue };
         let v = if v.is_finite() { v } else { VIZ_FLOOR_DBFS };
         let v = v.max(VIZ_FLOOR_DBFS);
-        if key.ends_with("RMS_level") {
+        if key.ends_with("Overall.RMS_level") {
             rms = Some(v);
-        } else if key.ends_with("Peak_level") {
+        } else if key.ends_with("Overall.Peak_level") {
             peak = Some(v);
         }
     }
     match (rms, peak) {
         (None, None) => None,
-        // If only one surfaced, mirror it so a subscriber still gets a usable pair.
         (r, p) => Some((r.or(p).unwrap(), p.or(r).unwrap())),
     }
 }
@@ -1189,6 +1208,41 @@ mod tests {
     // The idle guard: with nothing loaded the reported state is always Stopped,
     // no matter what the raw backend claims; with a current song the raw state
     // passes through unchanged.
+    #[test]
+    fn select_astats_pins_to_overall_not_per_channel() {
+        // A real astats metadata map carries BOTH per-channel keys
+        // (lavfi.astats.1.RMS_level, ...2....) and the Overall aggregate. The
+        // selector must read ONLY the Overall level; a per-channel value listed
+        // AFTER Overall must not clobber it (the ends_with bug this pins shut).
+        let pairs = vec![
+            ("lavfi.astats.1.RMS_level".to_string(), Some(-3.0f32)),
+            ("lavfi.astats.Overall.RMS_level".to_string(), Some(-20.0f32)),
+            ("lavfi.astats.2.RMS_level".to_string(), Some(-99.0f32)),
+            ("lavfi.astats.1.Peak_level".to_string(), Some(-1.0f32)),
+            ("lavfi.astats.Overall.Peak_level".to_string(), Some(-12.0f32)),
+            ("lavfi.astats.2.Peak_level".to_string(), Some(-2.0f32)),
+        ];
+        let (rms, peak) = select_astats_levels(pairs).expect("overall levels present");
+        assert_eq!(rms, -20.0, "RMS must be the Overall value, not a per-channel one");
+        assert_eq!(peak, -12.0, "Peak must be the Overall value, not a per-channel one");
+    }
+
+    #[test]
+    fn select_astats_floors_non_finite_and_mirrors_lone_level() {
+        // -inf silence clamps to the floor; a lone Overall level mirrors into both.
+        let (rms, peak) = select_astats_levels(vec![
+            ("lavfi.astats.Overall.RMS_level".to_string(), Some(f32::NEG_INFINITY)),
+        ])
+        .unwrap();
+        assert_eq!(rms, VIZ_FLOOR_DBFS);
+        assert_eq!(peak, VIZ_FLOOR_DBFS);
+        // No overall level at all -> None (only per-channel keys present).
+        assert!(select_astats_levels(vec![
+            ("lavfi.astats.1.RMS_level".to_string(), Some(-3.0f32)),
+        ])
+        .is_none());
+    }
+
     #[test]
     fn effective_state_forces_stop_without_current() {
         assert_eq!(effective_play_state(PlayState::Playing, false), PlayState::Stopped);
