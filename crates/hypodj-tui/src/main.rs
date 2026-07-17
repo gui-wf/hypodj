@@ -496,6 +496,12 @@ fn apply_resp(tx: &Sender<Req>, state: &mut TuiState, kind: RespKind) {
             // rare status/currentsong ACK never permanently wedges wake-driven
             // refreshes. Clearing on an unrelated banner costs at most one extra cheap
             // refresh.
+            // On the DJ pane, also surface the arm ACK/result (armed / did-nothing /
+            // error) IN the scrollback where the user is looking, not only the bottom
+            // status bar - a no-op/failed arm otherwise gives no feedback in the pane.
+            if state.screen == Screen::Dj {
+                state.push_dj_log(msg.clone());
+            }
             state.status_msg = Some(msg);
             clear_refresh_gate(tx, state);
         }

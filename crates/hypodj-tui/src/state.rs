@@ -1182,11 +1182,39 @@ impl TuiState {
                 self.push_dj_log(format!("> {phrase}"));
                 let words: Vec<String> =
                     phrase.split_whitespace().map(str::to_string).collect();
-                if route(&words) == Action::FavoriteCurrent {
-                    return self.favorite_current();
+                // Route bare control verbs (favorite/star, play/pause/stop/next/prev,
+                // clear) to the DETERMINISTIC client verb path BEFORE Claude - the
+                // same spirit as the favorite fix. A queue-manipulation ask that is
+                // NOT a bare verb (a fuzzy phrase) still goes to CC. This is the
+                // hybrid split: bare verbs never reach the translator (which cannot
+                // express favorite/clear and would degrade them to a no-op enqueue).
+                match route(&words) {
+                    Action::FavoriteCurrent => self.favorite_current(),
+                    Action::Command(line) => {
+                        self.push_dj_log(format!("ok: {line}"));
+                        Some(Intent::Command(line))
+                    }
+                    Action::ClearConfirm => {
+                        self.enter_confirm(Pending {
+                            command: Some("clear".to_string()),
+                            token: None,
+                            steps: vec!["clear the whole queue".to_string()],
+                            note: None,
+                            trust: None,
+                        });
+                        None
+                    }
+                    Action::NowPlaying | Action::Queue => Some(Intent::Refresh),
+                    Action::Help => {
+                        self.push_dj_log(not_understood_hint());
+                        None
+                    }
+                    // A fuzzy phrase (queue-edit ask, fade, enqueue, ...) -> Claude.
+                    Action::Nl(phrase) => {
+                        self.dj_phase = Some("thinking...".to_string());
+                        Some(Intent::Cc(phrase))
+                    }
                 }
-                self.dj_phase = Some("thinking...".to_string());
-                Some(Intent::Cc(phrase))
             }
             KeyCode::Char(c) => {
                 self.dj_input.push(c);
@@ -2038,6 +2066,41 @@ mod tests {
         // No spurious CC thinking phase on the favorite path.
         assert_eq!(s.dj_phase, None);
         assert_eq!(s.dj_input, "");
+    }
+
+    #[test]
+    fn dj_bare_queue_verb_routes_to_command_not_cc() {
+        // A bare control verb typed in the DJ pane must run the DETERMINISTIC verb
+        // path (never Claude, which cannot express clear/next and would no-op).
+        let mut s = TuiState::new();
+        s.handle_key(key(KeyCode::F(4)));
+        s.dj_input = "next".into();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Command("next".into()))
+        );
+        // No CC thinking phase on the verb path.
+        assert_eq!(s.dj_phase, None);
+        // Feedback is surfaced in the DJ pane scrollback.
+        assert!(s.dj_log.iter().any(|l| l == "ok: next"));
+
+        // `clear` opens the destructive default-No confirm, NOT a silent run.
+        let mut s = TuiState::new();
+        s.handle_key(key(KeyCode::F(4)));
+        s.dj_input = "clear".into();
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), None);
+        assert_eq!(s.mode, Mode::Confirm);
+        assert_eq!(s.dj_phase, None);
+
+        // A fuzzy phrase still goes to CC (the translator path).
+        let mut s = TuiState::new();
+        s.handle_key(key(KeyCode::F(4)));
+        s.dj_input = "fade out slowly".into();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Cc("fade out slowly".into()))
+        );
+        assert_eq!(s.dj_phase.as_deref(), Some("thinking..."));
     }
 
     #[test]
