@@ -474,6 +474,10 @@ pub struct TuiState {
     /// Whether the `?` help overlay is open. Normal-mode-only modal: while open, only
     /// `?`/Esc/q resolve (toggle-close), everything else is swallowed.
     pub help_open: bool,
+    /// The help overlay's vertical scroll offset (rows). Nonzero only when the overlay
+    /// is taller than the terminal; nav keys scroll it and the renderer clamps it to the
+    /// real max so a short terminal can still reach every binding. Reset when help opens.
+    pub help_scroll: u16,
     /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
     /// guaranteed dark default so the visual system always has a bg to contrast against.
     pub term_bg: crate::album_color::TermBg,
@@ -543,6 +547,7 @@ impl Default for TuiState {
             viz_env: 0.0,
             viz_playing: false,
             help_open: false,
+            help_scroll: 0,
             term_bg: crate::album_color::TermBg::dark_default(),
             image_protocol: crate::album_color::ImageProtocol::None,
             truecolor: false,
@@ -626,8 +631,28 @@ impl TuiState {
         // The help overlay is a true modal: while open, ONLY `?`/Esc/q toggle it
         // closed and every other key is swallowed (never leaks to nav/transport).
         if self.help_open {
+            // A true modal: `?`/Esc/q close it; j/k/arrows/PgUp/PgDn scroll it (so a
+            // short terminal that cannot show the whole table can still reach every
+            // binding); everything else is swallowed. The offset is clamped against the
+            // real content/viewport in the renderer, so an over-scroll just pins to the
+            // last page.
             match key.code {
-                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => self.help_open = false,
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                    self.help_open = false;
+                    self.help_scroll = 0;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.help_scroll = self.help_scroll.saturating_add(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    self.help_scroll = self.help_scroll.saturating_add(10);
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(10);
+                }
                 _ => {}
             }
             return None;
@@ -732,6 +757,7 @@ impl TuiState {
             // the top of key_normal then handles every key until it is toggled closed.
             Act::HelpToggle => {
                 self.help_open = true;
+                self.help_scroll = 0;
                 None
             }
             Act::Quit => Some(Intent::Quit),
@@ -1117,21 +1143,25 @@ impl TuiState {
     /// anything else stays a CC translation (a DJ query is otherwise never a bare
     /// verb).
     fn key_dj(&mut self, key: KeyEvent) -> Option<Intent> {
-        // The Scope::Global view + help bindings must work here too (KEYMAP marks
-        // F1-F4 and `?` Global with no screen caveat, and the help overlay advertises
-        // them everywhere). F-keys are never part of an NL query, so switch outright;
+        // The Scope::Global view + help bindings must work here too, and they are
+        // resolved through the SINGLE-SOURCE keymap (match_key) - NOT hand-written -
+        // so the DJ screen can never drift from KEYMAP. Only the four screen-switch
+        // Acts and HelpToggle are honored here; every other Global matcher (j/k/p/vol
+        // etc.) falls through to be captured as ask-line input, since a DJ query is
+        // always typed text. F-keys are never part of an NL query, so switch outright;
         // `?` opens help ONLY on an empty ask line, so a literal `?` can still be typed
-        // mid-phrase ("what should I play?"). Everything else is captured as input.
-        match key.code {
-            KeyCode::F(1) => return self.switch_screen(Screen::Queue),
-            KeyCode::F(2) => return self.switch_screen(Screen::Albums),
-            KeyCode::F(3) => return self.switch_screen(Screen::Playlists),
-            KeyCode::F(4) => return self.switch_screen(Screen::Dj),
-            KeyCode::Char('?') if self.dj_input.is_empty() => {
-                self.help_open = true;
-                return None;
+        // mid-phrase ("what should I play?").
+        if let Some(act) = keymap::match_key(key, self.screen) {
+            use keymap::Act;
+            match act {
+                Act::ScreenQueue | Act::ScreenAlbums | Act::ScreenPlaylists | Act::ScreenDj => {
+                    return self.apply_act(act);
+                }
+                Act::HelpToggle if self.dj_input.is_empty() => {
+                    return self.apply_act(act);
+                }
+                _ => {}
             }
-            _ => {}
         }
         match key.code {
             KeyCode::Esc => {
@@ -1310,6 +1340,53 @@ mod tests {
         s.handle_key(ch('?'));
         assert!(!s.help_open, "? mid-phrase is text, not a help toggle");
         assert_eq!(s.dj_input, "w?");
+    }
+
+    #[test]
+    fn dj_screen_all_f_keys_dispatch_via_match_key() {
+        // Every F1-F4 switch resolves through the SINGLE-SOURCE keymap (match_key) even
+        // from the DJ screen, so the Global view keys are alive on every screen and can
+        // never drift from KEYMAP.
+        for (fk, want) in [
+            (KeyCode::F(1), Screen::Queue),
+            (KeyCode::F(2), Screen::Albums),
+            (KeyCode::F(3), Screen::Playlists),
+            (KeyCode::F(4), Screen::Dj),
+        ] {
+            let mut s = TuiState::new();
+            s.screen = Screen::Dj;
+            assert_eq!(s.handle_key(key(fk)), Some(Intent::ShowScreen(want)));
+            assert_eq!(s.screen, want);
+        }
+    }
+
+    #[test]
+    fn help_overlay_scrolls_and_resets() {
+        let mut s = TuiState::new();
+        // `?` opens help at the top.
+        assert_eq!(s.handle_key(ch('?')), None);
+        assert!(s.help_open);
+        assert_eq!(s.help_scroll, 0);
+        // j / Down scroll down; k / Up scroll up (clamped at 0). PageDown jumps.
+        s.handle_key(ch('j'));
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.help_scroll, 2);
+        s.handle_key(ch('k'));
+        assert_eq!(s.help_scroll, 1);
+        s.handle_key(key(KeyCode::PageDown));
+        assert_eq!(s.help_scroll, 11);
+        // Up never underflows.
+        s.help_scroll = 0;
+        s.handle_key(ch('k'));
+        assert_eq!(s.help_scroll, 0);
+        // Every other key is swallowed while the modal is open (no transport leak).
+        assert_eq!(s.handle_key(ch('p')), None);
+        assert!(s.help_open);
+        // Closing resets the offset so the next open starts at the top.
+        s.help_scroll = 5;
+        s.handle_key(key(KeyCode::Esc));
+        assert!(!s.help_open);
+        assert_eq!(s.help_scroll, 0);
     }
 
     #[test]

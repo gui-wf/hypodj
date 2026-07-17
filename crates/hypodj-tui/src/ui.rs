@@ -90,9 +90,17 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
         for (g, rows) in cols {
             out.push(Line::from(Span::styled(g.title().to_string(), head)));
             for b in rows {
+                // Tag screen-specific bindings so the overlay does not imply a Queue- or
+                // browse-only key works everywhere; Global keys carry no tag (the common
+                // case, kept uncluttered).
+                let desc = match b.scope {
+                    keymap::Scope::Global => b.help.to_string(),
+                    keymap::Scope::Queue => format!("{} [queue]", b.help),
+                    keymap::Scope::Browse => format!("{} [browse]", b.help),
+                };
                 out.push(Line::from(vec![
                     Span::styled(format!("{:<kw$} ", b.keys, kw = key_w), key_style),
-                    Span::styled(b.help.to_string(), desc_style),
+                    Span::styled(desc, desc_style),
                 ]));
             }
             out.push(Line::from(""));
@@ -101,20 +109,30 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     };
     let lcol = render_col(left);
     let rcol = render_col(right);
-    let rows = lcol.len().max(rcol.len());
     let lwidth = lcol.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
-    for i in 0..rows {
-        let mut spans: Vec<Span> = Vec::new();
-        let lspans = lcol.get(i).map(|l| l.spans.clone()).unwrap_or_default();
-        let lused: usize = lspans.iter().map(|s| s.content.chars().count()).sum();
-        spans.extend(lspans);
-        // Pad the gap between the two columns.
-        let pad = (lwidth as usize + 3).saturating_sub(lused);
-        spans.push(Span::raw(" ".repeat(pad)));
-        if let Some(r) = rcol.get(i) {
-            spans.extend(r.spans.clone());
+    let rwidth = rcol.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    // The two-column layout only fits when both columns plus the gap and borders clear
+    // the region width. On a NARROW terminal we fall back to a SINGLE stacked column
+    // (always fits width-wise) and rely on vertical scroll so every binding is still
+    // reachable - never a horizontal truncation that hides the right column's tail.
+    let two_col_w = lwidth + 3 + rwidth + 4;
+    if two_col_w <= region.width {
+        let rows = lcol.len().max(rcol.len());
+        for i in 0..rows {
+            let mut spans: Vec<Span> = Vec::new();
+            let lspans = lcol.get(i).map(|l| l.spans.clone()).unwrap_or_default();
+            let lused: usize = lspans.iter().map(|s| s.content.chars().count()).sum();
+            spans.extend(lspans);
+            // Pad the gap between the two columns.
+            let pad = (lwidth as usize + 3).saturating_sub(lused);
+            spans.push(Span::raw(" ".repeat(pad)));
+            if let Some(r) = rcol.get(i) {
+                spans.extend(r.spans.clone());
+            }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
+    } else {
+        lines = render_col(&groups);
     }
 
     let content_h = lines.len() as u16 + 2;
@@ -124,12 +142,26 @@ fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
     let x = region.x + (region.width.saturating_sub(w)) / 2;
     let y = region.y + (region.height.saturating_sub(h)) / 2;
     let popup = Rect { x, y, width: w, height: h };
+    // The inner text height (popup minus the top/bottom border rows). When the table is
+    // taller than this, the overlay SCROLLS instead of silently truncating: the offset
+    // is clamped to the last full page so a short terminal can still reach every binding.
+    let inner_h = h.saturating_sub(2);
+    let max_scroll = (lines.len() as u16).saturating_sub(inner_h);
+    let scroll = state.help_scroll.min(max_scroll);
+    let title = if max_scroll > 0 {
+        format!("Help - keys ({}/{})  j/k scroll", scroll + 1, max_scroll + 1)
+    } else {
+        "Help - keys".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(base)
-        .title(Span::styled("Help - keys", head));
+        .title(Span::styled(title, head));
     f.render_widget(Clear, popup);
-    f.render_widget(Paragraph::new(lines).block(block).style(base), popup);
+    f.render_widget(
+        Paragraph::new(lines).block(block).style(base).scroll((scroll, 0)),
+        popup,
+    );
 }
 
 /// Split `label` into styled spans, underlining+bolding the FIRST case-insensitive
@@ -640,13 +672,47 @@ mod tests {
         // surface so the full two-column table lands (a cramped terminal clamps it).
         let mut s = TuiState::new();
         s.help_open = true;
-        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        let out = render_to_lines_sized(&s, 120, 48).join("\n");
         // A group header and a couple of known binding descriptions are present, all
         // derived from keymap::grouped (so the overlay can never drift).
         assert!(out.contains("View"), "group header rendered:\n{out}");
         assert!(out.contains("play / pause"), "a keymap help line rendered:\n{out}");
         assert!(out.contains("quit"), "quit binding rendered:\n{out}");
         assert!(out.contains("Help - keys"), "overlay titled:\n{out}");
+    }
+
+    #[test]
+    fn help_overlay_fits_and_scrolls_on_a_short_terminal() {
+        // On a standard-height terminal the table is taller than the screen; the overlay
+        // must SCROLL rather than silently truncate. At the top, the last group (General
+        // -> "quit") is off-screen; scrolled down it becomes visible, proving every
+        // binding is reachable. The title also advertises the scroll position.
+        let mut s = TuiState::new();
+        s.help_open = true;
+        s.help_scroll = 0;
+        let top = render_to_lines_sized(&s, 60, 12).join("\n");
+        assert!(top.contains("Help - keys"), "overlay titled + fits:\n{top}");
+        assert!(top.contains("scroll"), "scroll affordance shown when clamped:\n{top}");
+        assert!(!top.contains("quit"), "tail binding is off-screen at the top:\n{top}");
+        // The `quit` binding is off-screen at the top but becomes reachable by scrolling:
+        // walk the offsets and assert it appears at some page (proving nothing is lost to
+        // truncation). Over-scroll clamps to the last page, never panics.
+        let reachable = (0..40u16).any(|off| {
+            s.help_scroll = off;
+            render_to_lines_sized(&s, 60, 12).join("\n").contains("quit")
+        });
+        assert!(reachable, "every binding is reachable by scrolling on a short terminal");
+    }
+
+    #[test]
+    fn help_overlay_labels_screen_specific_bindings() {
+        // Global keys carry no tag; a browse-scoped binding is marked so the overlay
+        // does not imply it works everywhere.
+        let mut s = TuiState::new();
+        s.help_open = true;
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("[browse]"), "browse-scoped binding tagged:\n{out}");
+        assert!(out.contains("[queue]"), "queue-scoped binding tagged:\n{out}");
     }
 
     #[test]
