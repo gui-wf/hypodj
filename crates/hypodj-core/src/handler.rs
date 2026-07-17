@@ -4144,6 +4144,12 @@ impl MpdHandler for HypodjHandler {
                     Some(fav) => match self.client.star(&fav).await {
                         Ok(()) => {
                             self.bust_star_caches();
+                            // Reflect the star on any matching queued entry so the
+                            // Now Playing heart appears immediately (before a
+                            // re-fetch). Only on a CONFIRMED successful star.
+                            if let Some(sid) = song_id_from_uri(&uri) {
+                                self.set_queue_starred(&sid, true);
+                            }
                             self.notify_change();
                             MpdResponse::ok()
                         }
@@ -4176,9 +4182,13 @@ impl MpdHandler for HypodjHandler {
                     st.last_starred_order.get(pos).cloned()
                 };
                 match target {
-                    Some(id) => match self.client.unstar(&Favorite::Song(id)).await {
+                    Some(id) => match self.client.unstar(&Favorite::Song(id.clone())).await {
                         Ok(()) => {
                             self.bust_star_caches();
+                            // Symmetrically clear the heart on any matching queued
+                            // entry so it disappears LIVE (before a re-fetch). Only
+                            // on a CONFIRMED successful unstar.
+                            self.set_queue_starred(&id, false);
                             self.notify_change();
                             MpdResponse::ok()
                         }
@@ -5076,6 +5086,22 @@ impl HypodjHandler {
         self.dir_cache.invalidate(&"artists".to_string());
         self.listings.invalidate_prefix("album/");
     }
+
+    /// Flip the in-memory `starred` flag on every queued entry whose song id
+    /// matches, so the Now Playing heart appears (or clears) LIVE before any
+    /// re-fetch. Called ONLY after a CONFIRMED successful star / unstar, so the
+    /// in-memory flag never desyncs from the real library state. The std Mutex is
+    /// taken and released synchronously here - never held across an `.await`.
+    fn set_queue_starred(&self, id: &SongId, starred: bool) {
+        let mut st = self.state.lock().unwrap();
+        for item in st.queue.iter_mut() {
+            if let QueueEntry::Song(song) = &mut item.entry {
+                if &song.id == id {
+                    song.starred = starred;
+                }
+            }
+        }
+    }
 }
 
 /// Does `song` satisfy the `tag == / contains val` filter? `exact` picks
@@ -5209,6 +5235,13 @@ fn browse_song_pairs(s: &Song) -> Vec<(String, String)> {
 
 /// Append the common + richer tags for a song (shared by browse + queue rows).
 fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
+    // A non-standard hint so the clients can show a heart in Now Playing when the
+    // current track is a Subsonic favorite. Emitted ONLY when starred (never a
+    // `0` line), so the pair stays well-formed and strict MPD clients (ncmpcpp)
+    // swallow the unknown song-row key harmlessly.
+    if s.starred {
+        p.push(("X-Starred".to_string(), "1".to_string()));
+    }
     if let Some(a) = &s.artist {
         p.push(("Artist".to_string(), a.clone()));
     }
@@ -5340,6 +5373,100 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("s-2")).await;
         let ids = h.queue_song_ids();
         assert_eq!(ids, vec![SongId("s-1".into()), SongId("s-2".into())]);
+    }
+
+    #[test]
+    fn push_song_tags_emits_x_starred_only_when_starred() {
+        // Not starred -> no X-Starred pair at all (never a `0` line).
+        let mut s = playlist_test_song("s-1");
+        let pairs = browse_song_pairs(&s);
+        assert!(!pairs.iter().any(|(k, _)| k == "X-Starred"));
+        // Starred -> exactly one well-formed `X-Starred: 1` pair.
+        s.starred = true;
+        let pairs = browse_song_pairs(&s);
+        let starred: Vec<_> = pairs.iter().filter(|(k, _)| k == "X-Starred").collect();
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].1, "1");
+    }
+
+    #[tokio::test]
+    async fn set_queue_starred_flips_currentsong_heart_live() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        let cur = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        // Baseline: not starred, so currentsong carries no heart hint.
+        let c0 = cur(h.handle(MpdCommand::CurrentSong).await);
+        assert!(!c0.iter().any(|(k, _)| k == "X-Starred"));
+        // A confirmed star flips the in-memory entry -> heart appears LIVE.
+        h.set_queue_starred(&SongId("s-1".into()), true);
+        let c1 = cur(h.handle(MpdCommand::CurrentSong).await);
+        assert!(c1.iter().any(|(k, v)| k == "X-Starred" && v == "1"));
+        // Symmetric unstar clears it LIVE.
+        h.set_queue_starred(&SongId("s-1".into()), false);
+        let c2 = cur(h.handle(MpdCommand::CurrentSong).await);
+        assert!(!c2.iter().any(|(k, _)| k == "X-Starred"));
+    }
+
+    /// Live star/unstar heart flip against a REAL backend. Skipped by default
+    /// (`#[ignore]`); run with `--ignored` and env config pointing at a throwaway
+    /// backend/song. Stars the given song via the real `playlistadd Starred` path,
+    /// asserts `currentsong` gains `X-Starred: 1`, then unstars it (real Subsonic
+    /// unstar) and asserts the heart clears. Restores the original star state.
+    ///
+    /// Env: `HYPODJ_LIVE_URL`, `HYPODJ_LIVE_USER`, `HYPODJ_LIVE_PASS`,
+    /// `HYPODJ_LIVE_SONG` (a bare Subsonic song id).
+    #[tokio::test]
+    #[ignore]
+    async fn live_star_unstar_toggles_currentsong_heart() {
+        let (url, user, pass, sid) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+            std::env::var("HYPODJ_LIVE_SONG"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw), Ok(s)) => (u, us, pw, s),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS/SONG to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig {
+            url,
+            username: user,
+            password: pass,
+            client_name: "hypodj-live-test".to_string(),
+        };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(client, player);
+
+        // Queue a minimal entry for the target song and make it current.
+        let mut song = playlist_test_song(&sid);
+        song.starred = false;
+        h.enqueue_song_for_test(song).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        let cur = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let uri = format!("song/{sid}");
+
+        // Star via the real path -> heart appears LIVE.
+        let r = h.handle(MpdCommand::PlaylistAdd("Starred".into(), uri.clone())).await;
+        assert!(!matches!(r, MpdResponse::Ack { .. }), "star must succeed: {r:?}");
+        let c1 = cur(h.handle(MpdCommand::CurrentSong).await);
+        assert!(c1.iter().any(|(k, v)| k == "X-Starred" && v == "1"), "heart set: {c1:?}");
+
+        // Unstar via the real Subsonic path -> heart clears LIVE. Restores state.
+        h.client.unstar(&Favorite::Song(SongId(sid.clone()))).await.expect("unstar");
+        h.set_queue_starred(&SongId(sid.clone()), false);
+        let c2 = cur(h.handle(MpdCommand::CurrentSong).await);
+        assert!(!c2.iter().any(|(k, _)| k == "X-Starred"), "heart cleared: {c2:?}");
     }
 
     // ── queue-edit executor (Part B): deterministic remove/move/clear over the

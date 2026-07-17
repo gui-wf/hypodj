@@ -2,7 +2,7 @@
 //! the queue highlight; all decisions come from TuiState.
 
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -361,10 +361,19 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         height: text_h,
     };
     let title = np.title.clone().unwrap_or_else(|| "(unknown)".to_string());
-    let mut lines = vec![Line::from(Span::styled(
-        title,
-        Style::default().add_modifier(Modifier::BOLD),
-    ))];
+    let title_span = Span::styled(title, Style::default().add_modifier(Modifier::BOLD));
+    // A heart marks a Subsonic favorite (U+2665, cell-width 1, terminal-safe).
+    // Prepended only when the current track is starred, so the layout is unchanged
+    // otherwise. Colored red, subtle against the theme.
+    let title_line = if np.starred {
+        Line::from(vec![
+            Span::styled("\u{2665} ", Style::default().fg(Color::Red)),
+            title_span,
+        ])
+    } else {
+        Line::from(title_span)
+    };
+    let mut lines = vec![title_line];
     if let Some(artist) = np.artist.as_deref() {
         lines.push(Line::from(artist.to_string()));
     }
@@ -817,6 +826,21 @@ mod tests {
             out.contains('\u{2571}') || out.contains('\u{2572}'),
             "album sigil drawn in the art slot:\n{out}"
         );
+    }
+
+    #[test]
+    fn current_prepends_heart_when_starred() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Blue in Green".into());
+        s.now.starred = true;
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains('\u{2665}'), "heart glyph rendered when starred:\n{out}");
+        assert!(out.contains("Blue in Green"), "title still present:\n{out}");
+        // Not starred -> no heart, title unchanged.
+        s.now.starred = false;
+        let plain = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(!plain.contains('\u{2665}'), "no heart when not starred:\n{plain}");
     }
 
     #[test]

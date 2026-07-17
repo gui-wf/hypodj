@@ -19,6 +19,10 @@ pub struct NowPlaying {
     /// track, an `http(s)://...` URL for a raw stream). Needed to favorite the
     /// current track (`playlistadd Starred <uri>`); a stream has no star surface.
     pub file: Option<String>,
+    /// True when the current track is a Subsonic favorite (the daemon emits the
+    /// non-standard `X-Starred` pair on `currentsong`), so the clients can show a
+    /// heart. Parsed from `currentsong`, coexisting with the `armed` status pairs.
+    pub starred: bool,
     /// The armed human-features, surfaced by the daemon as X- status pairs and
     /// present ONLY when armed. Startle-safe equals trust only if the machine's
     /// hold on the night is VISIBLE - these back that render.
@@ -78,6 +82,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
         file: find(current, "file").map(str::to_string),
+        starred: find(current, "X-Starred").is_some(),
         armed: ArmedFeatures::parse(status),
     }
 }
@@ -182,6 +187,31 @@ mod tests {
         assert_eq!(np.file.as_deref(), Some("song/42"));
         // No armed X- pairs -> nothing armed.
         assert!(!np.armed.any());
+        // No X-Starred pair -> not a favorite.
+        assert!(!np.starred);
+    }
+
+    #[test]
+    fn nowplaying_parses_x_starred_coexisting_with_armed() {
+        // A starred current track WHILE a sleep timer is armed: the two X- sources
+        // (currentsong X-Starred + status X-hypodj-*) must parse independently.
+        let status = p(&[
+            ("state", "play"),
+            ("X-hypodj-sleep-remaining", "600"),
+        ]);
+        let current = p(&[
+            ("file", "song/42"),
+            ("Title", "Blue in Green"),
+            ("X-Starred", "1"),
+        ]);
+        let np = now_playing(&status, &current);
+        assert!(np.starred);
+        assert!(np.armed.any());
+        assert_eq!(np.armed.sleep_remaining, Some(600));
+        // Absent pair -> not starred, armed untouched.
+        let np2 = now_playing(&status, &p(&[("file", "song/7"), ("Title", "X")]));
+        assert!(!np2.starred);
+        assert!(np2.armed.any());
     }
 
     #[test]
