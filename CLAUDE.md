@@ -49,6 +49,15 @@ nix develop --command cargo test  -j4 --workspace
   cross-crate enum/type, build AND test the WHOLE `--workspace`, never just
   `-p <crate>`.** A new enum variant (e.g. an `Action`/`MpdCommand` case) breaks
   another crate's exhaustive `match` (this broke the `dj-gui` build once).
+- **A workflow must not merge to master until ALL gates pass: whole-workspace
+  build+test green, `nix build .#hypodj`/`.#hypodj-clients` green, the LIVE
+  functional proof for the change passes, AND every confirmed critical/high review
+  finding is resolved and re-verified.** Gate the integrate phase on these
+  explicitly - never merge-then-discover (this shipped a live-broken favorite
+  route, a latent cc contract bug, and a critical skip-EOF audible-bleed before
+  being caught post-merge). A `let Some(..) = handler_with_null_player()` unit test
+  CANNOT prove a real-mpv path (warm-skip, EOF auto-advance, astats) - those need
+  an `#[ignore]` live-libmpv test that the gate actually runs.
 - **Devshell `cargo test` green does NOT mean the Nix package builds.**
   `nix/package.nix` and `nix/clients.nix` run `doCheck` with `-p hypodj-core` in a
   CERTLESS, network-less sandbox where `handler_with_null_player()` returns `None`.
