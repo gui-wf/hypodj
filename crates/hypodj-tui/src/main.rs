@@ -128,6 +128,9 @@ fn event_loop(
     // music flows and freezes flat when paused/stopped. It rides the existing
     // poll(POLL) cadence - one Instant delta per frame, no extra wakeups.
     let mut anim_accum = 0.0f64;
+    // Free-running clock advanced EVERY frame (unlike anim_accum, which freezes when
+    // paused) so the DJ "thinking..." spinner keeps rotating on a paused/stopped deck.
+    let mut spin_accum = 0.0f64;
     let mut last_frame = Instant::now();
     loop {
         let frame_now = Instant::now();
@@ -135,8 +138,10 @@ fn event_loop(
         if state.now.state.as_deref() == Some("play") {
             anim_accum += dt;
         }
+        spin_accum += dt;
         last_frame = frame_now;
         state.anim_secs = anim_accum;
+        state.spin_secs = spin_accum;
 
         // Sample the latest-wins viz slot and run the ballistics envelope at the
         // render dt. When the viz socket is live we draw the REAL post-gain level

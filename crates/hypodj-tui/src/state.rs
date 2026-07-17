@@ -453,6 +453,11 @@ pub struct TuiState {
     /// paused/stopped) and writes it here before each draw; the idle bottom-bar wave
     /// reads it as its animation phase. Pure display state - no key/logic meaning.
     pub anim_secs: f64,
+    /// Free-running animation clock, advanced EVERY frame regardless of play state
+    /// (unlike `anim_secs`, which freezes when paused). Drives the DJ "thinking..."
+    /// spinner so it keeps rotating while a CC call is in flight even on a paused
+    /// or stopped deck. Pure display state - no key/logic meaning.
+    pub spin_secs: f64,
     /// The DJ View "ask>" input line (the NL query being typed on Screen::Dj).
     pub dj_input: String,
     /// The DJ View scrollback: coarse CC progress + result lines, newest at the
@@ -540,6 +545,7 @@ impl Default for TuiState {
             epoch: 0,
             art_req_uri: None,
             anim_secs: 0.0,
+            spin_secs: 0.0,
             dj_input: String::new(),
             dj_log: Vec::new(),
             dj_phase: None,

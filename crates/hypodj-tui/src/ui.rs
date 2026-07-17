@@ -1145,7 +1145,9 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
     let phase_line = match &state.dj_phase {
         Some(phase) if !phase.is_empty() => {
             let frames = ['|', '/', '-', '\\'];
-            let spin = frames[((state.anim_secs * 6.0) as usize) % 4];
+            // spin_secs is free-running (advances even when paused), so the spinner
+            // keeps turning while a CC call is in flight regardless of play state.
+            let spin = frames[((state.spin_secs * 6.0) as usize) % 4];
             Line::from(Span::styled(
                 format!("{spin} {phase}"),
                 Style::default().add_modifier(Modifier::DIM),
