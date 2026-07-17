@@ -1093,6 +1093,22 @@ impl HypodjHandler {
     /// leave a partial, inconsistent arm. The whole body is await-free; the (async)
     /// Immediate actions are handed to the executor after the lock is released.
     pub fn plan_add_batch(&self, raws: Vec<RawPlan>) -> Result<Vec<PlanId>, PlanError> {
+        let (pendings, ids, immediates) = self.prepare_batch(raws)?;
+        self.plan_pending.lock().unwrap().extend(pendings);
+        self.nudge_immediates(immediates);
+        Ok(ids)
+    }
+
+    /// Validate + arm (mint ids, arm deadline timers) a batch of raw plans WITHOUT
+    /// inserting them into the registry, returning the ready-to-commit
+    /// `PendingPlan`s alongside their ids and the subset that are Immediate. Splitting
+    /// prepare from the registry mutation lets a caller (e.g. [`Self::set_singleton`])
+    /// commit under ONE lock scope that also removes a prior instance, so no window
+    /// ever exposes two plans of the same origin. Whole body is await-free.
+    fn prepare_batch(
+        &self,
+        raws: Vec<RawPlan>,
+    ) -> Result<(Vec<PendingPlan>, Vec<PlanId>, Vec<PlanId>), PlanError> {
         let bounds = self.plan_bounds();
         let snap = self.queue_snapshot();
         let now = Instant::now();
@@ -1108,7 +1124,7 @@ impl HypodjHandler {
         }
 
         // Phase 2: every plan validated -> arm them all. Mint ids, arm deadline
-        // timers, then push under one lock scope.
+        // timers, then hand back the pendings for the caller to commit.
         let mut ids = Vec::with_capacity(prepared.len());
         let mut immediates: Vec<PlanId> = Vec::new();
         let mut pendings: Vec<PendingPlan> = Vec::with_capacity(prepared.len());
@@ -1140,16 +1156,17 @@ impl HypodjHandler {
             pendings.push(PendingPlan { armed, guard, remaining_deadline: None });
             ids.push(id);
         }
-        self.plan_pending.lock().unwrap().extend(pendings);
+        Ok((pendings, ids, immediates))
+    }
 
-        // An Immediate plan executes at add-time: nudge the executor (its action
-        // is async, so it cannot run inside this sync, lock-holding path).
+    /// An Immediate plan executes at add-time: nudge the executor (its action is
+    /// async, so it cannot run inside a sync, lock-holding path).
+    fn nudge_immediates(&self, immediates: Vec<PlanId>) {
         if let Some(tx) = self.plan_immediate.get() {
             for id in immediates {
                 let _ = tx.send(id);
             }
         }
-        Ok(ids)
     }
 
     /// List the armed plans (id + the raw, clamped plan) for `plan list`.
@@ -1215,13 +1232,26 @@ impl HypodjHandler {
             .map(|pp| pp.armed.id)
     }
 
-    /// Build a convenience plan for `origin`: replace the existing single instance
-    /// (validate-then-cancel) or add a fresh one, so exactly one is ever active.
+    /// Build a convenience plan for `origin`, so EXACTLY one is ever active: arm the
+    /// replacement (validate-before-mutate, mirroring the fade discipline) then, under
+    /// ONE registry lock, atomically drop EVERY prior plan of this origin and insert
+    /// the new one. The swap being a single critical section is load-bearing: the
+    /// handler is `Arc`-shared and connections run concurrently, so a
+    /// find-then-add-then-cancel sequence would momentarily expose two plans of the
+    /// same origin - a concurrent Status poll would then emit a duplicate `X-hypodj-*`
+    /// key (malformed MPD status), and two racing re-arms would leak a permanent
+    /// second instance. A failed validate leaves the old plan untouched (arm runs
+    /// before the lock).
     fn set_singleton(&self, origin: &str, raw: RawPlan) -> Result<PlanId, PlanError> {
-        match self.find_by_origin(origin) {
-            Some(id) => self.plan_replace(id, raw),
-            None => self.plan_add(raw),
+        let (pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
+        {
+            let mut g = self.plan_pending.lock().unwrap();
+            g.retain(|pp| pp.armed.raw.origin != origin);
+            g.extend(pendings);
         }
+        self.nudge_immediates(immediates);
+        // Exactly one id for a single-plan batch.
+        Ok(ids.remove(0))
     }
 
     /// A `WallClock` trigger `dur` from now, reduced from civil time exactly as a
@@ -1338,6 +1368,62 @@ impl HypodjHandler {
             Some(id) => self.plan_cancel(id),
             None => false,
         }
+    }
+
+    /// The armed human-features (sleep / wind-down / wake) as X- prefixed MPD
+    /// status pairs, computed from a SINGLE plan-registry snapshot so the three
+    /// features never desync among themselves. Empty when nothing is armed, so the
+    /// Status response stays lean. This is a pure SURFACING of the existing armed
+    /// plan deadlines (see [`Self::plan_deadlines`]) - it recomputes nothing.
+    ///
+    /// - `X-hypodj-sleep-remaining`   secs until the sleep fade-to-stop fires
+    /// - `X-hypodj-winddown-active`   `1` while a wind-down plan is armed
+    /// - `X-hypodj-winddown-remaining` secs until a scheduled wind-down fires
+    ///   (omitted for an Immediate wind-down, which has no deadline)
+    /// - `X-hypodj-wake-remaining`    secs until the scheduled wake alarm
+    /// - `X-hypodj-wake-at`           the wake alarm as a unix epoch second
+    ///
+    /// X- pairs are the MPD-safe extension mechanism (ncmpcpp ignores unknown
+    /// fields). Keys carry no colon/newline and values are digits only, so the
+    /// status line stays well-formed.
+    pub fn armed_feature_pairs(&self) -> Vec<(&'static str, String)> {
+        let now = Instant::now();
+        let deadlines = self.plan_deadlines();
+        let mut out = Vec::new();
+        for (_, origin, deadline) in &deadlines {
+            let remaining = deadline.map(|inst| inst.saturating_duration_since(now));
+            match origin.as_str() {
+                ORIGIN_SLEEP => {
+                    if let Some(r) = remaining {
+                        out.push(("X-hypodj-sleep-remaining", r.as_secs().to_string()));
+                    }
+                }
+                ORIGIN_WINDDOWN => {
+                    out.push(("X-hypodj-winddown-active", "1".to_string()));
+                    if let Some(r) = remaining {
+                        out.push(("X-hypodj-winddown-remaining", r.as_secs().to_string()));
+                    }
+                }
+                ORIGIN_WAKE => {
+                    if let Some(r) = remaining {
+                        out.push(("X-hypodj-wake-remaining", r.as_secs().to_string()));
+                        // The absolute alarm instant as a unix epoch second, so a
+                        // clock display survives poll-to-poll drift. now + remaining
+                        // reconstructs it from the same monotonic snapshot.
+                        if let Ok(sys_now) =
+                            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                        {
+                            out.push((
+                                "X-hypodj-wake-at",
+                                (sys_now.as_secs() + r.as_secs()).to_string(),
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Resolve the next future civil `h:m` (today if still ahead, else tomorrow) in
@@ -3501,6 +3587,11 @@ impl MpdHandler for HypodjHandler {
                             }
                         }
                     }
+                }
+                // Surface the armed human-features (sleep / wind-down / wake) as
+                // X- extension pairs, present ONLY when armed so status stays lean.
+                for (k, v) in self.armed_feature_pairs() {
+                    b = b.pair(k, v);
                 }
                 b.build()
             }
@@ -7193,6 +7284,90 @@ mod tests {
         assert_eq!(pair(&resp, "repeat"), Some("1"));
         assert_eq!(pair(&resp, "single"), Some("1"));
         assert_eq!(pair(&resp, "consume"), Some("1"));
+    }
+
+    // The armed human-features surface as X- status pairs ONLY when armed: a fresh
+    // handler emits none; arming a sleep timer adds X-hypodj-sleep-remaining with a
+    // sensible remaining time; cancelling removes it again (status stays lean).
+    #[tokio::test(start_paused = true)]
+    async fn status_surfaces_armed_sleep_only_when_armed() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Nothing armed: no X- pairs.
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "X-hypodj-sleep-remaining"), None);
+
+        // Arm a 10-minute sleep timer, then read status.
+        h.sleep_set(Duration::from_secs(600)).expect("arm sleep");
+        let resp = h.handle(MpdCommand::Status).await;
+        let remaining: u64 = pair(&resp, "X-hypodj-sleep-remaining")
+            .expect("sleep pair present when armed")
+            .parse()
+            .expect("digits");
+        // Within a tick of 600s (no time advanced).
+        assert!(remaining > 590 && remaining <= 600, "sensible remaining: {remaining}");
+
+        // Cancel: the pair disappears.
+        assert!(h.sleep_cancel());
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "X-hypodj-sleep-remaining"), None);
+    }
+
+    // Re-arming a single-instance convenience feature must NEVER leave two plans of
+    // the same origin: the set_singleton swap is atomic, so status carries EXACTLY
+    // one X-hypodj-sleep-remaining key (a duplicate would be malformed MPD status).
+    #[tokio::test(start_paused = true)]
+    async fn rearm_sleep_keeps_exactly_one_plan_and_pair() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Count occurrences of a key across the whole status Pairs response.
+        fn count(resp: &MpdResponse, key: &str) -> usize {
+            match resp {
+                MpdResponse::Pairs(p) => p.iter().filter(|(k, _)| k == key).count(),
+                _ => 0,
+            }
+        }
+
+        h.sleep_set(Duration::from_secs(600)).expect("arm sleep");
+        // Re-arm several times; each replaces the previous single instance.
+        h.sleep_set(Duration::from_secs(1800)).expect("re-arm sleep");
+        h.sleep_set(Duration::from_secs(900)).expect("re-arm sleep again");
+
+        // Exactly one armed plan of the sleep origin remains.
+        let armed = h
+            .plan_deadlines()
+            .into_iter()
+            .filter(|(_, origin, _)| origin == ORIGIN_SLEEP)
+            .count();
+        assert_eq!(armed, 1, "one sleep plan after re-arms, got {armed}");
+
+        // And status surfaces the key exactly once (well-formed).
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(count(&resp, "X-hypodj-sleep-remaining"), 1, "no duplicate status key");
+        let remaining: u64 =
+            pair(&resp, "X-hypodj-sleep-remaining").expect("present").parse().expect("digits");
+        // Reflects the LAST re-arm (900s), not a stale earlier one.
+        assert!(remaining > 890 && remaining <= 900, "reflects last re-arm: {remaining}");
+    }
+
+    // Wind-down and wake each surface their own X- pairs when armed: an immediate
+    // wind-down reports active-with-no-remaining; a scheduled wake reports both a
+    // remaining and an absolute wake-at epoch.
+    #[tokio::test(start_paused = true)]
+    async fn status_surfaces_armed_winddown_and_wake() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.winddown_set(None).expect("arm immediate winddown");
+        let at = chrono::Utc::now() + chrono::Duration::hours(2);
+        h.wake_set(at, None, 0).expect("arm wake");
+
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "X-hypodj-winddown-active"), Some("1"));
+        // Immediate wind-down has no deadline -> no remaining pair.
+        assert_eq!(pair(&resp, "X-hypodj-winddown-remaining"), None);
+        let wake_rem: u64 = pair(&resp, "X-hypodj-wake-remaining")
+            .expect("wake remaining present")
+            .parse()
+            .unwrap();
+        assert!(wake_rem > 7100 && wake_rem <= 7200, "~2h remaining: {wake_rem}");
+        assert!(pair(&resp, "X-hypodj-wake-at").is_some(), "wake-at epoch present");
     }
 
     // ── skip-fade (single-mpv dip-through-silence on a USER Next/Previous) ────

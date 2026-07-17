@@ -3,15 +3,21 @@
 //! NowPlaying + queue parsing lives in the client. A stopped/empty deck renders a
 //! friendly "nothing playing".
 
-use hypodj_client::model::{parse_queue, NowPlaying};
+use hypodj_client::model::{fmt_remaining, parse_queue, ArmedFeatures, NowPlaying};
 
 /// Render the now-playing card as plain text (a couple of lines). A stopped or
 /// empty deck is "nothing playing" - never a leftover title/artist.
 pub fn render_card(np: &NowPlaying) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
+    let armed = render_armed(&np.armed);
     if stopped || empty {
-        return "nothing playing".to_string();
+        // A stopped deck can still hold an armed wake alarm - surface it so the
+        // machine's hold on the night stays visible even with nothing playing.
+        return match armed {
+            Some(a) => format!("nothing playing\n{a}"),
+            None => "nothing playing".to_string(),
+        };
     }
     let mut lines = Vec::new();
     if let Some(t) = &np.title {
@@ -48,7 +54,32 @@ pub fn render_card(np: &NowPlaying) -> String {
     if !status_bits.is_empty() {
         lines.push(status_bits.join(" | "));
     }
+    if let Some(a) = armed {
+        lines.push(a);
+    }
     lines.join("\n")
+}
+
+/// The armed human-features as one unobtrusive line, e.g.
+/// `sleep 12m | winding down | wake in 7h 00m`. `None` when nothing is armed.
+fn render_armed(a: &ArmedFeatures) -> Option<String> {
+    if !a.any() {
+        return None;
+    }
+    let mut bits = Vec::new();
+    if let Some(s) = a.sleep_remaining {
+        bits.push(format!("sleep {}", fmt_remaining(s)));
+    }
+    if a.winddown_active {
+        match a.winddown_remaining {
+            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
+            None => bits.push("winding down".to_string()),
+        }
+    }
+    if let Some(s) = a.wake_remaining {
+        bits.push(format!("wake in {}", fmt_remaining(s)));
+    }
+    Some(bits.join(" | "))
 }
 
 fn fmt_dur(secs: f64) -> String {
@@ -119,6 +150,43 @@ mod tests {
     fn card_empty_currentsong() {
         let status = p(&[("volume", "50"), ("playlistlength", "0"), ("state", "play")]);
         assert_eq!(render_card(&now_playing(&status, &[])), "nothing playing");
+    }
+
+    #[test]
+    fn card_shows_armed_features() {
+        let status = p(&[
+            ("volume", "70"),
+            ("playlistlength", "12"),
+            ("state", "play"),
+            ("song", "0"),
+            ("X-hypodj-sleep-remaining", "720"),
+            ("X-hypodj-wake-remaining", "25200"),
+        ]);
+        let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(card.contains("sleep 12m"), "card: {card}");
+        assert!(card.contains("wake in 7h 00m"), "card: {card}");
+    }
+
+    #[test]
+    fn card_stopped_still_shows_armed_wake() {
+        let status = p(&[
+            ("volume", "50"),
+            ("state", "stop"),
+            ("X-hypodj-wake-remaining", "25200"),
+        ]);
+        let card = render_card(&now_playing(&status, &[]));
+        assert!(card.contains("nothing playing"));
+        assert!(card.contains("wake in 7h 00m"), "card: {card}");
+    }
+
+    #[test]
+    fn card_no_armed_line_when_nothing_armed() {
+        let status = p(&[("volume", "70"), ("state", "play"), ("song", "0")]);
+        let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(!card.contains("sleep"));
+        assert!(!card.contains("wake"));
     }
 
     #[test]

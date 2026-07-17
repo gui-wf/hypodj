@@ -19,6 +19,48 @@ pub struct NowPlaying {
     /// track, an `http(s)://...` URL for a raw stream). Needed to favorite the
     /// current track (`playlistadd Starred <uri>`); a stream has no star surface.
     pub file: Option<String>,
+    /// The armed human-features, surfaced by the daemon as X- status pairs and
+    /// present ONLY when armed. Startle-safe equals trust only if the machine's
+    /// hold on the night is VISIBLE - these back that render.
+    pub armed: ArmedFeatures,
+}
+
+/// The armed sleep / wind-down / wake state parsed from the daemon's X- status
+/// pairs. Every field is `None`/`false` when nothing is armed, so a lean status
+/// leaves this empty and the clients render nothing.
+#[derive(Debug, Default, PartialEq, Clone)]
+pub struct ArmedFeatures {
+    /// Seconds until the sleep fade-to-stop fires (`X-hypodj-sleep-remaining`).
+    pub sleep_remaining: Option<u64>,
+    /// A wind-down plan is armed (`X-hypodj-winddown-active`).
+    pub winddown_active: bool,
+    /// Seconds until a scheduled wind-down fires (`X-hypodj-winddown-remaining`);
+    /// absent for an immediate wind-down.
+    pub winddown_remaining: Option<u64>,
+    /// Seconds until the scheduled wake alarm (`X-hypodj-wake-remaining`).
+    pub wake_remaining: Option<u64>,
+    /// The wake alarm as a unix epoch second (`X-hypodj-wake-at`).
+    pub wake_at: Option<u64>,
+}
+
+impl ArmedFeatures {
+    /// `true` if any feature is armed - the render gate.
+    pub fn any(&self) -> bool {
+        self.sleep_remaining.is_some()
+            || self.winddown_active
+            || self.wake_remaining.is_some()
+    }
+
+    fn parse(status: &[(String, String)]) -> Self {
+        let num = |k: &str| find(status, k).and_then(|v| v.parse::<u64>().ok());
+        ArmedFeatures {
+            sleep_remaining: num("X-hypodj-sleep-remaining"),
+            winddown_active: find(status, "X-hypodj-winddown-active").is_some(),
+            winddown_remaining: num("X-hypodj-winddown-remaining"),
+            wake_remaining: num("X-hypodj-wake-remaining"),
+            wake_at: num("X-hypodj-wake-at"),
+        }
+    }
 }
 
 fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -36,6 +78,22 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
         file: find(current, "file").map(str::to_string),
+        armed: ArmedFeatures::parse(status),
+    }
+}
+
+/// Format a `secs` remaining as a compact human-readable string: `Hh MMm`, `MMm`,
+/// or `Ss`. Used by both clients so the armed-feature render reads consistently.
+pub fn fmt_remaining(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -122,6 +180,40 @@ mod tests {
         assert_eq!(np.artist.as_deref(), Some("Miles Davis"));
         assert_eq!(np.album.as_deref(), Some("Kind of Blue"));
         assert_eq!(np.file.as_deref(), Some("song/42"));
+        // No armed X- pairs -> nothing armed.
+        assert!(!np.armed.any());
+    }
+
+    #[test]
+    fn nowplaying_parses_armed_feature_pairs() {
+        let status = p(&[
+            ("volume", "70"),
+            ("state", "play"),
+            ("X-hypodj-sleep-remaining", "720"),
+            ("X-hypodj-winddown-active", "1"),
+            ("X-hypodj-wake-remaining", "25200"),
+            ("X-hypodj-wake-at", "1750000000"),
+        ]);
+        let np = now_playing(&status, &[]);
+        assert!(np.armed.any());
+        assert_eq!(np.armed.sleep_remaining, Some(720));
+        assert!(np.armed.winddown_active);
+        assert_eq!(np.armed.winddown_remaining, None);
+        assert_eq!(np.armed.wake_remaining, Some(25200));
+        assert_eq!(np.armed.wake_at, Some(1750000000));
+    }
+
+    #[test]
+    fn armed_absent_when_no_pairs() {
+        let np = now_playing(&p(&[("state", "play")]), &[]);
+        assert_eq!(np.armed, ArmedFeatures::default());
+    }
+
+    #[test]
+    fn fmt_remaining_reads_human() {
+        assert_eq!(fmt_remaining(45), "45s");
+        assert_eq!(fmt_remaining(720), "12m");
+        assert_eq!(fmt_remaining(25200), "7h 00m");
     }
 
     #[test]

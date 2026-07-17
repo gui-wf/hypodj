@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use hypodj_client::model::NowPlaying;
+use hypodj_client::model::{fmt_remaining, ArmedFeatures, NowPlaying};
 
 use crate::keymap;
 use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
@@ -310,16 +310,27 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         return;
     }
 
+    let armed_line = armed_hud(&np.armed);
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
     if stopped || empty {
-        f.render_widget(Paragraph::new("nothing playing"), inner);
+        // A stopped deck can still hold an armed wake alarm - surface it as a subtle
+        // second line so the machine's hold on the night stays visible.
+        let mut lines = vec![Line::from("nothing playing")];
+        if let Some(a) = &armed_line {
+            lines.push(Line::from(Span::styled(
+                a.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
-    // Reserve up to 4 rows at the bottom for title/artist/album + the playback
-    // status line (state | volume fader | position); the rest is art.
-    let text_h = 4u16.min(inner.height);
+    // Reserve up to 4 rows (5 with an armed-feature HUD line) at the bottom for
+    // title/artist/album + the playback status line (state | volume fader |
+    // position) + the optional armed line; the rest is art.
+    let text_h = if armed_line.is_some() { 5u16 } else { 4u16 }.min(inner.height);
     let art_h = inner.height.saturating_sub(text_h);
     if art_h > 0 {
         // Keep the art roughly square: each cell renders 2 vertical pixels, so a
@@ -368,7 +379,36 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         status_line(np),
         Style::default().add_modifier(Modifier::DIM),
     )));
+    if let Some(a) = armed_line {
+        lines.push(Line::from(Span::styled(
+            a,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
     f.render_widget(Paragraph::new(lines), text_area);
+}
+
+/// The armed human-features (sleep / wind-down / wake) as one subtle HUD line, e.g.
+/// `[armed] sleep 12m | wake in 7h 00m`. `None` when nothing is armed, so a lean
+/// status renders no extra line. Surfaces the daemon's X- status pairs verbatim.
+fn armed_hud(a: &ArmedFeatures) -> Option<String> {
+    if !a.any() {
+        return None;
+    }
+    let mut bits = Vec::new();
+    if let Some(s) = a.sleep_remaining {
+        bits.push(format!("sleep {}", fmt_remaining(s)));
+    }
+    if a.winddown_active {
+        match a.winddown_remaining {
+            Some(s) => bits.push(format!("wind-down in {}", fmt_remaining(s))),
+            None => bits.push("winding down".to_string()),
+        }
+    }
+    if let Some(s) = a.wake_remaining {
+        bits.push(format!("wake in {}", fmt_remaining(s)));
+    }
+    Some(format!("[armed] {}", bits.join(" | ")))
 }
 
 /// A dim placeholder shown when there is no cover art (stream, missing, or a fetch
@@ -467,12 +507,29 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_style, level_wave_row, match_spans, track_seed, volume_slider, wave_glyphs, wave_row,
-        window_title, BLOCK_GLYPHS,
+        armed_hud, hit_style, level_wave_row, match_spans, track_seed, volume_slider, wave_glyphs,
+        wave_row, window_title, BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
-    use hypodj_client::model::NowPlaying;
+    use hypodj_client::model::{ArmedFeatures, NowPlaying};
     use ratatui::style::Style;
+
+    #[test]
+    fn armed_hud_reads_human_and_absent_when_unarmed() {
+        assert_eq!(armed_hud(&ArmedFeatures::default()), None);
+        let a = ArmedFeatures {
+            sleep_remaining: Some(720),
+            winddown_active: true,
+            winddown_remaining: None,
+            wake_remaining: Some(25200),
+            wake_at: Some(1750000000),
+        };
+        let hud = armed_hud(&a).expect("armed");
+        assert!(hud.contains("[armed]"), "hud: {hud}");
+        assert!(hud.contains("sleep 12m"), "hud: {hud}");
+        assert!(hud.contains("winding down"), "hud: {hud}");
+        assert!(hud.contains("wake in 7h 00m"), "hud: {hud}");
+    }
 
     #[test]
     fn match_spans_splits_before_match_after() {
