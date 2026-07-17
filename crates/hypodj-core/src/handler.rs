@@ -745,9 +745,13 @@ fn fade_task(
                     // The dip reached its floor AND this is still the current epoch, so
                     // no superseding skip/setvol/stop got here first: it is SAFE to
                     // load the target. mpv's softvol (at the dip floor) persists across
-                    // the loadfile, so the new track starts at that shallow-duck level
+                    // the switch, so the new track starts at that shallow-duck level
                     // and the follow-on ResumeIn owns the rise back to the baseline.
-                    let _ = sink.play_url(play.song_id, Some(play.qid), &play.url).await;
+                    // switch_warmed lands on the prefetched entry near-instant (the
+                    // trough gap collapses toward ~0); if the warm never completed it
+                    // falls back to a plain loadfile-replace - today's behavior, so a
+                    // prefetch miss/failure is never worse than before.
+                    let _ = sink.switch_warmed(play.song_id, Some(play.qid), &play.url).await;
                     // Commit the target as the real current, clear the reported-target
                     // override, pin the live gain to the dip floor (where the deck and
                     // the ResumeIn's from_db agree) and keep `fading` true - the
@@ -919,6 +923,16 @@ const NL_TOKEN_TTL: Duration = Duration::from_secs(300);
 /// old track ducks to ~1/8 loudness, the new track loads there and rises back to
 /// the baseline). Closer to 0 = shallower + faster; deeper = slower.
 const SKIP_DIP_DB: f64 = -18.0;
+
+/// NEAR-EOF GUARD threshold for the warm-skip prefetch. When the CURRENT track is
+/// within this many seconds of its natural end, [`HypodjHandler::skip_with_fade`]
+/// DECLINES the background warm and takes the plain trough loadfile-replace path.
+/// A warm appends the target as a 2nd playlist entry, and mpv would AUTO-ADVANCE
+/// into it at the current track's natural EOF - so a skip pressed this close to the
+/// end could make the warm target audible at the shallow duck AND fire a phantom
+/// queue advance for the outgoing track. Declining sidesteps that entirely; the
+/// warm has no time to pay off this near the end anyway.
+const NEAR_EOF_GUARD_SECS: f64 = 2.0;
 
 /// The perceptual dB at which the wake/resume ramp-in first becomes HEARABLE, 20 dB
 /// above the -60 dB synth floor. The resume path reads the wall-clock LEAD - the
@@ -1917,6 +1931,20 @@ impl HypodjHandler {
         let dur = req.dur;
         let intent = req.intent;
         let commit_logical = req.commit_logical;
+        // ANY fade that installs here SUPERSEDES whatever is running. If it superseded
+        // a live skip dip, that dip's Terminal::SkipLoad/switch_warmed will NEVER run,
+        // so `pending_skip` and the prefetched warm target are now STALE - the warm
+        // stays appended behind the still-playing current track and mpv would
+        // auto-advance into it (audible bleed at the live gain) at the current track's
+        // natural EOF, and the `warmed` guard would then swallow that EOF and stall the
+        // queue. This is TRUE regardless of intent: a committing fade (setvol glide /
+        // knob) AND every non-committing fade (resume-in, wind-down `fade to`/`toFloor`/
+        // `fade in`, scheduled wake) alike abort the dip. `start_fade_spec` is NEVER the
+        // skip machinery itself (the dip installs via `install_skip_dip`; the follow-on
+        // ResumeIn spawns straight from the SkipLoad terminal), so a superseded skip is
+        // always dead here. The install closure therefore clears `pending_skip`
+        // unconditionally and the warm is dropped after the abort+join below - both
+        // idempotent no-ops when nothing was skipping/warmed.
 
         let cfg = self.fade_cfg.clone();
         let state_read = self.state.clone();
@@ -1978,6 +2006,14 @@ impl HypodjHandler {
                         // supersedes an in-flight PauseOut) nor at a never-loaded
                         // skip target - the difference from set_manual_volume is it
                         // leaves `fading`/`live_gain_db` alone so the ramp animates.
+                        // Clear `pending_skip` for EVERY install, committing or not: if
+                        // this fade superseded a live skip dip, that dip is dead (its
+                        // SkipLoad never runs) and the reported current must revert from
+                        // the never-loaded target back to `current`. A no-op when no skip
+                        // was in flight. Pairs with the drop_warm below (which discards the
+                        // now-orphaned parked warm entry) so a non-committing wake/resume/
+                        // wind-down can never leave a stale target to auto-advance.
+                        st.pending_skip = None;
                         if let Some((db, vol)) = commit_logical {
                             st.logical_gain_db = db;
                             st.target_volume = vol;
@@ -1986,7 +2022,6 @@ impl HypodjHandler {
                             // each advance a detent).
                             st.baseline_committed = true;
                             st.pending_pause = false;
-                            st.pending_skip = None;
                         } else {
                             // A non-committing fade (resume-in, wind-down, wake, skip
                             // dip) leaves logical_gain_db at the stale pre-fade level
@@ -2009,6 +2044,21 @@ impl HypodjHandler {
 
         // On rejection nothing was disturbed: the in-flight fade (if any) is still
         // running and no volume was touched, so just surface the ACK error.
+        //
+        // On ANY successful install, `pending_skip` was cleared (a superseded skip):
+        // drop any now-stale parked warm target so it can never auto-advance behind the
+        // still-playing current track. This must run for NON-committing fades too
+        // (scheduled wake, reconnect restart, user resume-in, wind-down `fade to`/
+        // `toFloor`/`fade in`) - each supersedes and aborts a live skip dip just like a
+        // committing setvol/knob does, so leaving the warm parked would let mpv
+        // auto-advance into it at the current track's natural EOF (audible bleed) and
+        // then stall the queue on the swallowed `warmed` EOF. Best-effort + idempotent
+        // (a no-op when nothing was warmed). Done after the supersede's abort+join, so it
+        // never races a SkipLoad. Intent no longer gates this drop - the install closure
+        // still distinguishes the baseline-commit behavior separately above.
+        if res.is_ok() {
+            let _ = self.player.drop_warm().await;
+        }
         res
     }
 
@@ -2237,10 +2287,16 @@ impl HypodjHandler {
         }
         self.notify_change();
         let dur = self.pause_fade_dur();
-        match self
+        let r = self
             .start_fade_spec(FadeRequest { intent: FadeIntent::PauseOut, dur, commit_logical: None })
-            .await
-        {
+            .await;
+        // A pause issued during a skip dip supersedes it (above): the skip target never
+        // loads, so drop any parked warm entry - else the OLD track (still loaded, now
+        // paused) would auto-advance into the stale target at its natural EOF once
+        // resumed. Best-effort + idempotent; PauseOut is non-committing so start_fade_spec
+        // does not do this itself. Done after the fade install (abort+join), no SkipLoad race.
+        let _ = self.player.drop_warm().await;
+        match r {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "pause fade rejected; pausing without fade");
@@ -2905,6 +2961,46 @@ impl HypodjHandler {
         self.clamp_fade_dur(raw)
     }
 
+    /// Whether the CURRENT track is safe to WARM behind (near-EOF guard, finding
+    /// 1a). Returns `false` - decline the warm - when the current entry is a live /
+    /// continuous stream (no natural end), has an UNKNOWN duration, or is within
+    /// [`NEAR_EOF_GUARD_SECS`] of its natural EOF (elapsed read from the lockless
+    /// live-media atomic). Only a finite Song with a comfortable margin left warms;
+    /// a decline degrades the skip to today's proven trough loadfile-replace, never
+    /// worse. Conservative on purpose: any doubt (no current, no duration) declines.
+    fn current_can_warm(&self) -> bool {
+        let dur_secs = {
+            let st = self.state.lock().unwrap();
+            let Some(cur) = st.current else { return false };
+            let Some(item) = st.queue.get(cur) else { return false };
+            match &item.entry {
+                // A live/continuous stream never reaches a natural EOF, so appending
+                // behind it can never auto-advance - but it also never buffers fully,
+                // so the warm has nothing to prefetch and no payoff. Decline.
+                QueueEntry::Stream { .. } => return false,
+                // A Song with a KNOWN finite duration can be warmed behind, subject to
+                // the margin check below. Unknown duration -> decline (cannot bound the
+                // EOF distance, so treat as unsafe).
+                QueueEntry::Song(song) => match song.duration_secs {
+                    Some(d) if d > 0 => d as f64,
+                    _ => return false,
+                },
+            }
+        };
+        // Live media position (P1 Tick.time_pos) via the lockless atomic.
+        let elapsed = self.last_elapsed_secs();
+        // The warm sits PARKED behind the current track for the WHOLE dip (from
+        // prefetch_warm until the trough switch_warmed ~ the dip's duration), and mpv
+        // auto-advances into a parked entry at the current's natural EOF (keep-open does
+        // not stop a non-last entry - see MpvPlayer::spawn). So the guard window must
+        // exceed the dip duration, not just a fixed constant: only warm when the current
+        // has MORE than (dip duration + NEAR_EOF_GUARD_SECS margin) left, so it cannot
+        // EOF while a warm is parked. The margin also absorbs the Tick-quantized
+        // staleness of `elapsed` and the switch/network overhead.
+        let guard = self.skip_fade_dur().as_secs_f64() + NEAR_EOF_GUARD_SECS;
+        (dur_secs - elapsed) > guard
+    }
+
     /// Build a DELIBERATE (not sub-JND) fade spec from `from_db` to `target`,
     /// clamping the duration UP to the deliberate-safe minimum (never a hard cut) -
     /// the SAME `eff_dur` math [`Self::start_fade_spec`] applies to a `clamp_dur_up`
@@ -2979,6 +3075,35 @@ impl HypodjHandler {
         // target at once.
         self.state.lock().unwrap().pending_skip = Some(idx);
         self.notify_change();
+
+        // (c2) NEAR-EOF GUARD (finding 1a - the PRIMARY no-bleed defense): a warm
+        // appends the target as a 2nd playlist entry, and mpv AUTO-ADVANCES into it the
+        // instant the CURRENT track hits its natural EOF (keep-open=always does NOT stop
+        // a non-last entry - see MpvPlayer::spawn). So we DECLINE the warm outright
+        // whenever the current track has less than (the dip duration + a margin) left,
+        // or its duration is unknown, or it is a live/continuous stream with no end (see
+        // current_can_warm) - so a warm is NEVER parked in a window where the current
+        // could EOF before the trough switch. There the warm's payoff cannot land
+        // anyway, and declining keeps the skip on today's proven trough loadfile-replace.
+        // On decline we ALSO drop any warm a PRIOR skip parked
+        // (a second skip that lands in the guard window must not leave the first skip's
+        // warm entry auto-advancing behind the current track - finding 3, second-skip).
+        let warm_ok = self.current_can_warm();
+        if warm_ok {
+            // (c3) WARM the target stream in the BACKGROUND during the dip: mpv opens +
+            // demuxes + decodes the appended entry off the audible chain, so the trough
+            // switch (Terminal::SkipLoad -> switch_warmed) lands near-instant instead of
+            // paying the network first-byte cost at the bottom of the dip - collapsing the
+            // moment-of-silence artifact. Purely best-effort and PURE GAIN: the warmed
+            // entry is NOT routed to output (no bleed at the shallow duck), and a warm
+            // failure just degrades switch_warmed to today's trough loadfile - never worse,
+            // never a panic or silence. Errors are ignored here on purpose.
+            let _ = self.player.prefetch_warm(&play.url).await;
+        } else {
+            // Declined: clear any stale warm from an earlier skip so switch_warmed falls
+            // back to loadfile-replace and no parked entry can auto-advance.
+            let _ = self.player.drop_warm().await;
+        }
 
         // (e) Install the deliberate dip-out to silence -> Terminal::SkipLoad.
         match self.install_skip_dip(dur, idx, play, resume_spec, baseline).await {
@@ -4081,6 +4206,10 @@ impl HypodjHandler {
             self.fade
                 .cancel_with(|| self.state.lock().unwrap().set_manual_volume(landing_vol))
                 .await;
+            // This defensive cancel_with also SUPERSEDES a live skip dip (its SkipLoad
+            // never runs), so drop any parked warm target - else the still-playing
+            // current track's natural EOF would auto-advance into it (finding 3).
+            let _ = self.player.drop_warm().await;
             let _ = self.player.set_volume(landing_vol).await;
         }
         self.notify_change();
@@ -4879,6 +5008,28 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    /// Like [`handler_with_null_player`] but wires a probing NullPlayer so a test
+    /// can observe the warm-skip commands the handler issues (prefetch / drop).
+    /// Same sandbox `None` guard.
+    fn handler_with_probe_player() -> Option<(
+        HypodjHandler,
+        tokio::sync::mpsc::Receiver<PlayerEvent>,
+        std::sync::Arc<crate::player::WarmProbe>,
+    )> {
+        let cfg = ServerConfig {
+            url: "http://127.0.0.1:1/never-called".to_string(),
+            username: "u".to_string(),
+            password: "p".to_string(),
+            client_name: "test".to_string(),
+        };
+        let client = match std::panic::catch_unwind(|| SubsonicClient::connect(&cfg)) {
+            Ok(Ok(c)) => Arc::new(c),
+            _ => return None,
+        };
+        let (player, events, probe) = NullPlayer::spawn_with_probe();
+        Some((HypodjHandler::new(client, player), events, probe))
     }
 
     // A minimal library Song for queue/playlist wiring tests (no network).
@@ -7081,6 +7232,162 @@ mod tests {
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
         assert!(h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0, "ramped back up");
         assert_eq!(h.state.lock().unwrap().current, Some(1));
+    }
+
+    // The warm-skip path is PURE GAIN: a user Next drives dip -> switch_warmed ->
+    // ResumeIn with NO pause/unpause anywhere. The deck stays Playing across the whole
+    // skip and no Paused state edge is ever emitted - the fix warms the target stream,
+    // it never introduces a transport pause (HARD CONSTRAINT 1).
+    #[tokio::test(start_paused = true)]
+    async fn warm_skip_is_pure_gain_never_pauses() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        h.wait_for_fade().await; // dip -> switch_warmed lands the target
+        h.wait_for_fade().await; // follow-on ResumeIn back to baseline
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "target committed");
+        assert_eq!(h.player.state(), PlayState::Playing, "deck never left Playing");
+
+        // Not a single Paused edge crossed the wire during the skip.
+        while let Ok(ev) = events.try_recv() {
+            if let PlayerEvent::StateChanged(PlayState::Paused, _, _) = ev {
+                panic!("a skip must never pause the deck (pure gain violated)");
+            }
+        }
+    }
+
+    // NEAR-EOF GUARD (finding 1a): the warm is DECLINED whenever appending the target
+    // behind the current track could let mpv auto-advance into it - i.e. when the
+    // current is within NEAR_EOF_GUARD_SECS of its natural end, has an unknown
+    // duration, is a live/continuous stream, or there is no current. Only a finite
+    // Song with a comfortable margin left warms. Direct unit check of the predicate.
+    #[tokio::test(start_paused = true)]
+    async fn near_eof_guard_declines_the_warm() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-0")).await; // idx 0: 200s
+        let mut unknown = playlist_test_song("s-1");
+        unknown.duration_secs = None;
+        h.enqueue_song_for_test(unknown).await; // idx 1: unknown duration
+        h.enqueue_stream_for_test(NTS).await; // idx 2: live stream
+
+        // Mid-track finite song with lots left -> warm OK.
+        h.state.lock().unwrap().current = Some(0);
+        h.reset_elapsed();
+        h.note_elapsed_ms(10_000); // 10s into a 200s track
+        assert!(h.current_can_warm(), "mid-track finite song warms");
+
+        // Within the guard window of the natural end -> decline.
+        h.note_elapsed_ms(199_000); // 1s remaining of 200s
+        assert!(!h.current_can_warm(), "near-EOF declines the warm");
+
+        // Unknown duration -> decline (cannot bound the EOF distance).
+        h.state.lock().unwrap().current = Some(1);
+        h.note_elapsed_ms(1_000);
+        assert!(!h.current_can_warm(), "unknown-duration song declines the warm");
+
+        // Live/continuous stream -> decline (no natural end, nothing to prefetch).
+        h.state.lock().unwrap().current = Some(2);
+        assert!(!h.current_can_warm(), "live stream declines the warm");
+
+        // No current -> decline (conservative).
+        h.state.lock().unwrap().current = None;
+        assert!(!h.current_can_warm(), "no current declines the warm");
+    }
+
+    // SUPERSEDE CLEARS THE WARM (finding 3): a mid-track skip warms the target, then a
+    // PAUSE issued DURING the dip supersedes it - the SkipLoad never runs, so the
+    // parked warm MUST be dropped or the still-playing (now paused) old track's natural
+    // EOF would later auto-advance into the stale target. Observed via the WarmProbe.
+    #[tokio::test(start_paused = true)]
+    async fn pause_during_skip_dip_drops_the_warm() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Next installs a dip and WARMS the target (finite current, fresh elapsed).
+        h.handle(MpdCommand::Next).await;
+        assert!(h.fade_active().await, "next installs a dip fade");
+        assert_eq!(probe.prefetch.load(Relaxed), 1, "a mid-track skip warms the target");
+        let drops_before = probe.drop.load(Relaxed);
+
+        // Pause DURING the dip supersedes the skip; the parked warm must be dropped.
+        h.handle(MpdCommand::Pause(Some(true))).await;
+        assert!(
+            probe.drop.load(Relaxed) > drops_before,
+            "pause-supersede drops the parked warm target"
+        );
+    }
+
+    // SUPERSEDE CLEARS THE WARM, NON-COMMITTING branch (findings 1/1b): a mid-track
+    // skip warms the target, then a WIND-DOWN `fade to <v>` issued DURING the dip
+    // supersedes it. This fade is NON-committing (commit_logical=None) - the exact class
+    // the old code left the warm parked for - so it must ALSO clear pending_skip and drop
+    // the parked warm, or the still-playing old track's natural EOF would auto-advance
+    // into the stale target (audible bleed) and the `warmed` guard would then swallow the
+    // EOF and stall the queue. Observed via the WarmProbe.
+    #[tokio::test(start_paused = true)]
+    async fn winddown_fade_during_skip_dip_drops_the_warm() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.player.state(), PlayState::Playing);
+
+        // Next installs a dip and WARMS the target (finite current, fresh elapsed).
+        h.handle(MpdCommand::Next).await;
+        assert!(h.fade_active().await, "next installs a dip fade");
+        assert_eq!(probe.prefetch.load(Relaxed), 1, "a mid-track skip warms the target");
+        assert_eq!(h.state.lock().unwrap().pending_skip, Some(1), "skip target reported");
+        let drops_before = probe.drop.load(Relaxed);
+
+        // A non-committing `fade to 40` DURING the dip supersedes the skip: pending_skip
+        // must revert to `current` and the parked warm must be dropped.
+        h.start_fade(fade_args(FadeKind::To(40), 60)).await.unwrap();
+        assert_eq!(
+            h.state.lock().unwrap().pending_skip,
+            None,
+            "a non-committing wind-down clears the superseded skip"
+        );
+        assert!(
+            probe.drop.load(Relaxed) > drops_before,
+            "wind-down supersede drops the parked warm target"
+        );
+        assert_eq!(h.state.lock().unwrap().current, Some(0), "old track still current");
+    }
+
+    // SUPERSEDE CLEARS THE WARM, wake-ramp branch (finding 1): a scheduled/user wake
+    // `fade in` (also non-committing, ResumeIn/SetBaseline terminal) that supersedes a
+    // live skip dip must clear pending_skip and drop the parked warm just the same.
+    #[tokio::test(start_paused = true)]
+    async fn wake_ramp_during_skip_dip_drops_the_warm() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some((h, _events, probe)) = handler_with_probe_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        assert_eq!(probe.prefetch.load(Relaxed), 1, "a mid-track skip warms the target");
+        let drops_before = probe.drop.load(Relaxed);
+
+        h.start_fade(fade_args(FadeKind::In, 30)).await.unwrap();
+        assert_eq!(
+            h.state.lock().unwrap().pending_skip,
+            None,
+            "a non-committing wake clears the superseded skip"
+        );
+        assert!(
+            probe.drop.load(Relaxed) > drops_before,
+            "wake-ramp supersede drops the parked warm target"
+        );
     }
 
     // A rapid SECOND skip during the dip SUPERSEDES the first: the first SkipLoad
