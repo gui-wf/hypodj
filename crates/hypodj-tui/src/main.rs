@@ -9,7 +9,10 @@
 //! messages into TuiState - no shared mutable state, no Mutex. The pure logic lives
 //! in state.rs; rendering in ui.rs.
 
+mod album_color;
 mod art;
+mod keymap;
+mod sigil;
 mod state;
 mod ui;
 mod worker;
@@ -84,6 +87,16 @@ fn run() -> Result<(), MpdError> {
 
     let mut terminal = setup_terminal().map_err(|e| MpdError::Io(e.to_string()))?;
     let mut state = TuiState::new();
+    // Probe the visual-system primitives once at startup (raw mode is on; the OSC 11
+    // read is bounded so a non-answering terminal / tmux can never hang us). Capability
+    // + truecolor come from the env only (no query). See album_color for the tmux note.
+    state.image_protocol = album_color::image_protocol(&env);
+    state.truecolor = album_color::truecolor(&env);
+    state.term_bg = album_color::probe_bg(
+        terminal.backend_mut(),
+        &env,
+        Duration::from_millis(100),
+    );
     // Prime the panes before the first draw: request the initial snapshot (the
     // response lands within the first few poll cycles).
     request_refresh(&workers.req_tx, &mut state);
@@ -185,6 +198,9 @@ fn event_loop(
         }
         // Keep album art in step: on a track-uri change, ask the art worker (once).
         request_art(&workers.art_tx, state);
+        // Keep the album sigil in step: rebuild only when the album identity changes
+        // (static, cached - never regenerated per frame).
+        update_sigil(state);
 
         // Safety net: an idle-push wake normally drives liveness, but a missed wake
         // or a silently-dropped command socket is caught here. request_refresh is
@@ -532,6 +548,35 @@ fn request_art(art_tx: &Sender<String>, state: &mut TuiState) {
             }
         }
     }
+}
+
+/// Rebuild the album sigil when the album identity changes, so it is static per album
+/// and cached (no per-frame regen). Only meaningful when no inline-image protocol is
+/// available (the renderer only draws the sigil in that image-less path), but we build
+/// it regardless so a capability change is cheap. The palette comes from the cover the
+/// art worker already fetched (DECORATION policy inside the sigil); no cover -> a
+/// hash-only identicon over the neutral palette. Nothing playing clears the sigil.
+fn update_sigil(state: &mut TuiState) {
+    let empty = state.now.title.is_none() && state.now.artist.is_none() && state.now.album.is_none();
+    if empty {
+        state.sigil = None;
+        return;
+    }
+    let identity = sigil::album_identity(&state.now);
+    let has_art = state.art.is_some();
+    if let Some(s) = &state.sigil {
+        // Up to date: same album, and not still waiting to upgrade to a real palette.
+        if s.identity == identity && (s.has_palette || !has_art) {
+            return;
+        }
+    }
+    let palette = state.art.as_ref().map(|a| &a.palette);
+    state.sigil = Some(sigil::Sigil::build(
+        &identity,
+        palette,
+        state.term_bg,
+        state.truecolor,
+    ));
 }
 
 /// Emit the OSC terminal title for the current now-playing, but only when it

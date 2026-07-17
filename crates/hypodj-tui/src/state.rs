@@ -6,11 +6,13 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 use hypodj_client::model::{NowPlaying, QueueItem};
 use hypodj_client::nl::not_understood_hint;
 use hypodj_client::route::{route, Action};
+
+use crate::keymap;
 
 /// Vim-style scrolloff: keep this many rows of context above/below the cursor.
 const SCROLLOFF: usize = 3;
@@ -469,6 +471,20 @@ pub struct TuiState {
     /// Whether the daemon reports audio is playing (from the latest viz frame); gates
     /// the level wave between the live field and the resting hairline.
     pub viz_playing: bool,
+    /// Whether the `?` help overlay is open. Normal-mode-only modal: while open, only
+    /// `?`/Esc/q resolve (toggle-close), everything else is swallowed.
+    pub help_open: bool,
+    /// The detected terminal background (OSC 11 at startup / on resize), seeded to the
+    /// guaranteed dark default so the visual system always has a bg to contrast against.
+    pub term_bg: crate::album_color::TermBg,
+    /// The detected inline-image protocol; `None` => the album sigil is drawn in the
+    /// album-art slot's image-less path.
+    pub image_protocol: crate::album_color::ImageProtocol,
+    /// Whether the terminal advertises truecolor (else colors quantize to xterm-256).
+    pub truecolor: bool,
+    /// The cached album sigil, rebuilt only when the album identity changes (static -
+    /// never regenerated per frame).
+    pub sigil: Option<crate::sigil::Sigil>,
 }
 
 /// Perceptual floor / ceiling (dBFS) for the level normalize. Below the floor is
@@ -526,6 +542,11 @@ impl Default for TuiState {
             viz_active: false,
             viz_env: 0.0,
             viz_playing: false,
+            help_open: false,
+            term_bg: crate::album_color::TermBg::dark_default(),
+            image_protocol: crate::album_color::ImageProtocol::None,
+            truecolor: false,
+            sigil: None,
         }
     }
 }
@@ -602,132 +623,126 @@ impl TuiState {
     }
 
     fn key_normal(&mut self, key: KeyEvent) -> Option<Intent> {
+        // The help overlay is a true modal: while open, ONLY `?`/Esc/q toggle it
+        // closed and every other key is swallowed (never leaks to nav/transport).
+        if self.help_open {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => self.help_open = false,
+                _ => {}
+            }
+            return None;
+        }
         // The DJ View captures typing into its own "ask>" line (a DJ query is always
         // NL), so nav/verb keys never shadow the input. `1`/`2`/`3` still tab away is
         // NOT wanted here - Esc leaves the pane. Handled before the shared bindings.
         if self.screen == Screen::Dj {
             return self.key_dj(key);
         }
-        // Readline-style CONTROL bindings first, so a plain `p`/`n`/`s` never
-        // shadows ctrl+p/ctrl+n (cursor), ctrl+f/ctrl+b (scrub), or ctrl+s (fav).
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('n') => {
-                    self.move_selection(1);
-                    None
-                }
-                KeyCode::Char('p') => {
-                    self.move_selection(-1);
-                    None
-                }
-                // Scrub the current track (relative seekcur); space vacated scrub.
-                KeyCode::Char('f') => Some(Intent::Command(format!("seekcur +{SCRUB_STEP}"))),
-                KeyCode::Char('b') => Some(Intent::Command(format!("seekcur -{SCRUB_STEP}"))),
-                // Favorite the CURRENT playing track; stop moved to the `:stop` line.
-                KeyCode::Char('s') => self.favorite_current(),
-                _ => None,
-            };
+        // Dispatch is DERIVED from the single-source KEYMAP: resolve the key to its
+        // Act via `match_key` (which already encodes the readline-first ordering - a
+        // Ctrl chord is a `Ctrl` matcher, so a plain `p`/`n`/`s` never shadows
+        // `C-p`/`C-n`/`C-s`) and run it through `apply_act`. Because `apply_act` is an
+        // EXHAUSTIVE match on `Act`, a new KEYMAP row (help + dispatch) cannot be added
+        // without a compiler error until it is handled here, and an Act cannot be
+        // removed from dispatch while a row still advertises it - so help and behavior
+        // can never drift. Keys with no row (Backspace, a freed `f`) fall through to a
+        // safe no-op.
+        if let Some(act) = keymap::match_key(key, self.screen) {
+            return self.apply_act(act);
         }
-        match key.code {
-            // Space ADDS the selected browse row to the queue (no play) and advances
-            // the cursor for rapid multi-add; Queue has nothing to add -> no-op.
-            KeyCode::Char(' ') => self.enqueue_selected(),
-            // Backspace is a safe no-op (browse-back lives on h/Left/Esc).
-            KeyCode::Backspace => None,
-            KeyCode::Char('p') => Some(Intent::Command("pause".into())),
-            // `<`/`>` arrive as Char with SHIFT; the char value already encodes it.
-            KeyCode::Char('<') => Some(Intent::Command("previous".into())),
-            KeyCode::Char('>') => Some(Intent::Command("next".into())),
-            // Volume is a physical-potentiometer KNOB: each press is one equal-
-            // loudness (dB) detent, computed server-side. 0/+/= turn it up, 9/-/_
-            // down; turning all the way down is the off-click that pauses, and
-            // turning up from there resumes. 0 = louder, 9 = quieter.
-            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char('0') => {
-                Some(Intent::Command("knob up".into()))
-            }
-            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('9') => {
-                Some(Intent::Command("knob down".into()))
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
+        None
+    }
+
+    /// Execute a resolved [`keymap::Act`]. The ONE place a normal-mode binding turns
+    /// into an Intent or state change; [`key_normal`] routes every table key here, so
+    /// this exhaustive match is the dispatch half of the single-source keymap.
+    fn apply_act(&mut self, act: keymap::Act) -> Option<Intent> {
+        use keymap::Act;
+        match act {
+            // Screen switch: main.rs lazily fetches the target view.
+            Act::ScreenQueue => self.switch_screen(Screen::Queue),
+            Act::ScreenAlbums => self.switch_screen(Screen::Albums),
+            Act::ScreenPlaylists => self.switch_screen(Screen::Playlists),
+            Act::ScreenDj => self.switch_screen(Screen::Dj),
+            Act::Down => {
                 self.move_selection(1);
                 None
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Act::Up => {
                 self.move_selection(-1);
                 None
             }
-            KeyCode::Char('g') => {
+            Act::Top => {
                 self.go_top();
                 None
             }
-            KeyCode::Char('G') => {
+            Act::Bottom => {
                 self.go_bottom();
                 None
             }
             // Shift+P jumps the Queue cursor to the currently-playing song (browse
             // screens have no now-playing row, so it no-ops there).
-            KeyCode::Char('P') => {
+            Act::JumpCurrent => {
                 self.go_current();
                 None
             }
-            // `s` stars the SELECTED row; `f` is freed (vim find idiom now on `/`).
-            KeyCode::Char('s') => self.favorite_selected(),
-            KeyCode::Char('f') => None,
-            // `n`/`N` repeat the last accepted search over the active list, stepping
-            // OFF the current match (origin +/- 1) so they never re-find in place;
-            // no standing search -> no-op.
-            KeyCode::Char('n') => {
-                self.repeat_search(true);
-                None
-            }
-            KeyCode::Char('N') => {
-                self.repeat_search(false);
-                None
-            }
-            // `o` OPENS (drills into) the selected browse directory.
-            KeyCode::Char('o') => self.open_selected(),
-            // Screen switch: F1/F2/F3 select the view; main.rs lazily fetches it.
-            KeyCode::F(1) => {
-                self.last_search.clear();
-                self.screen = Screen::Queue;
-                Some(Intent::ShowScreen(Screen::Queue))
-            }
-            KeyCode::F(2) => {
-                self.last_search.clear();
-                self.screen = Screen::Albums;
-                Some(Intent::ShowScreen(Screen::Albums))
-            }
-            KeyCode::F(3) => {
-                self.last_search.clear();
-                self.screen = Screen::Playlists;
-                Some(Intent::ShowScreen(Screen::Playlists))
-            }
-            // The DJ View (Claude Code intelligence pane), right of Queue.
-            KeyCode::F(4) => {
-                self.last_search.clear();
-                self.screen = Screen::Dj;
-                Some(Intent::ShowScreen(Screen::Dj))
-            }
-            // Back out of a browse drill-down (Queue: no-op).
-            KeyCode::Char('h') | KeyCode::Left => self.browse_back(),
-            // Esc backs out one browse level; on Queue / a browse root it no-ops.
-            KeyCode::Esc => self.browse_back(),
-            KeyCode::Enter => self.enter_action(),
-            KeyCode::Char(':') => {
-                self.mode = Mode::Command;
-                self.input.clear();
-                None
-            }
-            KeyCode::Char('/') => {
+            Act::SearchStart => {
                 self.last_search.clear();
                 self.search_origin = self.active_cursor();
                 self.input.clear();
                 self.mode = Mode::Search;
                 None
             }
-            KeyCode::Char('q') => Some(Intent::Quit),
-            _ => None,
+            // `n`/`N` repeat the last accepted search over the active list, stepping
+            // OFF the current match (origin +/- 1); no standing search -> no-op.
+            Act::SearchNext => {
+                self.repeat_search(true);
+                None
+            }
+            Act::SearchPrev => {
+                self.repeat_search(false);
+                None
+            }
+            Act::CommandLine => {
+                self.mode = Mode::Command;
+                self.input.clear();
+                None
+            }
+            // Volume is a physical-potentiometer KNOB: each press is one equal-
+            // loudness (dB) detent, computed server-side.
+            Act::VolumeUp => Some(Intent::Command("knob up".into())),
+            Act::VolumeDown => Some(Intent::Command("knob down".into())),
+            Act::Pause => Some(Intent::Command("pause".into())),
+            Act::Next => Some(Intent::Command("next".into())),
+            Act::Prev => Some(Intent::Command("previous".into())),
+            // Scrub the current track (relative seekcur).
+            Act::ScrubFwd => Some(Intent::Command(format!("seekcur +{SCRUB_STEP}"))),
+            Act::ScrubBack => Some(Intent::Command(format!("seekcur -{SCRUB_STEP}"))),
+            // `s` stars the SELECTED row; C-s stars the CURRENT playing track.
+            Act::FavSelected => self.favorite_selected(),
+            Act::FavCurrent => self.favorite_current(),
+            Act::PlaySel => self.enter_action(),
+            // Space ADDS the selected browse row to the queue (Queue: no-op).
+            Act::Enqueue => self.enqueue_selected(),
+            // `o` OPENS (drills into) the selected browse directory.
+            Act::Open => self.open_selected(),
+            // Back out of a browse drill-down (Queue / a browse root: no-op).
+            Act::BrowseBack => self.browse_back(),
+            // `?` opens the help overlay (a normal-mode modal); the modal intercept at
+            // the top of key_normal then handles every key until it is toggled closed.
+            Act::HelpToggle => {
+                self.help_open = true;
+                None
+            }
+            Act::Quit => Some(Intent::Quit),
         }
+    }
+
+    /// Switch to `screen` (clearing any standing search); main.rs lazily fetches it.
+    fn switch_screen(&mut self, screen: Screen) -> Option<Intent> {
+        self.last_search.clear();
+        self.screen = screen;
+        Some(Intent::ShowScreen(screen))
     }
 
     /// The browse list for a specific target screen, if it is a browse screen. Used
@@ -1102,6 +1117,22 @@ impl TuiState {
     /// anything else stays a CC translation (a DJ query is otherwise never a bare
     /// verb).
     fn key_dj(&mut self, key: KeyEvent) -> Option<Intent> {
+        // The Scope::Global view + help bindings must work here too (KEYMAP marks
+        // F1-F4 and `?` Global with no screen caveat, and the help overlay advertises
+        // them everywhere). F-keys are never part of an NL query, so switch outright;
+        // `?` opens help ONLY on an empty ask line, so a literal `?` can still be typed
+        // mid-phrase ("what should I play?"). Everything else is captured as input.
+        match key.code {
+            KeyCode::F(1) => return self.switch_screen(Screen::Queue),
+            KeyCode::F(2) => return self.switch_screen(Screen::Albums),
+            KeyCode::F(3) => return self.switch_screen(Screen::Playlists),
+            KeyCode::F(4) => return self.switch_screen(Screen::Dj),
+            KeyCode::Char('?') if self.dj_input.is_empty() => {
+                self.help_open = true;
+                return None;
+            }
+            _ => {}
+        }
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Queue;
@@ -1258,6 +1289,51 @@ mod tests {
         assert_eq!(s.handle_key(ch('N')), None);
         assert_eq!(s.handle_key(ch('b')), None);
         assert_eq!(s.handle_key(ch('f')), None);
+    }
+
+    #[test]
+    fn dj_view_honors_global_view_and_help_bindings() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Dj;
+        // F-keys switch views even from the DJ screen (Scope::Global, never NL text).
+        assert_eq!(s.handle_key(key(KeyCode::F(2))), Some(Intent::ShowScreen(Screen::Albums)));
+        assert_eq!(s.screen, Screen::Albums);
+        // Back into DJ; `?` on an EMPTY ask line opens help.
+        s.screen = Screen::Dj;
+        assert!(s.dj_input.is_empty());
+        assert_eq!(s.handle_key(ch('?')), None);
+        assert!(s.help_open);
+        // Close help, then a `?` typed mid-phrase is captured as input, not help.
+        s.help_open = false;
+        s.screen = Screen::Dj;
+        s.handle_key(ch('w'));
+        s.handle_key(ch('?'));
+        assert!(!s.help_open, "? mid-phrase is text, not a help toggle");
+        assert_eq!(s.dj_input, "w?");
+    }
+
+    #[test]
+    fn every_keymap_row_is_dispatched() {
+        // Drift guard: each KEYMAP matcher must resolve through key_normal's table
+        // dispatch (apply_act) to a real effect - never silently fall through. We only
+        // assert it does not panic and that the Act round-trips (match_key), which with
+        // apply_act's exhaustive match is the single-source contract.
+        for b in keymap::KEYMAP {
+            let mut s = TuiState::new();
+            let ev = match b.matchers[0] {
+                keymap::KeyMatch::Char(c) => ch(c),
+                keymap::KeyMatch::Ctrl(c) => KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL),
+                keymap::KeyMatch::Code(code) => key(code),
+            };
+            assert_eq!(
+                keymap::match_key(ev, Screen::Queue),
+                Some(b.act),
+                "row {:?} does not resolve to its Act",
+                b.keys
+            );
+            // Exercising dispatch must not panic for any table key.
+            let _ = s.handle_key(ev);
+        }
     }
 
     #[test]

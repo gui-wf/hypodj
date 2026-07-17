@@ -40,3 +40,5 @@ thiserror.workspace = true
 # Album-art decode only. Trim to the two codecs Subsonic/Navidrome actually serve
 # (JPEG/PNG) so we do not pull the whole codec zoo; no default features.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# poll(2) for the single-threaded, deadline-bounded OSC 11 stdin read (album_color).
+libc = "0.2"

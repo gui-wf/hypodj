@@ -547,6 +547,7 @@ dependencies = [
  "hypodj-client",
  "hypodj-nl",
  "image",
+ "libc",
  "ratatui",
  "thiserror",
 ]

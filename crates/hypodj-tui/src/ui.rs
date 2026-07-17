@@ -9,6 +9,7 @@ use ratatui::Frame;
 
 use hypodj_client::model::NowPlaying;
 
+use crate::keymap;
 use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
 
 /// Draw the full jukebox: the screen-tab row, the active list
@@ -51,6 +52,84 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     if state.mode == Mode::Confirm {
         render_confirm_popup(f, list_area, state);
     }
+    // The `?` help overlay sits above everything else (a normal-mode modal). It gets
+    // the FULL frame as its region so the two-column table has room to breathe.
+    if state.help_open {
+        render_help_overlay(f, f.area(), state);
+    }
+}
+
+/// The `?` help overlay: a centered, bordered popup laid out in two columns from the
+/// single-source keymap table (grouped, with a keys column and a one-line description).
+/// Theme-aware: fg/border are nudged off the detected background via the INFO policy so
+/// the panel stays legible on light or dark terminals. Derived entirely from
+/// [`keymap::grouped`], so it can never drift from the real bindings.
+fn render_help_overlay(f: &mut Frame, region: Rect, state: &TuiState) {
+    use crate::keymap::grouped;
+    // A legible fg for the detected background (a neutral swatch pushed to >= 3:1).
+    let fg = crate::album_color::info_color([0x88, 0x88, 0x88], state.term_bg, state.truecolor);
+    let base = Style::default().fg(fg);
+    let head = base.add_modifier(Modifier::BOLD);
+    let key_style = base.add_modifier(Modifier::BOLD);
+    let desc_style = base.add_modifier(Modifier::DIM);
+
+    // Widest keys column across all rows, so the description column aligns.
+    let key_w = keymap::KEYMAP.iter().map(|b| b.keys.len()).max().unwrap_or(6).min(18);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let groups = grouped();
+    let mid = groups.len().div_ceil(2);
+    // Two columns of groups: left half then right half, interleaved row by row would be
+    // complex; instead stack groups but flow them into two side-by-side blocks by
+    // rendering left-group block then right-group block per band. MVP: single stacked
+    // column of groups is clamped to the region; to honor "two-column" we split the
+    // GROUPS into two vertical columns joined per line.
+    let (left, right) = groups.split_at(mid);
+    let render_col = |cols: &[(keymap::Group, Vec<&'static keymap::Binding>)]| -> Vec<Line<'static>> {
+        let mut out: Vec<Line> = Vec::new();
+        for (g, rows) in cols {
+            out.push(Line::from(Span::styled(g.title().to_string(), head)));
+            for b in rows {
+                out.push(Line::from(vec![
+                    Span::styled(format!("{:<kw$} ", b.keys, kw = key_w), key_style),
+                    Span::styled(b.help.to_string(), desc_style),
+                ]));
+            }
+            out.push(Line::from(""));
+        }
+        out
+    };
+    let lcol = render_col(left);
+    let rcol = render_col(right);
+    let rows = lcol.len().max(rcol.len());
+    let lwidth = lcol.iter().map(|l| l.width()).max().unwrap_or(0) as u16;
+    for i in 0..rows {
+        let mut spans: Vec<Span> = Vec::new();
+        let lspans = lcol.get(i).map(|l| l.spans.clone()).unwrap_or_default();
+        let lused: usize = lspans.iter().map(|s| s.content.chars().count()).sum();
+        spans.extend(lspans);
+        // Pad the gap between the two columns.
+        let pad = (lwidth as usize + 3).saturating_sub(lused);
+        spans.push(Span::raw(" ".repeat(pad)));
+        if let Some(r) = rcol.get(i) {
+            spans.extend(r.spans.clone());
+        }
+        lines.push(Line::from(spans));
+    }
+
+    let content_h = lines.len() as u16 + 2;
+    let content_w = lines.iter().map(|l| l.width() as u16).max().unwrap_or(0).saturating_add(4);
+    let w = content_w.min(region.width).max(1);
+    let h = content_h.min(region.height).max(1);
+    let x = region.x + (region.width.saturating_sub(w)) / 2;
+    let y = region.y + (region.height.saturating_sub(h)) / 2;
+    let popup = Rect { x, y, width: w, height: h };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(base)
+        .title(Span::styled("Help - keys", head));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block).style(base), popup);
 }
 
 /// Split `label` into styled spans, underlining+bolding the FIRST case-insensitive
@@ -217,8 +296,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         let art_cols = (art_rows * 2).min(inner.width as usize);
         let art_area = Rect { x: inner.x, y: inner.y, width: art_cols as u16, height: art_h };
         match &state.art {
+            // A real cover is always preferred (dithered half-block render).
             Some(a) => f.render_widget(Paragraph::new(a.lines(art_cols, art_rows)), art_area),
-            None => f.render_widget(art_placeholder(np), art_area),
+            // No cover: draw the deterministic album sigil when no inline-image
+            // protocol is available (the image-less fallback for the art slot); else a
+            // plain placeholder. The sigil degrades to a hash-only identicon with no
+            // cover palette (built neutral in update_sigil).
+            None => match (&state.sigil, state.image_protocol) {
+                (Some(sig), crate::album_color::ImageProtocol::None) => {
+                    f.render_widget(Paragraph::new(sig.lines(art_cols, art_rows)), art_area)
+                }
+                _ => f.render_widget(art_placeholder(np), art_area),
+            },
         }
     }
 
@@ -510,6 +599,122 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Collect every distinct foreground color present in the rendered buffer, so a
+    /// style assertion (colored waveform bars) is checkable headlessly.
+    fn render_fg_colors(state: &TuiState, w: u16, h: u16) -> Vec<ratatui::style::Color> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| super::render(f, state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = Vec::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = buf[(x, y)].style().fg;
+                if let Some(col) = c {
+                    if !out.contains(&col) {
+                        out.push(col);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn render_to_lines_sized(state: &TuiState, w: u16, h: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| super::render(f, state)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn help_overlay_renders_groups_and_bindings_from_keymap() {
+        // `?` opens a normal-mode modal drawn from the single-source keymap. A roomy
+        // surface so the full two-column table lands (a cramped terminal clamps it).
+        let mut s = TuiState::new();
+        s.help_open = true;
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        // A group header and a couple of known binding descriptions are present, all
+        // derived from keymap::grouped (so the overlay can never drift).
+        assert!(out.contains("View"), "group header rendered:\n{out}");
+        assert!(out.contains("play / pause"), "a keymap help line rendered:\n{out}");
+        assert!(out.contains("quit"), "quit binding rendered:\n{out}");
+        assert!(out.contains("Help - keys"), "overlay titled:\n{out}");
+    }
+
+    #[test]
+    fn help_toggle_open_and_close_and_search_still_works() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ch = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let mut s = TuiState::new();
+        // `?` opens.
+        s.handle_key(ch('?'));
+        assert!(s.help_open, "? opens the overlay");
+        // While open, nav/transport keys are swallowed.
+        assert_eq!(s.handle_key(ch('p')), None, "keys swallowed while help open");
+        assert!(s.help_open, "still open after a swallowed key");
+        // Esc closes.
+        s.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!s.help_open, "Esc closes the overlay");
+        // With help closed, `/` still enters search (never shadowed by `?`).
+        s.handle_key(ch('/'));
+        assert_eq!(s.mode, Mode::Search);
+    }
+
+    #[test]
+    fn bottom_bar_shows_help_hint_when_idle() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        let out = render_to_lines(&s).join("\n");
+        assert!(out.contains("? help"), "subtle help hint on the bottom bar:\n{out}");
+    }
+
+    #[test]
+    fn sigil_fills_art_slot_when_no_cover_and_no_image_protocol() {
+        use crate::album_color::{ImageProtocol, TermBg};
+        use crate::sigil::Sigil;
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Track".into());
+        s.now.artist = Some("Artist".into());
+        s.now.album = Some("Album".into());
+        s.art = None;
+        s.image_protocol = ImageProtocol::None;
+        s.sigil = Some(Sigil::build("artist\nalbum", None, TermBg::dark_default(), true));
+        let out = render_to_lines(&s).join("\n");
+        // The Truchet diagonals appear in the album-art slot (image-less fallback).
+        assert!(
+            out.contains('\u{2571}') || out.contains('\u{2572}'),
+            "album sigil drawn in the art slot:\n{out}"
+        );
+    }
+
+    #[test]
+    fn waveform_uses_album_swatch_color() {
+        use crate::album_color::{info_color, Palette};
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.file = Some("song/1".into());
+        s.viz_active = true;
+        s.viz_playing = true;
+        s.viz_env = 0.9;
+        s.truecolor = true;
+        // A vivid album palette -> the waveform is colored via the INFO policy.
+        let pal = Palette { vibrant: [220, 40, 40], muted: [80, 30, 30], swatches: vec![[220, 40, 40]] };
+        s.art = Some(crate::art::AlbumArt::for_test("song/1", pal.clone()));
+        let expect = info_color(pal.vibrant, s.term_bg, true);
+        let colors = render_fg_colors(&s, 60, 24);
+        assert!(
+            colors.contains(&expect),
+            "the album-swatch INFO color appears in the rendered bars: want {expect:?} got {colors:?}"
+        );
     }
 
     #[test]
@@ -945,7 +1150,12 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                 // (viz_active) draw the REAL post-gain level field; otherwise fall
                 // back to the decorative wall-clock wave, animating only while
                 // playing. Both are DIM so the row stays the least-prominent surface.
-                let width = area.width as usize;
+                // Reserve the right edge for the subtle "? help" hint, drawing the
+                // wave into the remaining width so it never covers the hint.
+                const HINT: &str = " ? help";
+                let full = area.width as usize;
+                let hint_len = if full > HINT.len() + 2 { HINT.len() } else { 0 };
+                let width = full.saturating_sub(hint_len);
                 let seed = track_seed(&state.now);
                 let wave = if state.viz_active {
                     level_wave_row(width, state.anim_secs, seed, state.viz_env, state.viz_playing)
@@ -953,7 +1163,28 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
                     let animate = state.now.state.as_deref() == Some("play");
                     wave_row(width, state.anim_secs, seed, animate)
                 };
-                Line::from(Span::styled(wave, Style::default().add_modifier(Modifier::DIM)))
+                // Waveform color: an album swatch run through the INFO policy (>= 3:1
+                // vs the detected bg, hue-preserving), replacing the flat DIM styling.
+                // No cover -> stay DIM (no album hue to honor).
+                let wave_style = match &state.art {
+                    Some(a) => {
+                        let c = crate::album_color::info_color(
+                            a.palette.vibrant,
+                            state.term_bg,
+                            state.truecolor,
+                        );
+                        Style::default().fg(c)
+                    }
+                    None => Style::default().add_modifier(Modifier::DIM),
+                };
+                let mut spans = vec![Span::styled(wave, wave_style)];
+                if hint_len > 0 {
+                    spans.push(Span::styled(
+                        HINT,
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                Line::from(spans)
             }
         },
     };

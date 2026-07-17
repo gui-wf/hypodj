@@ -28,6 +28,9 @@ const THUMB: u32 = 96;
 pub struct AlbumArt {
     pub uri: String,
     img: RgbImage,
+    /// The ranked cover palette, extracted once at decode time. Shared by the sigil
+    /// (DECORATION) and the waveform (INFO) so the visual system reads from one source.
+    pub palette: crate::album_color::Palette,
 }
 
 impl AlbumArt {
@@ -39,7 +42,8 @@ impl AlbumArt {
         let thumb = img
             .resize_exact(THUMB, THUMB, image::imageops::FilterType::Triangle)
             .to_rgb8();
-        Some(AlbumArt { uri: uri.to_string(), img: thumb })
+        let palette = crate::album_color::extract_palette(&thumb);
+        Some(AlbumArt { uri: uri.to_string(), img: thumb, palette })
     }
 
     /// Render the art into `cols x rows` half-block cells (so `cols x rows*2` px).
@@ -158,6 +162,16 @@ fn render_lines(img: &RgbImage, cols: usize, rows: usize) -> Vec<Line<'static>> 
         lines.push(Line::from(spans));
     }
     lines
+}
+
+#[cfg(test)]
+impl AlbumArt {
+    /// A test-only constructor so ui.rs render tests can exercise the album-swatch
+    /// waveform coloring without a live cover fetch. The image is a 1x1 stub; only the
+    /// palette is read by the waveform styling.
+    pub fn for_test(uri: &str, palette: crate::album_color::Palette) -> AlbumArt {
+        AlbumArt { uri: uri.to_string(), img: RgbImage::new(1, 1), palette }
+    }
 }
 
 #[cfg(test)]
