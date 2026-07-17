@@ -184,7 +184,8 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
     let (cc_tx, cc_rx) = mpsc::channel::<Req>();
     {
         let stop = stop.clone();
-        thread::spawn(move || cc_worker(cc_rx, in_tx, stop));
+        let host = host.to_string();
+        thread::spawn(move || cc_worker(cc_rx, in_tx, &host, port, stop));
     }
 
     // VIZ worker: a 4th dedicated socket (MPD port + 1) that streams post-gain
@@ -223,7 +224,7 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
 /// EXACT existing confirm + `Req::Arm` direct-command arm. A miss / disabled build
 /// posts a loud CcProgress line, never a fabricated plan. Owns no socket, so a
 /// multi-second call cannot block commands.
-fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
+fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, host: &str, port: u16, stop: Arc<AtomicBool>) {
     while let Ok(req) = rx.recv() {
         if stop.load(Ordering::Relaxed) || matches!(req, Req::Shutdown) {
             break;
@@ -236,11 +237,18 @@ fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
         }
         #[cfg(feature = "cc")]
         {
+            // GROUND the prompt with REAL library candidates so Claude picks from what
+            // ACTUALLY exists instead of guessing a blind string. This worker owns NO
+            // command socket (so a multi-second `claude` call can never head-of-line-
+            // block commands), so it opens a SHORT-LIVED throwaway socket JUST for the
+            // list/search reads and drops it. Any connect/read failure degrades cleanly
+            // to an empty context (today's un-grounded prompt), never a hard failure.
+            let ctx = grounding_context(host, port, &phrase);
             // One non-streamed `claude` call is the single spine: the installed CLI
             // returns the settled result intact, so there is no truncation to work
             // around and no stream-else-fallback dance. The DJ View shows the
             // "thinking..." spinner (already posted above) until this settles.
-            let settled = hypodj_nl::cc::run_claude(&phrase, queue_len, is_playing);
+            let settled = hypodj_nl::cc::run_claude(&phrase, queue_len, is_playing, &ctx);
             // Drop the "thinking..." spinner.
             let _ = tx.send(Inbound::CcProgress(String::new()));
             match settled {
@@ -269,12 +277,28 @@ fn cc_worker(rx: Receiver<Req>, tx: Sender<Inbound>, stop: Arc<AtomicBool>) {
         }
         #[cfg(not(feature = "cc"))]
         {
-            let _ = (&phrase, queue_len, is_playing);
+            let _ = (&phrase, queue_len, is_playing, host, port);
             let _ = tx.send(Inbound::CcProgress(String::new()));
             let _ = tx.send(Inbound::CcLine(
                 "Claude Code backend not enabled in this build".into(),
             ));
         }
+    }
+}
+
+/// Gather the COMPACT real-candidate [`LibraryContext`] for the DJ prompt off a
+/// SHORT-LIVED throwaway socket (the CC worker owns no command socket). Degrades
+/// cleanly: a connect failure yields an empty context (today's un-grounded prompt).
+#[cfg(feature = "cc")]
+fn grounding_context(host: &str, port: u16, phrase: &str) -> hypodj_nl::cc::LibraryContext {
+    let mut conn = match MpdConn::connect(host, port) {
+        Ok(c) => c,
+        Err(_) => return hypodj_nl::cc::LibraryContext::default(),
+    };
+    hypodj_nl::cc::LibraryContext {
+        genres: hypodj_client::grounding::list_genres(&mut conn),
+        candidates: hypodj_client::grounding::search_labels(&mut conn, phrase, 20),
+        notes: Vec::new(),
     }
 }
 

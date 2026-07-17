@@ -133,20 +133,80 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     Request: move track 4 up two spots -> {\"type\":\"move\",\"sel\":\"position\",\"slot\":4,\"dest\":\"relative\",\"dest_rel\":-2}\n\
     Request: play the track called so what -> {\"type\":\"play\",\"sel\":\"query\",\"query\":\"so what\"}\n\
     Request: jump to track 6 -> {\"type\":\"play\",\"sel\":\"position\",\"slot\":6}\n\
-    Request: what is the airspeed of an unladen swallow -> {\"type\":\"noop\"}";
+    Request: what is the airspeed of an unladen swallow -> {\"type\":\"noop\"}\n\
+    GROUNDING: if the user prompt carries an \"Available in the library:\" block, PREFER a \
+    genre/artist/query DRAWN FROM those real listed names over inventing one - pick the closest \
+    listed genre for \"genre\", or a listed artist/track label for \"query\". Fall back to a \
+    free-text \"query\" ONLY when nothing listed plausibly matches. You still emit only a LABEL \
+    (a genre/artist/query string); never a library id.";
+
+/// A COMPACT, real-candidate library context gathered client-side (via MPD
+/// list/search) and injected into [`build_prompt`] so Claude picks from what
+/// ACTUALLY EXISTS instead of guessing a blind query string. Bounded by
+/// construction (a small genre list + a top-N candidate slice) so the prompt cost
+/// stays ~flat. Default-empty: an empty context reproduces today's un-grounded
+/// prompt exactly (so unit tests + the model-free path are unaffected, and a search
+/// failure degrades cleanly). The model still only ever emits a LABEL (genre/artist/
+/// query text); hypodj maps that label back to real ids at execute time, so the
+/// off-surface-id safety boundary is untouched.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LibraryContext {
+    /// The library's real genre names (MPD `list genre`), e.g. jazz, ambient.
+    pub genres: Vec<String>,
+    /// Real artist/album/track LABELS matching the utterance keywords (MPD
+    /// `search any <kw>`), e.g. "Bill Evans - Blue in Green".
+    pub candidates: Vec<String>,
+    /// Optional freeform hint lines (e.g. a "starred/favorites" note) appended
+    /// verbatim under the block. Usually empty.
+    pub notes: Vec<String>,
+}
+
+impl LibraryContext {
+    /// True when there is nothing to inject: [`build_prompt`] then emits today's
+    /// exact un-grounded prompt (the clean-degrade path).
+    pub fn is_empty(&self) -> bool {
+        self.genres.is_empty() && self.candidates.is_empty() && self.notes.is_empty()
+    }
+}
 
 /// Build the per-request user prompt: only the small live context the client already
 /// has (queue length, is-playing) plus the utterance, mirroring the local-model prompt
 /// shape (llm.rs `prompt`). The standing DJ framing rides in [`DJ_SYSTEM_PROMPT`] via
 /// `--system-prompt`, so this text is intentionally just the live bit. Pure and
 /// unit-tested.
-pub fn build_prompt(utterance: &str, queue_len: usize, is_playing: bool) -> String {
-    format!(
-        "Queue length: {}. Something is {}playing.\nRequest: {}",
+pub fn build_prompt(
+    utterance: &str,
+    queue_len: usize,
+    is_playing: bool,
+    ctx: &LibraryContext,
+) -> String {
+    let mut s = format!(
+        "Queue length: {}. Something is {}playing.\n",
         queue_len,
         if is_playing { "" } else { "NOT " },
-        utterance,
-    )
+    );
+    // Inject the real-candidate block ONLY when we have something; an empty context
+    // reproduces today's exact un-grounded prompt (clean-degrade + test parity).
+    if !ctx.is_empty() {
+        s.push_str("Available in the library:\n");
+        if !ctx.genres.is_empty() {
+            s.push_str("Genres: ");
+            s.push_str(&ctx.genres.join(", "));
+            s.push('\n');
+        }
+        if !ctx.candidates.is_empty() {
+            s.push_str("Matching artists/tracks: ");
+            s.push_str(&ctx.candidates.join(", "));
+            s.push('\n');
+        }
+        for note in &ctx.notes {
+            s.push_str(note);
+            s.push('\n');
+        }
+    }
+    s.push_str("Request: ");
+    s.push_str(utterance);
+    s
 }
 
 /// Strip a leading/trailing markdown code fence (```json ... ```), if present, so a
@@ -209,8 +269,13 @@ const CLAUDE_TIMEOUT: Duration = Duration::from_secs(45);
 /// `--json-schema` takes the schema INLINE (not a path), so [`schema_json`] is passed
 /// straight as the arg value. `< /dev/null` (empty stdin via `Stdio::null`) means an
 /// auth/interactive prompt cannot block waiting on input - it fails fast instead.
-pub fn run_claude(utterance: &str, queue_len: usize, is_playing: bool) -> Result<RawPlan, String> {
-    let prompt = build_prompt(utterance, queue_len, is_playing);
+pub fn run_claude(
+    utterance: &str,
+    queue_len: usize,
+    is_playing: bool,
+    ctx: &LibraryContext,
+) -> Result<RawPlan, String> {
+    let prompt = build_prompt(utterance, queue_len, is_playing, ctx);
     let mut child = Command::new("claude")
         .arg("-p")
         .arg(&prompt)
@@ -301,8 +366,13 @@ mod tests {
         assert!(DJ_SYSTEM_PROMPT.contains("EXACTLY ONE JSON plan"));
         assert!(DJ_SYSTEM_PROMPT.contains("matching the provided JSON schema"));
 
+        // The system prompt instructs the model to PREFER real listed candidates.
+        assert!(DJ_SYSTEM_PROMPT.contains("Available in the library:"));
+        assert!(DJ_SYSTEM_PROMPT.contains("PREFER"));
+
         // The user prompt carries ONLY the live bit: queue length, is-playing, request.
-        let p = build_prompt("fade out slowly", 7, true);
+        let empty = LibraryContext::default();
+        let p = build_prompt("fade out slowly", 7, true, &empty);
         assert!(p.contains("Queue length: 7."));
         assert!(p.contains("Something is playing."));
         // The utterance rides through verbatim.
@@ -310,7 +380,42 @@ mod tests {
         // The standing framing is NOT baked into the user prompt anymore.
         assert!(!p.contains("EXACTLY ONE JSON plan"));
         // Not-playing flips the context.
-        assert!(build_prompt("stop", 0, false).contains("Something is NOT playing."));
+        assert!(build_prompt("stop", 0, false, &empty).contains("Something is NOT playing."));
+    }
+
+    #[test]
+    fn empty_context_reproduces_the_ungrounded_prompt() {
+        // A default (empty) context MUST NOT change the prompt: no injected block,
+        // byte-for-byte the pre-grounding shape (clean-degrade + model-free parity).
+        let empty = LibraryContext::default();
+        let p = build_prompt("play some jazz", 3, true, &empty);
+        assert_eq!(p, "Queue length: 3. Something is playing.\nRequest: play some jazz");
+        assert!(!p.contains("Available in the library:"));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn context_injects_a_labelled_candidate_block() {
+        // A grounded context injects a clearly-labelled block with the REAL genres
+        // and candidate labels, BEFORE the request line, so Claude can pick from what
+        // exists. The candidates are LABELS only (no library ids leak into the prompt).
+        let ctx = LibraryContext {
+            genres: vec!["jazz".into(), "ambient".into()],
+            candidates: vec!["Bill Evans - Blue in Green".into(), "Miles Davis - So What".into()],
+            notes: vec!["Note: the user referenced their starred tracks.".into()],
+        };
+        let p = build_prompt("play something calm", 2, false, &ctx);
+        assert!(p.contains("Available in the library:"));
+        assert!(p.contains("Genres: jazz, ambient"));
+        assert!(p.contains("Matching artists/tracks: Bill Evans - Blue in Green, Miles Davis - So What"));
+        assert!(p.contains("Note: the user referenced their starred tracks."));
+        // The block precedes the request line.
+        let block = p.find("Available in the library:").unwrap();
+        let req = p.find("Request: play something calm").unwrap();
+        assert!(block < req);
+        // No library id form leaked in (labels only).
+        assert!(!p.contains("song/"));
+        assert!(!ctx.is_empty());
     }
 
     #[test]
@@ -387,7 +492,7 @@ mod tests {
             eprintln!("skipping: claude CLI not available");
             return;
         }
-        match run_claude("fade out over 10 seconds", 5, true) {
+        match run_claude("fade out over 10 seconds", 5, true, &LibraryContext::default()) {
             Ok(raw) => {
                 // A real model reply must still be a validated, off-surface-free IR.
                 assert!(render_dsl_ok(&raw), "the live plan must be a valid IR: {raw:?}");
@@ -415,23 +520,60 @@ mod tests {
             return;
         }
         // remove the last 3 tracks -> Action::Remove.
-        match run_claude("remove the last 3 tracks", 8, true) {
+        match run_claude("remove the last 3 tracks", 8, true, &LibraryContext::default()) {
             Ok(raw) => assert!(matches!(raw.action, A::Remove { .. }), "got {:?}", raw.action),
             Err(e) => eprintln!("live remove call did not produce a plan (acceptable): {e}"),
         }
         // clear everything after the current track -> Action::Clear.
-        match run_claude("clear everything after the current track", 8, true) {
+        match run_claude("clear everything after the current track", 8, true, &LibraryContext::default()) {
             Ok(raw) => assert!(matches!(raw.action, A::Clear { .. }), "got {:?}", raw.action),
             Err(e) => eprintln!("live clear call did not produce a plan (acceptable): {e}"),
         }
         // An off-topic ask -> Noop, NEVER a fabricated Enqueue.
-        match run_claude("what is the airspeed of an unladen swallow", 8, true) {
+        match run_claude("what is the airspeed of an unladen swallow", 8, true, &LibraryContext::default()) {
             Ok(raw) => assert!(
                 !matches!(raw.action, A::Enqueue { .. }),
                 "off-topic ask must not fabricate an enqueue, got {:?}",
                 raw.action
             ),
             Err(e) => eprintln!("live noop call did not produce a plan (acceptable): {e}"),
+        }
+    }
+
+    // LIVE: a real `claude` call with a GROUNDED context must PREFER a listed genre
+    // over inventing one - the whole point of the grounding. We inject deliberately
+    // uncommon genres the model would never guess blind (so a match proves it read the
+    // block), then assert the chosen enqueue label is DRAWN FROM the provided
+    // candidates, not a hallucinated free string. #[ignore] + availability-gated:
+    // NEVER runs in doCheck. Run:
+    // `cargo test -p hypodj-nl --features cc -- --ignored live_claude_grounds`.
+    #[test]
+    #[ignore]
+    fn live_claude_grounds_to_a_real_candidate() {
+        use hypodj_core::plan::{Action as A, Selector};
+        if !cc_available() {
+            eprintln!("skipping: claude CLI not available");
+            return;
+        }
+        // Uncommon genres the model would not guess from "calm/dreamy" alone; if it
+        // picks one of these it PROVES the injected block grounded the plan.
+        let genres = vec!["shoegaze".to_string(), "ambient".to_string(), "klezmer".to_string()];
+        let ctx = LibraryContext {
+            genres: genres.clone(),
+            candidates: vec!["Slowdive - Alison".to_string(), "Mazzy Star - Fade Into You".to_string()],
+            notes: Vec::new(),
+        };
+        match run_claude("play some calm dreamy music", 0, false, &ctx) {
+            Ok(raw) => match &raw.action {
+                A::Enqueue { selector: Selector::Genre(g), .. } => assert!(
+                    genres.iter().any(|lg| lg.eq_ignore_ascii_case(g)),
+                    "grounded genre must be one of the listed candidates, got {g:?}"
+                ),
+                // A query label is also acceptable (nothing forces genre), but it must
+                // still be a validated, off-surface-free plan.
+                other => assert!(render_dsl_ok(&raw), "must be a valid IR: {other:?}"),
+            },
+            Err(e) => eprintln!("live grounded call did not produce a plan (acceptable): {e}"),
         }
     }
 }

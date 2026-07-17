@@ -4,6 +4,7 @@
 //! SAME socket that ran the translate). Model-free: std::net + thiserror only.
 
 pub mod config;
+pub mod grounding;
 pub mod model;
 pub mod mpd;
 pub mod nl;

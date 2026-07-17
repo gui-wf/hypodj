@@ -280,13 +280,23 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
         .map(|(_, v)| v == "play")
         .unwrap_or(false);
 
+    // GROUND the prompt with REAL library candidates so Claude picks a genre/artist/
+    // query that ACTUALLY exists instead of guessing a blind string. Both reads run on
+    // this same socket BEFORE the claude call and DEGRADE CLEANLY (empty on any MPD
+    // error) - an empty context reproduces today's un-grounded prompt, never a failure.
+    let ctx = hypodj_nl::cc::LibraryContext {
+        genres: hypodj_client::grounding::list_genres(conn),
+        candidates: hypodj_client::grounding::search_labels(conn, phrase, 20),
+        notes: Vec::new(),
+    };
+
     // Simple "thinking..." indicator on stderr (stdout stays clean for the echo +
     // y/N). The blocking multi-second call is fine here - the CLI is a one-shot; the
     // indicator keeps it from ever looking frozen. One non-streamed call returns the
     // settled VALIDATED plan directly (the installed CLI returns the result intact).
     eprint!("Claude Code: thinking...");
     let _ = std::io::stderr().flush();
-    let result = hypodj_nl::cc::run_claude(phrase, queue_len, is_playing);
+    let result = hypodj_nl::cc::run_claude(phrase, queue_len, is_playing, &ctx);
     // Clear the indicator line before any output.
     eprint!("\r\x1b[2K");
     let _ = std::io::stderr().flush();
