@@ -41,7 +41,7 @@ use crate::fade::{
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
 use crate::intelligence::{FeatureStore, MetadataStore};
-use crate::model::{AlbumId, ArtistId, Favorite, Genre, QueueEntry, Song, SongId};
+use crate::model::{AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId};
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
     RawTrigger, Resolved, Selector, ORIGIN_SLEEP, ORIGIN_WAKE, ORIGIN_WINDDOWN,
@@ -1776,6 +1776,85 @@ impl HypodjHandler {
         self.changed.notify_waiters();
     }
 
+    /// The Subsonic song ids of the CURRENT QUEUE, in queue order. Raw
+    /// [`QueueEntry::Stream`] entries have no song id and are skipped (a Navidrome
+    /// playlist can only hold library tracks). Backs `save <name>`.
+    fn queue_song_ids(&self) -> Vec<SongId> {
+        let st = self.state.lock().unwrap();
+        st.queue
+            .iter()
+            .filter_map(|item| match &item.entry {
+                QueueEntry::Song(s) => Some(s.id.clone()),
+                QueueEntry::Stream { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Append one song to a REAL named Navidrome playlist, create-or-append: if a
+    /// playlist with `name` already exists, `updatePlaylist` adds the song to it;
+    /// otherwise `createPlaylist` mints a new one seeded with the song. Backs the
+    /// non-`Starred` `playlistadd <name> <uri>` path (GAP cusq3zaw). Any Subsonic
+    /// error surfaces to the caller so it becomes a proper ACK, never a silent
+    /// success.
+    async fn playlist_add_song(&self, name: &str, id: SongId) -> Result<(), SubsonicError> {
+        let existing = self
+            .client
+            .get_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.name == name);
+        match existing {
+            Some(p) => self.client.add_to_playlist(&p.id, &[id]).await,
+            None => self.client.create_playlist(name, &[id]).await.map(|_| ()),
+        }
+    }
+
+    /// Fetch the starred songs and record their order under the state lock, so a
+    /// later position-based `playlistdelete Starred <pos>` maps back to a song id.
+    /// Shared by `listplaylistinfo Starred` and `load Starred` (which must agree on
+    /// the exact order they present). Starred is NEVER cached (freshness-critical).
+    async fn starred_songs_recording_order(&self) -> Result<Vec<Song>, SubsonicError> {
+        let songs = self.client.starred_songs().await?;
+        let mut st = self.state.lock().unwrap();
+        st.last_starred_order = songs.iter().map(|s| s.id.clone()).collect();
+        Ok(songs)
+    }
+
+    /// Resolve a real Navidrome playlist by NAME to its full song list, or `None`
+    /// when no playlist carries that name. Backs `listplaylistinfo <name>` and
+    /// `load <name>` so a `save`d set is inspectable and loadable by name.
+    async fn playlist_by_name(&self, name: &str) -> Result<Option<Playlist>, SubsonicError> {
+        let existing = self
+            .client
+            .get_playlists()
+            .await?
+            .into_iter()
+            .find(|p| p.name == name);
+        match existing {
+            Some(p) => Ok(Some(self.client.get_playlist(&p.id).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Append already-resolved songs to the queue as ONE atomic push (a single
+    /// playlist_version bump and ONE notify_change), mirroring the album fan-out in
+    /// [`enqueue_uri`](Self::enqueue_uri). An empty list is a no-op (no spurious
+    /// wake). Backs `load` appending a playlist's songs to the queue.
+    fn enqueue_songs(&self, songs: Vec<Song>) {
+        if songs.is_empty() {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        for song in songs {
+            let qid = st.next_id;
+            st.next_id += 1;
+            st.queue.push(QueueItem { id: qid, entry: QueueEntry::Song(song) });
+        }
+        st.playlist_version += 1;
+        drop(st);
+        self.notify_change();
+    }
+
     /// THE MPD-facing fade entry point: convert the parsed [`FadeArgs`] DSL into a
     /// fade-native [`FadeRequest`] (resolving the per-kind default duration and
     /// clamping to `[min_slew, max_dur]` from [`FadeConfig`], so a user's `[fade]`
@@ -3218,6 +3297,7 @@ fn startle_bounds(cfg: &FadeConfig, sub_jnd: bool) -> StartleBounds {
 // ACK error codes (subset of MPD's ack.h).
 const ACK_ERROR_NO_EXIST: u32 = 50;
 const ACK_ERROR_UNKNOWN: u32 = 5;
+const ACK_ERROR_EXIST: u32 = 56;
 
 impl MpdHandler for HypodjHandler {
     async fn idle(&self, _subsystems: Vec<String>) -> Option<String> {
@@ -3564,24 +3644,29 @@ impl MpdHandler for HypodjHandler {
 
             // ── stored playlists + star trigger (feature 3) ─────────────────
             MpdCommand::ListPlaylists => {
-                // Advertise the synthetic `Starred` playlist (the star trigger).
-                MpdResponse::pairs()
+                // Advertise the synthetic `Starred` playlist (the star trigger)
+                // PLUS every real Navidrome playlist, so a `save`d set is visible
+                // and loadable rather than write-only.
+                let mut resp = MpdResponse::pairs()
                     .pair("playlist", "Starred")
-                    .pair("Last-Modified", "1970-01-01T00:00:00Z")
-                    .build()
+                    .pair("Last-Modified", "1970-01-01T00:00:00Z");
+                match self.client.get_playlists().await {
+                    Ok(playlists) => {
+                        for p in playlists {
+                            resp = resp
+                                .pair("playlist", &p.name)
+                                .pair("Last-Modified", "1970-01-01T00:00:00Z");
+                        }
+                        resp.build()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "listplaylists", &e.to_string()),
+                }
             }
-            MpdCommand::ListPlaylistInfo(name) | MpdCommand::Load(name)
-                if name == "Starred" =>
-            {
+            MpdCommand::ListPlaylistInfo(name) if name == "Starred" => {
                 // Starred is NEVER cached (freshness-critical). Record the order
                 // so a later position-based playlistdelete maps to a song id.
-                match self.client.starred_songs().await {
+                match self.starred_songs_recording_order().await {
                     Ok(songs) => {
-                        {
-                            let mut st = self.state.lock().unwrap();
-                            st.last_starred_order =
-                                songs.iter().map(|s| s.id.clone()).collect();
-                        }
                         let mut pairs = Vec::new();
                         for s in &songs {
                             pairs.extend(browse_song_pairs(s));
@@ -3591,7 +3676,65 @@ impl MpdHandler for HypodjHandler {
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "listplaylistinfo", &e.to_string()),
                 }
             }
-            MpdCommand::ListPlaylistInfo(_) | MpdCommand::Load(_) => MpdResponse::ok(),
+            MpdCommand::Load(name) if name == "Starred" => {
+                // `load Starred` appends the starred songs to the queue (real MPD
+                // `load` semantics), not just echoes them. Record the order too.
+                match self.starred_songs_recording_order().await {
+                    Ok(songs) => {
+                        self.enqueue_songs(songs);
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "load", &e.to_string()),
+                }
+            }
+            MpdCommand::ListPlaylistInfo(name) => {
+                // A real Navidrome playlist: return its songs so a `save`d set can
+                // be inspected. Unknown name is a loud ACK, not a silent empty ok.
+                match self.playlist_by_name(&name).await {
+                    Ok(Some(pl)) => {
+                        let mut pairs = Vec::new();
+                        for s in &pl.songs {
+                            pairs.extend(browse_song_pairs(s));
+                        }
+                        MpdResponse::Pairs(pairs)
+                    }
+                    Ok(None) => {
+                        ack(ACK_ERROR_NO_EXIST, "listplaylistinfo", "No such playlist")
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "listplaylistinfo", &e.to_string()),
+                }
+            }
+            MpdCommand::Load(name) => {
+                // `load <name>` appends a real Navidrome playlist's songs to the
+                // queue, so a `save`d set round-trips back into the queue.
+                match self.playlist_by_name(&name).await {
+                    Ok(Some(pl)) => {
+                        self.enqueue_songs(pl.songs);
+                        MpdResponse::ok()
+                    }
+                    Ok(None) => ack(ACK_ERROR_NO_EXIST, "load", "No such playlist"),
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "load", &e.to_string()),
+                }
+            }
+            MpdCommand::Save(name) => {
+                // `save <name>` persists the CURRENT QUEUE as a new Navidrome
+                // playlist (GAP cusq3zaw). `Starred` is reserved to the star
+                // path - never save over it (a loud ACK, not a silent clobber).
+                if name == "Starred" {
+                    return ack(ACK_ERROR_EXIST, "save", "Starred is reserved");
+                }
+                let song_ids = self.queue_song_ids();
+                if song_ids.is_empty() {
+                    return ack(ACK_ERROR_UNKNOWN, "save", "queue is empty");
+                }
+                match self.client.create_playlist(&name, &song_ids).await {
+                    Ok(_) => {
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "save", &e.to_string()),
+                }
+            }
             MpdCommand::PlaylistAdd(name, uri) if name == "Starred" => {
                 // The uri PREFIX is the sole routing authority: `song/<id>` stars
                 // a song, `album/<id>` an album, `artist/<id>` an artist. Anything
@@ -3608,7 +3751,23 @@ impl MpdHandler for HypodjHandler {
                     None => ack(ACK_ERROR_NO_EXIST, "playlistadd", "unsupported uri"),
                 }
             }
-            MpdCommand::PlaylistAdd(..) => MpdResponse::ok(),
+            MpdCommand::PlaylistAdd(name, uri) => {
+                // Non-`Starred`: append the resolved song to a REAL Navidrome
+                // playlist, create-or-append by name (GAP cusq3zaw). Map the MPD
+                // uri back to a SongId exactly as the Starred path resolves a
+                // Favorite; a non-`song/` uri fails LOUD (never a silent no-op).
+                let id = match song_id_from_uri(&uri) {
+                    Some(id) => id,
+                    None => return ack(ACK_ERROR_NO_EXIST, "playlistadd", "unsupported uri"),
+                };
+                match self.playlist_add_song(&name, id).await {
+                    Ok(()) => {
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistadd", &e.to_string()),
+                }
+            }
             MpdCommand::PlaylistDelete(name, pos) if name == "Starred" => {
                 // Position-based: map to the song id from the last listed order.
                 let target = {
@@ -3765,6 +3924,7 @@ impl MpdHandler for HypodjHandler {
                     "notcommands", "outputs", "pause", "ping", "play", "playid",
                     "playlistadd", "playlistclear", "playlistdelete", "playlistid",
                     "playlistinfo", "plchanges", "previous", "readpicture",
+                    "save",
                     "search", "searchadd", "seek", "seekcur", "seekid", "setvol", "stats", "sticker",
                     "status", "stop", "tagtypes", "urlhandlers",
                 ];
@@ -4719,6 +4879,97 @@ mod tests {
         };
         let (player, events) = NullPlayer::spawn();
         Some((HypodjHandler::new(client, player), events))
+    }
+
+    // A minimal library Song for queue/playlist wiring tests (no network).
+    fn playlist_test_song(id: &str) -> Song {
+        Song {
+            id: SongId(id.to_string()),
+            title: format!("Song {id}"),
+            album: None,
+            album_id: None,
+            artist: None,
+            track: None,
+            duration_secs: Some(200),
+            cover_art: None,
+            starred: false,
+            musicbrainz_id: None,
+            disc: None,
+            year: None,
+            genre: None,
+            bitrate: None,
+            comment: None,
+            user_rating: None,
+            composer: None,
+            performer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_song_ids_collects_songs_in_order_skips_streams() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.enqueue_stream_for_test(NTS).await; // raw stream: no song id
+        h.enqueue_song_for_test(playlist_test_song("s-2")).await;
+        let ids = h.queue_song_ids();
+        assert_eq!(ids, vec![SongId("s-1".into()), SongId("s-2".into())]);
+    }
+
+    #[tokio::test]
+    async fn save_starred_name_is_reserved_and_never_clobbers() {
+        // `save Starred` must fail LOUD (reserved) rather than overwrite the
+        // synthetic star pseudo-playlist. No network is touched on this path.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        let resp = h.handle(MpdCommand::Save("Starred".into())).await;
+        match resp {
+            MpdResponse::Ack { command, .. } => assert_eq!(command, "save"),
+            other => panic!("expected ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn save_empty_queue_acks_rather_than_creating_empty_playlist() {
+        // An empty queue must not create an empty Navidrome playlist; it ACKs
+        // before any network call.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h.handle(MpdCommand::Save("Whatever".into())).await;
+        assert!(matches!(resp, MpdResponse::Ack { .. }), "empty queue -> ACK");
+    }
+
+    #[tokio::test]
+    async fn playlistadd_starred_stays_special_unsupported_uri_acks() {
+        // The Starred path routes via Favorite::from_uri; a non-favoritable uri
+        // fails LOUD (NO_EXIST), proving Starred is still handled specially and
+        // never falls through to the real-playlist create path.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h
+            .handle(MpdCommand::PlaylistAdd("Starred".into(), "bogus/x".into()))
+            .await;
+        match resp {
+            MpdResponse::Ack { command, code, .. } => {
+                assert_eq!(command, "playlistadd");
+                assert_eq!(code, ACK_ERROR_NO_EXIST);
+            }
+            other => panic!("expected ACK, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn playlistadd_real_playlist_unsupported_uri_acks_not_silent() {
+        // Non-Starred playlistadd with a non-`song/` uri must ACK (uri->SongId map
+        // fails), never the old silent no-op. No network is touched.
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let resp = h
+            .handle(MpdCommand::PlaylistAdd("Warm Room".into(), "album/a-1".into()))
+            .await;
+        match resp {
+            MpdResponse::Ack { command, code, .. } => {
+                assert_eq!(command, "playlistadd");
+                assert_eq!(code, ACK_ERROR_NO_EXIST);
+            }
+            other => panic!("expected ACK, got {other:?}"),
+        }
     }
 
     #[tokio::test(start_paused = true)]

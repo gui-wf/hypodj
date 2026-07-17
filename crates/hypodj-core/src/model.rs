@@ -168,6 +168,24 @@ pub struct Genre {
     pub album_count: u32,
 }
 
+/// A stored playlist id (Subsonic playlist id). Distinct newtype from
+/// [`SongId`]/[`AlbumId`] so a playlist id can never cross into a media call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlaylistId(pub String);
+
+/// A named, server-persisted playlist (Subsonic getPlaylists row). The songs are
+/// only populated by the single-playlist fetch ([`crate::subsonic::SubsonicClient::get_playlist`]);
+/// the list fetch leaves `songs` empty and carries `song_count` for the count.
+#[derive(Debug, Clone)]
+pub struct Playlist {
+    pub id: PlaylistId,
+    pub name: String,
+    pub song_count: u32,
+    /// Populated only by the single-playlist (getPlaylist) fetch; empty from the
+    /// list (getPlaylists) fetch.
+    pub songs: Vec<Song>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

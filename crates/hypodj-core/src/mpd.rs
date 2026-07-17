@@ -127,6 +127,10 @@ pub enum MpdCommand {
     ListPlaylists,
     ListPlaylistInfo(String),
     Load(String),
+    /// `save <name>` - persist the CURRENT QUEUE as a new named Navidrome
+    /// playlist (GAP cusq3zaw). The synthetic `Starred` name stays reserved to
+    /// the star path and is never saved over.
+    Save(String),
     /// `playlistadd <name> <uri>` - the `Starred` playlist is our star trigger:
     /// `playlistadd Starred song/<id>` stars the song server-side.
     PlaylistAdd(String, String),
@@ -950,6 +954,13 @@ pub fn parse(line: &str) -> MpdCommand {
         "listplaylists" => MpdCommand::ListPlaylists,
         "listplaylistinfo" => MpdCommand::ListPlaylistInfo(arg(0).unwrap_or_default()),
         "load" => MpdCommand::Load(arg(0).unwrap_or_default()),
+        // `save <name>` persists the current queue as a new Navidrome playlist.
+        // A missing name is a loud (no-op-safe) Unsupported ACK rather than
+        // saving an empty-named playlist.
+        "save" => match arg(0) {
+            Some(name) if !name.is_empty() => MpdCommand::Save(name),
+            _ => MpdCommand::Unsupported(line.to_string()),
+        },
         "playlistadd" => MpdCommand::PlaylistAdd(arg(0).unwrap_or_default(), arg(1).unwrap_or_default()),
         "playlistdelete" => MpdCommand::PlaylistDelete(
             arg(0).unwrap_or_default(),
@@ -1338,6 +1349,21 @@ mod parse_tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_save_and_rejects_empty_name() {
+        // `save <name>` parses to Save; a quoted multi-word name is preserved.
+        match parse("save \"Warm Room\"") {
+            MpdCommand::Save(name) => assert_eq!(name, "Warm Room"),
+            other => panic!("got {other:?}"),
+        }
+        match parse("save Set1") {
+            MpdCommand::Save(name) => assert_eq!(name, "Set1"),
+            other => panic!("got {other:?}"),
+        }
+        // A bare `save` with no name must NOT silently save an empty playlist.
+        assert!(matches!(parse("save"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

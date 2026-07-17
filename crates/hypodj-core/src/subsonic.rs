@@ -21,7 +21,9 @@
 use std::collections::HashSet;
 
 use crate::config::ServerConfig;
-use crate::model::{Album, AlbumId, Artist, ArtistId, Favorite, Genre, Song, SongId};
+use crate::model::{
+    Album, AlbumId, Artist, ArtistId, Favorite, Genre, Playlist, PlaylistId, Song, SongId,
+};
 use opensubsonic::{AlbumListType, data};
 use url::Url;
 
@@ -513,6 +515,78 @@ impl SubsonicClient {
             .map_err(|e| SubsonicError::Request(e.to_string()))?;
         Ok(bytes.to_vec())
     }
+
+    // ── stored playlists (GAP cusq3zaw: persist a curated queue) ───────────
+    //
+    // These are CORE Subsonic endpoints (createPlaylist / updatePlaylist /
+    // getPlaylists / getPlaylist / deletePlaylist), NOT the synthetic `Starred`
+    // pseudo-playlist the handler keeps special. `SubsonicClient` stays the one
+    // file that touches the opensubsonic wire types.
+
+    /// Create a NEW named playlist from a list of song ids and return its
+    /// server-assigned id (Subsonic `createPlaylist` with `name`, no
+    /// `playlistId`). The wire returns the created `PlaylistWithSongs`, whose
+    /// `id` is the fresh playlist id.
+    pub async fn create_playlist(
+        &self,
+        name: &str,
+        song_ids: &[SongId],
+    ) -> Result<PlaylistId, SubsonicError> {
+        let ids: Vec<&str> = song_ids.iter().map(|s| s.0.as_str()).collect();
+        let created = self
+            .inner
+            .create_playlist(None, Some(name), &ids)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(PlaylistId(created.id))
+    }
+
+    /// Append song ids to an EXISTING playlist (Subsonic `updatePlaylist` with
+    /// `songIdToAdd`). No removals, no rename - the create-or-append path only
+    /// ever grows the playlist.
+    pub async fn add_to_playlist(
+        &self,
+        id: &PlaylistId,
+        song_ids: &[SongId],
+    ) -> Result<(), SubsonicError> {
+        let ids: Vec<&str> = song_ids.iter().map(|s| s.0.as_str()).collect();
+        self.inner
+            .update_playlist(&id.0, None, None, None, &ids, &[])
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// All of the user's stored playlists (Subsonic `getPlaylists`). Songs are
+    /// NOT included (`song_count` carries the count); use [`get_playlist`](Self::get_playlist)
+    /// for the tracks. NEVER cached here - the handler owns any caching.
+    pub async fn get_playlists(&self) -> Result<Vec<Playlist>, SubsonicError> {
+        let playlists = self
+            .inner
+            .get_playlists(None)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(playlists.into_iter().map(map_playlist).collect())
+    }
+
+    /// A single playlist WITH its songs (Subsonic `getPlaylist`). The wire
+    /// `entry: Vec<Child>` maps through the shared [`map_song`].
+    pub async fn get_playlist(&self, id: &PlaylistId) -> Result<Playlist, SubsonicError> {
+        let pl = self
+            .inner
+            .get_playlist(&id.0)
+            .await
+            .map_err(map_request_error)?;
+        Ok(map_playlist_with_songs(pl))
+    }
+
+    /// Delete a stored playlist (Subsonic `deletePlaylist`). Used by the live
+    /// round-trip proof to clean up its throwaway playlist.
+    pub async fn delete_playlist(&self, id: &PlaylistId) -> Result<(), SubsonicError> {
+        self.inner
+            .delete_playlist(&id.0)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
 }
 
 /// Tag-classed search3 hits, decomposed from the wire `SearchResult3` aggregate
@@ -577,6 +651,30 @@ fn map_album(a: data::AlbumId3) -> Album {
 /// Map a wire `Child` (the universal media/song row) into our `Song`. Only the
 /// song-relevant fields are carried; video/rating/podcast fields are dropped at
 /// this boundary so the model never grows a wire-shaped tail.
+/// Map a wire `Playlist` (list row, no songs) into our model. `song_count` is
+/// Option<i64> on the wire; default 0, saturate into u32.
+fn map_playlist(p: data::Playlist) -> Playlist {
+    Playlist {
+        id: PlaylistId(p.id),
+        name: p.name,
+        song_count: i64_to_u32(p.song_count.unwrap_or(0)),
+        songs: Vec::new(),
+    }
+}
+
+/// Map a wire `PlaylistWithSongs` (the getPlaylist shape) into our model,
+/// carrying the `entry` tracks through the shared [`map_song`].
+fn map_playlist_with_songs(p: data::PlaylistWithSongs) -> Playlist {
+    let songs: Vec<Song> = p.entry.into_iter().map(map_song).collect();
+    Playlist {
+        id: PlaylistId(p.id),
+        // Prefer the true count from the materialized entries.
+        song_count: songs.len() as u32,
+        name: p.name,
+        songs,
+    }
+}
+
 fn map_song(c: data::Child) -> Song {
     Song {
         id: SongId(c.id),
@@ -1028,5 +1126,111 @@ mod tests {
         assert_eq!(i64_to_u32(0), 0);
         assert_eq!(i64_to_u32(42), 42);
         assert_eq!(i64_to_u32(i64::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn map_playlist_list_row_carries_id_name_count_and_no_songs() {
+        // A getPlaylists row (no songs). song_count comes from the wire; the
+        // list fetch never materializes tracks, so `songs` stays empty.
+        let wire: data::Playlist = serde_json::from_str(
+            r#"{ "id": "pl-7", "name": "Warm Room", "songCount": 12,
+                 "owner": "alice", "public": false }"#,
+        )
+        .unwrap();
+        let p = map_playlist(wire);
+        assert_eq!(p.id, PlaylistId("pl-7".into()));
+        assert_eq!(p.name, "Warm Room");
+        assert_eq!(p.song_count, 12);
+        assert!(p.songs.is_empty());
+    }
+
+    #[test]
+    fn map_playlist_with_songs_materializes_entries_and_recomputes_count() {
+        // A getPlaylist row carries `entry: [Child]`; songs map through map_song
+        // and song_count is derived from the true entry count.
+        let wire: data::PlaylistWithSongs = serde_json::from_str(
+            r#"{ "id": "pl-9", "name": "Set", "songCount": 99,
+                 "entry": [
+                   { "id": "s-1", "title": "One", "isDir": false },
+                   { "id": "s-2", "title": "Two", "isDir": false }
+                 ] }"#,
+        )
+        .unwrap();
+        let p = map_playlist_with_songs(wire);
+        assert_eq!(p.id, PlaylistId("pl-9".into()));
+        assert_eq!(p.songs.len(), 2);
+        assert_eq!(p.song_count, 2);
+        assert_eq!(p.songs[0].id, SongId("s-1".into()));
+        assert_eq!(p.songs[1].title, "Two");
+    }
+
+    // ── LIVE Navidrome round-trip (GAP cusq3zaw proof) ─────────────────────
+    //
+    // The sanctioned proof per CLAUDE.md: a REAL create -> read-back -> delete
+    // against the live server the daemon is configured for, leaving no litter.
+    // `#[ignore]` so the default/sandboxed test run skips it (certless, no
+    // network); run with `cargo test -p hypodj-core -- --ignored
+    // playlist_round_trip`. Reads config from env, NEVER printing the password.
+    #[tokio::test]
+    #[ignore = "requires a live Navidrome (HYPODJ_TEST_URL/USER/PASS) + two real song ids"]
+    async fn live_playlist_create_readback_delete_round_trip() {
+        // Config from env; the password is never echoed anywhere.
+        let (url, username, password) = match (
+            std::env::var("HYPODJ_TEST_URL"),
+            std::env::var("HYPODJ_TEST_USER"),
+            std::env::var("HYPODJ_TEST_PASS"),
+        ) {
+            (Ok(u), Ok(n), Ok(p)) => (u, n, p),
+            _ => {
+                eprintln!("skipping live round-trip: HYPODJ_TEST_URL/USER/PASS not set");
+                return;
+            }
+        };
+        let cfg = ServerConfig {
+            url,
+            username,
+            password,
+            client_name: "hypodj-selftest".into(),
+        };
+        let client = SubsonicClient::connect(&cfg).expect("connect");
+        client.ping().await.expect("ping live server");
+
+        // Pick two real song ids from a random-songs pull (no hardcoded ids).
+        let seed = client.random_songs(Some(2)).await.expect("random songs");
+        assert!(seed.len() >= 2, "need at least 2 songs on the server");
+        let song_ids: Vec<SongId> = seed.iter().take(2).map(|s| s.id.clone()).collect();
+
+        // Uniquely-named throwaway so a leftover from a crashed run never clashes.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("hypodj-selftest-{nonce}");
+
+        // (a) create
+        let pid = client
+            .create_playlist(&name, &song_ids)
+            .await
+            .expect("create_playlist");
+
+        // (b) read back: it exists in the list AND carries our songs.
+        let listed = client.get_playlists().await.expect("get_playlists");
+        assert!(
+            listed.iter().any(|p| p.id == pid && p.name == name),
+            "created playlist must appear in getPlaylists"
+        );
+        let full = client.get_playlist(&pid).await.expect("get_playlist");
+        let got: std::collections::HashSet<_> = full.songs.iter().map(|s| &s.id).collect();
+        for want in &song_ids {
+            assert!(got.contains(want), "playlist must contain seeded song {want:?}");
+        }
+
+        // (c) delete: clean up the side effect - leave no litter.
+        client.delete_playlist(&pid).await.expect("delete_playlist");
+        let after = client.get_playlists().await.expect("get_playlists after delete");
+        assert!(
+            !after.iter().any(|p| p.id == pid),
+            "deleted playlist must be gone"
+        );
     }
 }
