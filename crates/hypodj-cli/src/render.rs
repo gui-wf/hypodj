@@ -21,7 +21,13 @@ pub fn render_card(np: &NowPlaying) -> String {
     }
     let mut lines = Vec::new();
     if let Some(t) = &np.title {
-        lines.push(t.clone());
+        // A heart marks a Subsonic favorite (U+2665, cell-width 1, terminal-safe),
+        // prepended to the title only when the current track is starred.
+        if np.starred {
+            lines.push(format!("\u{2665} {t}"));
+        } else {
+            lines.push(t.clone());
+        }
     }
     // "Artist - Album" (whichever of the two is present).
     let sub: Vec<&str> = [np.artist.as_deref(), np.album.as_deref()]
@@ -138,6 +144,25 @@ mod tests {
         assert!(card.contains("3 of 12"));
         assert!(card.contains("3:35"));
         assert!(!card.to_lowercase().contains("elapsed"));
+    }
+
+    #[test]
+    fn card_prepends_heart_when_starred() {
+        let status = p(&[("state", "play")]);
+        let current = p(&[
+            ("file", "song/42"),
+            ("Title", "Blue in Green"),
+            ("X-Starred", "1"),
+        ]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(card.contains("\u{2665} Blue in Green"));
+        // Without the pair the heart is absent (plain title).
+        let plain = render_card(&now_playing(&status, &p(&[
+            ("file", "song/42"),
+            ("Title", "Blue in Green"),
+        ])));
+        assert!(!plain.contains('\u{2665}'));
+        assert!(plain.contains("Blue in Green"));
     }
 
     #[test]
