@@ -22,11 +22,12 @@
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use hypodj_client::mpd::{MpdConn, MpdError};
+use hypodj_client::viz::{VizConn, VizSample};
 use hypodj_client::model::{now_playing, parse_queue, NowPlaying, QueueItem};
 use hypodj_client::nl::{
     armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, split_echo, token_from_pairs,
@@ -122,6 +123,15 @@ pub struct Workers {
     pub cmd_shutdown: TcpStream,
     /// Cloned idle-socket handle (None if the idle socket was not connected at spawn).
     pub idle_shutdown: Option<TcpStream>,
+    /// The LATEST-WINS viz level slot: the dedicated viz worker decodes each frame
+    /// into here (std Mutex, locked only for the swap, never across IO), and the
+    /// render loop samples it each frame. `None` when no daemon frame has landed yet
+    /// OR the viz socket is down (old daemon / refused) - the render loop then draws
+    /// the decorative fallback wave.
+    pub viz_slot: Arc<Mutex<Option<VizSample>>>,
+    /// True while the viz socket is connected. Distinguishes "connected but paused
+    /// (a real resting sample)" from "no viz socket at all (fall back)".
+    pub viz_connected: Arc<AtomicBool>,
 }
 
 /// Connect the command socket (propagating a startup failure), then spawn all three
@@ -172,7 +182,31 @@ pub fn spawn(host: &str, port: u16) -> Result<Workers, MpdError> {
         thread::spawn(move || cc_worker(cc_rx, in_tx, stop));
     }
 
-    Ok(Workers { req_tx, cc_tx, inbound_rx: in_rx, art_tx, stop, cmd_shutdown, idle_shutdown })
+    // VIZ worker: a 4th dedicated socket (MPD port + 1) that streams post-gain
+    // audio levels into a latest-wins slot. Mirrors the idle/art dedicated-socket
+    // pattern; owns no command state. A refused connect / old daemon just leaves the
+    // slot empty and viz_connected false, and the render loop uses the fallback wave.
+    let viz_slot: Arc<Mutex<Option<VizSample>>> = Arc::new(Mutex::new(None));
+    let viz_connected = Arc::new(AtomicBool::new(false));
+    {
+        let host = host.to_string();
+        let slot = viz_slot.clone();
+        let connected = viz_connected.clone();
+        let stop = stop.clone();
+        thread::spawn(move || viz_worker(&host, port, slot, connected, stop));
+    }
+
+    Ok(Workers {
+        req_tx,
+        cc_tx,
+        inbound_rx: in_rx,
+        art_tx,
+        stop,
+        cmd_shutdown,
+        idle_shutdown,
+        viz_slot,
+        viz_connected,
+    })
 }
 
 /// The dedicated CC worker: for each [`Req::Cc`], post a coarse "thinking..." phase,
@@ -556,6 +590,68 @@ fn idle_worker(pre: Option<MpdConn>, tx: Sender<Inbound>, host: &str, port: u16,
                 }
             }
         }
+    }
+}
+
+/// The viz worker: own a dedicated socket at `port + 1`, decode each level frame
+/// into the latest-wins slot, and keep `connected` in step. Connect-or-fallback: a
+/// refused connect (an old daemon with no viz socket) backs off and retries, leaving
+/// the slot empty so the render loop draws the decorative wave. NEVER panics, never
+/// blocks the render thread (it runs on its own thread and only ever touches the
+/// std-Mutex slot for the brief swap).
+fn viz_worker(
+    host: &str,
+    mpd_port: u16,
+    slot: Arc<Mutex<Option<VizSample>>>,
+    connected: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+) {
+    let viz_port = mpd_port.saturating_add(1);
+    let mut backoff = BACKOFF_START;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match VizConn::connect(host, viz_port) {
+            Ok(mut conn) => {
+                backoff = BACKOFF_START;
+                connected.store(true, Ordering::Relaxed);
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        connected.store(false, Ordering::Relaxed);
+                        return;
+                    }
+                    match conn.next_sample() {
+                        Ok(Some(sample)) => {
+                            // Latest-wins: overwrite; lock only for the swap.
+                            if let Ok(mut g) = slot.lock() {
+                                *g = Some(sample);
+                            }
+                        }
+                        // A line that did not decode: skip, keep reading.
+                        Ok(None) => {}
+                        // Socket closed / errored: drop to reconnect.
+                        Err(_) => break,
+                    }
+                }
+                // Disconnected: mark down and clear the stale level so the render
+                // loop falls back rather than freezing on the last frame.
+                connected.store(false, Ordering::Relaxed);
+                if let Ok(mut g) = slot.lock() {
+                    *g = None;
+                }
+            }
+            Err(_) => {
+                // No viz socket (old daemon / refused): back off and retry, staying
+                // in fallback the whole time.
+                connected.store(false, Ordering::Relaxed);
+            }
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 

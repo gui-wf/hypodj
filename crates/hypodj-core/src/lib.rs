@@ -31,3 +31,4 @@ pub mod resume;
 pub mod scrobble;
 pub mod subsonic;
 pub mod timer;
+pub mod viz;

@@ -346,7 +346,8 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        hit_style, match_spans, track_seed, volume_slider, wave_glyphs, wave_row, window_title,
+        hit_style, level_wave_row, match_spans, track_seed, volume_slider, wave_glyphs, wave_row,
+        window_title, BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
     use hypodj_client::model::NowPlaying;
@@ -604,6 +605,35 @@ mod tests {
     }
 
     #[test]
+    fn level_wave_row_length_and_caps() {
+        // Exactly `width` glyphs at every width, including degenerate 0/1.
+        for w in [0usize, 1, 5, 20, 80] {
+            assert_eq!(level_wave_row(w, 3.0, 42, 1.0, true).chars().count(), w);
+        }
+        // The ramp NEVER reaches the full block (U+2588 = BLOCK_GLYPHS[7]): even at
+        // maximum level the loudest glyph is at most U+2587 (index 6), leaving the
+        // top breathing sliver.
+        let full = BLOCK_GLYPHS[7];
+        let loud = level_wave_row(120, 5.0, 7, 1.0, true);
+        assert!(loud.chars().all(|c| c != full), "full block is banned: {loud}");
+        // Every glyph is on the allowed ramp.
+        let allowed = wave_glyphs();
+        assert!(loud.chars().all(|c| allowed.contains(&c)));
+    }
+
+    #[test]
+    fn level_wave_row_hairline_when_paused_or_silent() {
+        let base = wave_glyphs()[0];
+        // Not playing -> a flat resting hairline, no motion, time-independent.
+        let row = level_wave_row(30, 5.0, 7, 0.8, false);
+        assert!(row.chars().all(|c| c == base), "paused row is the hairline");
+        assert_eq!(row, level_wave_row(30, 999.0, 7, 0.8, false));
+        // Playing but silent (a == 0) also rests on the hairline (round(0) == 0).
+        let quiet = level_wave_row(30, 5.0, 7, 0.0, true);
+        assert!(quiet.chars().all(|c| c == base), "silence rests on the hairline");
+    }
+
+    #[test]
     fn wave_row_different_seeds_diverge() {
         // Two tracks (seeds from real file hashes) at the same instant have distinct
         // textures. Use realistic hashed seeds - adjacent tiny integers fold to
@@ -851,6 +881,43 @@ fn wave_row(width: usize, t_secs: f64, seed: u64, animate: bool) -> String {
     out
 }
 
+/// Build one borderless bottom-bar row driven by the REAL post-gain audio level
+/// `a` in `[0, 1]` (the smoothed ballistics envelope). The shipped two-sine standing
+/// wave becomes the SPATIAL texture (so each track keeps its own look via `seed`),
+/// now amplitude-DRIVEN instead of constant: a loud chorus rolls a full field, a
+/// quiet verse a low ripple, a fade settles it toward the hairline. The ramp is
+/// CAPPED at index 6 (`U+2587`), never the full block `U+2588`, so a permanent 1/8
+/// sliver of background sits above the loudest wave (top breathing room). When
+/// `playing` is false the row is a flat resting `▁` hairline with no motion (a frozen
+/// animated wave reads as broken). Pure and deterministic - unit-tested.
+fn level_wave_row(width: usize, t_secs: f64, seed: u64, a: f32, playing: bool) -> String {
+    let glyphs = wave_glyphs();
+    if width == 0 {
+        return String::new();
+    }
+    // Not playing: a resting hairline (the lowest glyph), no motion.
+    if !playing {
+        return std::iter::repeat(glyphs[0]).take(width).collect();
+    }
+    let a = (a.clamp(0.0, 1.0)) as f64;
+    let phase = seed_phase(seed);
+    let (k1, k2, w1, w2) = (0.35_f64, 0.17_f64, 0.9_f64, 0.6_f64);
+    let mut out = String::with_capacity(width);
+    for x in 0..width {
+        let xf = x as f64;
+        let s = 0.6 * (xf * k1 + t_secs * w1 + phase).sin()
+            + 0.4 * (xf * k2 - t_secs * w2 + phase * 1.7).sin();
+        // Remap the texture s in [-1,1] -> [0.15, 1.0] so no column dies to zero
+        // while playing (the field breathes, never gaps).
+        let shape01 = 0.15 + (s + 1.0) / 2.0 * 0.85;
+        // Height CAPPED at 6 (U+2587): the loudest music tops at 7/8, leaving the
+        // top-of-row breathing sliver. The floor is index 0 (U+2581 hairline).
+        let level = (6.0 * a * shape01).round().clamp(0.0, 6.0) as usize;
+        out.push(glyphs[level]);
+    }
+    out
+}
+
 /// The thin, borderless bottom bar: the command/search prompt while typing, a status
 /// banner when one is set, else the dim ambient wave when truly idle. Confirm renders
 /// its own popup (see [`render_confirm_popup`]), so the bar stays blank there.
@@ -874,9 +941,18 @@ fn render_command(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) 
         Mode::Normal => match &state.status_msg {
             Some(msg) => Line::from(msg.replace('\n', " ")),
             None => {
-                // Truly idle: the dim ambient wave, animating only while playing.
-                let animate = state.now.state.as_deref() == Some("play");
-                let wave = wave_row(area.width as usize, state.anim_secs, track_seed(&state.now), animate);
+                // Truly idle: the bottom-bar wave. When the viz socket is live
+                // (viz_active) draw the REAL post-gain level field; otherwise fall
+                // back to the decorative wall-clock wave, animating only while
+                // playing. Both are DIM so the row stays the least-prominent surface.
+                let width = area.width as usize;
+                let seed = track_seed(&state.now);
+                let wave = if state.viz_active {
+                    level_wave_row(width, state.anim_secs, seed, state.viz_env, state.viz_playing)
+                } else {
+                    let animate = state.now.state.as_deref() == Some("play");
+                    wave_row(width, state.anim_secs, seed, animate)
+                };
                 Line::from(Span::styled(wave, Style::default().add_modifier(Modifier::DIM)))
             }
         },

@@ -89,6 +89,20 @@ pub enum PlayerEvent {
     /// now-playing on a NEW Playing id and attribute later `TimePos` to that
     /// latched id. `song`/`queue_id` are `None` on Stop (no current entry).
     StateChanged(PlayState, Option<SongId>, Option<QueueId>),
+    /// A post-decode audio LEVEL sample for the cosmetic HUD visualizer, read from
+    /// the labelled `@viz` lavfi `astats` node at mpv's af-metadata cadence (~20 Hz).
+    /// `rms_db`/`peak_db` are the RAW (pre-softvol) levels in dBFS; `gain_db` is the
+    /// actor's current softvol gain (from `cur_vol`), so a subscriber recovers the
+    /// AUDIBLE post-gain level as `rms_db + gain_db` (a startle-safe fade then reads
+    /// as a genuine descent of the bars). Emitted best-effort via `try_send`
+    /// (drop-on-Full): a stale level is harmless to lose and MUST NEVER wedge the
+    /// actor. `NullPlayer` never emits it; a filter failure degrades to no Viz.
+    Viz {
+        rms_db: f32,
+        peak_db: f32,
+        gain_db: f32,
+        playing: bool,
+    },
 }
 
 /// Commands sent INTO the player actor. Each carries a `oneshot` for its reply,
@@ -163,6 +177,20 @@ pub(crate) fn mpv_volume_to_db(vol: f64) -> f64 {
         return SYNTH_FLOOR_DB;
     }
     60.0 * (vol / 100.0).log10()
+}
+
+/// A silent, not-playing Viz frame. The af-metadata arm only emits while audio is
+/// decoding, so pause/stop/EOF must push ONE resting frame or the client's
+/// latest-wins viz slot keeps the last playing=true level and freezes the level
+/// field lit. `rms_db`/`peak_db` sit at the silence floor and `playing = false`, so
+/// the client targets the resting hairline regardless of the reported level.
+fn resting_viz(cur_vol: f64) -> PlayerEvent {
+    PlayerEvent::Viz {
+        rms_db: -120.0,
+        peak_db: -120.0,
+        gain_db: mpv_volume_to_db(cur_vol) as f32,
+        playing: false,
+    }
 }
 
 /// The cloneable handle every other layer holds. Cheap to clone (just channel
@@ -507,19 +535,40 @@ fn mpv_actor(
 ) {
     use libmpv2::{Format, events::Event};
 
+    // VIZ TAP (cosmetic HUD level meter). Add a LABELLED lavfi `astats` node to the
+    // audio filter chain, POST-construction and NON-FATALLY: a filter error here
+    // (stripped ffmpeg, no astats) must degrade to no-viz, NEVER silence the deck -
+    // so `let _`, never `?`. The `@viz:` label binds the node we read metadata from
+    // (`af-metadata/viz`); labelling the chain or asetnsamples yields a dead node.
+    // No asetnsamples: mpv coalesces af-metadata dispatch to ~20 Hz regardless.
+    if let Err(e) = mpv.set_property("af", "@viz:astats=metadata=1:reset=1") {
+        tracing::warn!(error = %e, "viz astats filter unavailable; playback continues without the HUD level meter");
+    }
+
     // Observe time-pos so we can push TimePos events (drives scrobble + UI).
     let ectx = mpv.event_context_mut();
     let _ = ectx.observe_property("time-pos", Format::Double, 0);
     let _ = ectx.observe_property("eof-reached", Format::Flag, 1);
+    // Observe the labelled astats node as a whole Node (a map of string metadata);
+    // read `lavfi.astats.Overall.RMS_level` / `Peak_level` off it. Do NOT observe the
+    // sub-key path `af-metadata/viz/lavfi.astats...` - it fires no events (mpv regr).
+    let _ = ectx.observe_property("af-metadata/viz", Format::Node, 2);
 
     let mut current: Option<SongId> = None;
     let mut current_qid: Option<QueueId> = None;
+    // The actor's current softvol volume (0..=100, fractional). The user af chain
+    // runs BEFORE mpv's internal softvol, so astats measures PRE-gain; carrying the
+    // live gain lets the emitted Viz recover the audible post-gain level. Seeded to
+    // mpv's default volume (100 == 0 dB) and updated on every SetVolume(F64).
+    let mut cur_vol: f64 = 100.0;
+    // Whether the deck is currently playing, for the Viz `playing` flag.
+    let mut playing = false;
 
     loop {
         // 1. Drain any pending commands without blocking.
         match cmd_rx.try_recv() {
             Ok(cmd) => {
-                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, cmd) {
+                if handle_cmd(&mpv, &state_tx, &evt_tx, &mut current, &mut current_qid, &mut cur_vol, &mut playing, cmd) {
                     // Stop requested with shutdown intent is not modeled;
                     // channel close is the only exit. Continue.
                 }
@@ -543,6 +592,24 @@ fn mpv_actor(
                         pos: t,
                         queue_id: current_qid,
                     });
+                }
+            }
+            Some(Ok(Event::PropertyChange { name: "af-metadata/viz", change, .. })) => {
+                // The labelled astats node fired: parse RMS/peak (dBFS) and emit a
+                // best-effort Viz. try_send (drop-on-Full) mirrors the TimePos
+                // discipline - a cosmetic level must never wedge the actor. A node
+                // that carries no parseable levels (a transient empty dispatch) is
+                // simply skipped; playback is untouched either way.
+                if let libmpv2::events::PropertyData::Node(node) = change {
+                    if let Some((rms_db, peak_db)) = parse_astats_levels(node) {
+                        let gain_db = mpv_volume_to_db(cur_vol) as f32;
+                        let _ = evt_tx.try_send(PlayerEvent::Viz {
+                            rms_db,
+                            peak_db,
+                            gain_db,
+                            playing,
+                        });
+                    }
                 }
             }
             Some(Ok(Event::EndFile(reason))) => {
@@ -580,6 +647,10 @@ fn mpv_actor(
                         // something was actually latched (queue_id present).
                         let song = current.take();
                         let qid = current_qid.take();
+                        playing = false;
+                        // Trailing resting frame: EOF stops decode, so the last live
+                        // Viz would otherwise stay lit at the pre-stop loudness forever.
+                        let _ = evt_tx.try_send(resting_viz(cur_vol));
                         let _ = state_tx.send(PlayState::Stopped);
                         if qid.is_some() {
                             let _ = evt_tx
@@ -615,6 +686,11 @@ fn handle_cmd(
     evt_tx: &mpsc::Sender<PlayerEvent>,
     current: &mut Option<SongId>,
     current_qid: &mut Option<QueueId>,
+    // Tracked softvol volume + play flag, so the Viz emit can report the audible
+    // post-gain level and whether sound is flowing. Mutated here (the single place
+    // volume + play-state actually change) and read by the af-metadata arm.
+    cur_vol: &mut f64,
+    playing: &mut bool,
     cmd: PlayerCommand,
 ) -> bool {
     match cmd {
@@ -627,6 +703,7 @@ fn handle_cmd(
                 Ok(()) => {
                     *current = song.clone();
                     *current_qid = queue_id;
+                    *playing = true;
                     let _ = state_tx.send(PlayState::Playing);
                     // Reply BEFORE the StateChanged blocking_send: the spine's
                     // play_url().await must complete and return to draining before
@@ -649,6 +726,12 @@ fn handle_cmd(
                 .set_property("pause", true)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             if res.is_ok() {
+                *playing = false;
+                // The af-metadata arm stops firing once decode halts, so without a
+                // trailing resting frame the client's latest-wins viz slot would keep
+                // the last playing=true level and freeze the level field lit. Emit one
+                // silent, not-playing Viz so the bars settle to the resting hairline.
+                let _ = evt_tx.try_send(resting_viz(*cur_vol));
                 let _ = state_tx.send(PlayState::Paused);
                 let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
                     PlayState::Paused,
@@ -663,6 +746,7 @@ fn handle_cmd(
                 .set_property("pause", false)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             if res.is_ok() {
+                *playing = true;
                 let _ = state_tx.send(PlayState::Playing);
                 let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
                     PlayState::Playing,
@@ -678,6 +762,10 @@ fn handle_cmd(
                 .map_err(|e| PlayerError::Backend(e.to_string()));
             *current = None;
             *current_qid = None;
+            *playing = false;
+            // Resting frame so the level field settles instead of freezing at the
+            // pre-stop loudness (the af-metadata arm goes silent once decode stops).
+            let _ = evt_tx.try_send(resting_viz(*cur_vol));
             let _ = state_tx.send(PlayState::Stopped);
             let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
             let _ = reply.send(res);
@@ -698,6 +786,9 @@ fn handle_cmd(
             let res = mpv
                 .set_property("volume", vol as i64)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
+            if res.is_ok() {
+                *cur_vol = vol as f64;
+            }
             let _ = reply.send(res);
         }
         PlayerCommand::SetVolumeF64 { vol, reply } => {
@@ -707,6 +798,9 @@ fn handle_cmd(
             let res = mpv
                 .set_property("volume", vol)
                 .map_err(|e| PlayerError::Backend(e.to_string()));
+            if res.is_ok() {
+                *cur_vol = vol;
+            }
             let _ = reply.send(res);
         }
         // The mpv actor never receives TestEof (only NullPlayer does), but the
@@ -722,6 +816,43 @@ fn handle_cmd(
 /// double quotes. We use double-quotes (URLs never contain a literal `"`).
 fn quote(url: &str) -> String {
     format!("\"{url}\"")
+}
+
+/// A hard floor (dBFS) for a parsed astats level: astats reports silence as
+/// `-inf`, which would poison the downstream normalize. Any non-finite / very low
+/// value is clamped to this so the wire always carries a finite number.
+pub(crate) const VIZ_FLOOR_DBFS: f32 = -120.0;
+
+/// Extract `(rms_db, peak_db)` in dBFS from an `af-metadata/viz` node (a string
+/// map). astats writes `lavfi.astats.Overall.RMS_level` / `Overall.Peak_level` as
+/// stringified dBFS. Returns `None` when NEITHER level is present (a transient
+/// empty dispatch), so a dead node never emits a bogus sample. `-inf` (true
+/// silence) parses to `f32::NEG_INFINITY`, which we clamp to [`VIZ_FLOOR_DBFS`].
+pub(crate) fn parse_astats_levels(node: libmpv2::mpv_node::MpvNode) -> Option<(f32, f32)> {
+    let map = node.map()?;
+    let mut rms: Option<f32> = None;
+    let mut peak: Option<f32> = None;
+    for (key, value) in map {
+        // Values are strings; tolerate a stray numeric node just in case.
+        let parsed: Option<f32> = match value {
+            libmpv2::mpv_node::MpvNode::String(s) => s.trim().parse::<f32>().ok(),
+            libmpv2::mpv_node::MpvNode::Double(d) => Some(d as f32),
+            _ => None,
+        };
+        let Some(v) = parsed else { continue };
+        let v = if v.is_finite() { v } else { VIZ_FLOOR_DBFS };
+        let v = v.max(VIZ_FLOOR_DBFS);
+        if key.ends_with("RMS_level") {
+            rms = Some(v);
+        } else if key.ends_with("Peak_level") {
+            peak = Some(v);
+        }
+    }
+    match (rms, peak) {
+        (None, None) => None,
+        // If only one surfaced, mirror it so a subscriber still gets a usable pair.
+        (r, p) => Some((r.or(p).unwrap(), p.or(r).unwrap())),
+    }
 }
 
 #[cfg(test)]
@@ -842,6 +973,115 @@ mod tests {
             let got: f64 = mpv.get_property("volume").expect("get volume");
             assert!((got - target).abs() < 1e-6, "vol {target} read back as {got}");
         }
+    }
+
+    // LIVE empirical proof of the viz data tap (the crux of the waveform feature):
+    // on THIS installed mpv/libmpv, the labelled `@viz:astats` node surfaces
+    // `lavfi.astats.Overall.RMS_level`/`Peak_level` via `af-metadata/viz` and the
+    // observe pushes at ~20 Hz. We synthesize a tiny amplitude-RAMPED tone WAV so the
+    // RMS is guaranteed to CHANGE over time, then assert we read real, finite,
+    // VARYING levels. Ignored by default (needs a real libmpv runtime, absent in the
+    // link-isolated Nix build sandbox); run with:
+    //   cargo test -p hypodj-core -- --ignored live_astats_viz_levels_change
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the astats viz tap"]
+    fn live_astats_viz_levels_change() {
+        use libmpv2::{events::Event, events::PropertyData, Format, Mpv};
+        use std::io::Write;
+
+        // 1. Synthesize ~2s of 440 Hz sine, mono s16le @ 44100, whose amplitude
+        //    ramps 0 -> full so the windowed RMS genuinely rises over time.
+        let sample_rate = 44100u32;
+        let secs = 2.0f64;
+        let n = (sample_rate as f64 * secs) as usize;
+        let mut pcm: Vec<u8> = Vec::with_capacity(n * 2);
+        for i in 0..n {
+            let t = i as f64 / sample_rate as f64;
+            let amp = (t / secs).clamp(0.0, 1.0); // 0 -> 1 ramp
+            let s = (2.0 * std::f64::consts::PI * 440.0 * t).sin() * amp;
+            let v = (s * i16::MAX as f64) as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        // Minimal 44-byte WAV header + PCM body.
+        let data_len = pcm.len() as u32;
+        let mut wav: Vec<u8> = Vec::with_capacity(44 + pcm.len());
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&sample_rate.to_le_bytes());
+        wav.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+        wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_len.to_le_bytes());
+        wav.extend_from_slice(&pcm);
+
+        let path = std::env::temp_dir().join("hypodj_viz_probe.wav");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(&wav))
+            .expect("write probe wav");
+
+        // 2. Headless mpv (ao=null) with the SAME labelled viz filter the actor sets.
+        let mut mpv = Mpv::with_initializer(|init| {
+            init.set_property("vid", "no")?;
+            init.set_property("ao", "null")?;
+            init.set_property("terminal", "no")?;
+            Ok(())
+        })
+        .expect("construct mpv");
+        mpv.set_property("af", "@viz:astats=metadata=1:reset=1")
+            .expect("set viz astats filter");
+        {
+            let ectx = mpv.event_context_mut();
+            ectx.observe_property("af-metadata/viz", Format::Node, 2)
+                .expect("observe af-metadata/viz");
+        }
+        mpv.command("loadfile", &[&quote(&path.to_string_lossy()), "replace"])
+            .expect("loadfile");
+        mpv.set_property("pause", false).expect("unpause");
+
+        // 3. Collect RMS samples for up to ~4s of wall time.
+        let mut rms_samples: Vec<f32> = Vec::new();
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_secs(4) && rms_samples.len() < 40 {
+            let ectx = mpv.event_context_mut();
+            match ectx.wait_event(0.2) {
+                Some(Ok(Event::PropertyChange { name: "af-metadata/viz", change, .. })) => {
+                    if let PropertyData::Node(node) = change {
+                        if let Some((rms, _peak)) = parse_astats_levels(node) {
+                            rms_samples.push(rms);
+                        }
+                    }
+                }
+                Some(Ok(Event::EndFile(_))) => break,
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+
+        // 4. Assert we got REAL, finite, non-silent, VARYING levels.
+        assert!(
+            rms_samples.len() >= 2,
+            "expected multiple af-metadata/viz RMS samples, got {rms_samples:?}"
+        );
+        assert!(
+            rms_samples.iter().all(|v| v.is_finite()),
+            "every level is finite (no raw -inf leaked): {rms_samples:?}"
+        );
+        assert!(
+            rms_samples.iter().any(|&v| v > VIZ_FLOOR_DBFS + 1.0),
+            "at least one level is above the floor (real signal): {rms_samples:?}"
+        );
+        let lo = rms_samples.iter().cloned().fold(f32::INFINITY, f32::min);
+        let hi = rms_samples.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (hi - lo) > 1.0,
+            "the ramped tone must make RMS CHANGE over time (lo={lo}, hi={hi}): {rms_samples:?}"
+        );
     }
 
     // The handle is cloneable and shared: a second clone sees the same state,

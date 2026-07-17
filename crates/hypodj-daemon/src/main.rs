@@ -226,6 +226,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let bind: SocketAddr = cfg.mpd.bind.parse()?;
+
+    // COSMETIC VIZ side-channel: a dedicated socket at MPD_port + 1 streaming the
+    // post-gain audio levels to any HUD client (dj-gui). Best-effort and fully out
+    // of band - a bind failure logs and is ignored (clients degrade to the
+    // decorative wave), and nothing here can touch playback or the MPD server.
+    {
+        let viz_bind = SocketAddr::new(bind.ip(), bind.port().saturating_add(1));
+        let viz_tx = runtime.viz.clone();
+        tokio::spawn(async move {
+            if let Err(e) = hypodj_core::viz::serve_viz(viz_bind, viz_tx).await {
+                tracing::warn!(error = %e, %viz_bind, "viz socket unavailable; clients will use the fallback wave");
+            }
+        });
+    }
+
     let server = MpdServer::new(bind);
     tracing::info!(%bind, "starting MPD server");
     // The internal shutdown-fade budget tracks the configured shutdown_fade_secs
