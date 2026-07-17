@@ -745,9 +745,13 @@ fn fade_task(
                     // The dip reached its floor AND this is still the current epoch, so
                     // no superseding skip/setvol/stop got here first: it is SAFE to
                     // load the target. mpv's softvol (at the dip floor) persists across
-                    // the loadfile, so the new track starts at that shallow-duck level
+                    // the switch, so the new track starts at that shallow-duck level
                     // and the follow-on ResumeIn owns the rise back to the baseline.
-                    let _ = sink.play_url(play.song_id, Some(play.qid), &play.url).await;
+                    // switch_warmed lands on the prefetched entry near-instant (the
+                    // trough gap collapses toward ~0); if the warm never completed it
+                    // falls back to a plain loadfile-replace - today's behavior, so a
+                    // prefetch miss/failure is never worse than before.
+                    let _ = sink.switch_warmed(play.song_id, Some(play.qid), &play.url).await;
                     // Commit the target as the real current, clear the reported-target
                     // override, pin the live gain to the dip floor (where the deck and
                     // the ResumeIn's from_db agree) and keep `fading` true - the
@@ -1838,6 +1842,13 @@ impl HypodjHandler {
         let dur = req.dur;
         let intent = req.intent;
         let commit_logical = req.commit_logical;
+        // A committing fade (setvol glide / knob) SUPERSEDES whatever is running and
+        // clears `pending_skip` in the install closure below. If it superseded a live
+        // skip dip, the prefetched warm target is now STALE (its Terminal::SkipLoad will
+        // never run), so it must be dropped or the still-playing current track's later
+        // natural EOF would auto-advance into it. Non-committing fades (resume/wind-down/
+        // wake/dip) never abort a skip this way, so they leave the warm alone.
+        let is_commit = commit_logical.is_some();
 
         let cfg = self.fade_cfg.clone();
         let state_read = self.state.clone();
@@ -1930,6 +1941,14 @@ impl HypodjHandler {
 
         // On rejection nothing was disturbed: the in-flight fade (if any) is still
         // running and no volume was touched, so just surface the ACK error.
+        //
+        // On a SUCCESSFUL committing install, `pending_skip` was cleared (a superseded
+        // skip): drop any now-stale parked warm target so it can never auto-advance
+        // behind the current track. Best-effort + idempotent (a no-op when nothing was
+        // warmed). Done after the supersede's abort+join, so it never races a SkipLoad.
+        if is_commit && res.is_ok() {
+            let _ = self.player.drop_warm().await;
+        }
         res
     }
 
@@ -2158,10 +2177,16 @@ impl HypodjHandler {
         }
         self.notify_change();
         let dur = self.pause_fade_dur();
-        match self
+        let r = self
             .start_fade_spec(FadeRequest { intent: FadeIntent::PauseOut, dur, commit_logical: None })
-            .await
-        {
+            .await;
+        // A pause issued during a skip dip supersedes it (above): the skip target never
+        // loads, so drop any parked warm entry - else the OLD track (still loaded, now
+        // paused) would auto-advance into the stale target at its natural EOF once
+        // resumed. Best-effort + idempotent; PauseOut is non-committing so start_fade_spec
+        // does not do this itself. Done after the fade install (abort+join), no SkipLoad race.
+        let _ = self.player.drop_warm().await;
+        match r {
             Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(error = %e, "pause fade rejected; pausing without fade");
@@ -2900,6 +2925,16 @@ impl HypodjHandler {
         // target at once.
         self.state.lock().unwrap().pending_skip = Some(idx);
         self.notify_change();
+
+        // (c2) WARM the target stream in the BACKGROUND during the dip: mpv opens +
+        // demuxes + decodes the appended entry off the audible chain, so the trough
+        // switch (Terminal::SkipLoad -> switch_warmed) lands near-instant instead of
+        // paying the network first-byte cost at the bottom of the dip - collapsing the
+        // moment-of-silence artifact. Purely best-effort and PURE GAIN: the warmed
+        // entry is NOT routed to output (no bleed at the shallow duck), and a warm
+        // failure just degrades switch_warmed to today's trough loadfile - never worse,
+        // never a panic or silence. Errors are ignored here on purpose.
+        let _ = self.player.prefetch_warm(&play.url).await;
 
         // (e) Install the deliberate dip-out to silence -> Terminal::SkipLoad.
         match self.install_skip_dip(dur, idx, play, resume_spec, baseline).await {
@@ -6830,6 +6865,32 @@ mod tests {
         assert_eq!(h.state.lock().unwrap().reported_volume(), 100);
         assert!(h.live_gain_db() > h.fade_cfg.synth_floor_db + 5.0, "ramped back up");
         assert_eq!(h.state.lock().unwrap().current, Some(1));
+    }
+
+    // The warm-skip path is PURE GAIN: a user Next drives dip -> switch_warmed ->
+    // ResumeIn with NO pause/unpause anywhere. The deck stays Playing across the whole
+    // skip and no Paused state edge is ever emitted - the fix warms the target stream,
+    // it never introduces a transport pause (HARD CONSTRAINT 1).
+    #[tokio::test(start_paused = true)]
+    async fn warm_skip_is_pure_gain_never_pauses() {
+        let Some((h, mut events)) = handler_with_null_player() else { return };
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+
+        h.handle(MpdCommand::Next).await;
+        h.wait_for_fade().await; // dip -> switch_warmed lands the target
+        h.wait_for_fade().await; // follow-on ResumeIn back to baseline
+
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "target committed");
+        assert_eq!(h.player.state(), PlayState::Playing, "deck never left Playing");
+
+        // Not a single Paused edge crossed the wire during the skip.
+        while let Ok(ev) = events.try_recv() {
+            if let PlayerEvent::StateChanged(PlayState::Paused, _, _) = ev {
+                panic!("a skip must never pause the deck (pure gain violated)");
+            }
+        }
     }
 
     // A rapid SECOND skip during the dip SUPERSEDES the first: the first SkipLoad
