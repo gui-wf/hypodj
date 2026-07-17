@@ -222,9 +222,57 @@ pub enum MpdCommand {
     /// See [`WakeCmd`].
     Wake(WakeCmd),
 
+    /// `field` / `field <word...>` / `field less|more|back` / `field clear` - the
+    /// latent-field FIRST SLICE: SET a decaying pull over P4 selection, SEE the live
+    /// pulls, one-nudge correct the most-recent one, or clear them. NOT a standard
+    /// MPD command; a hypodj extension. Biases candidate ranking ONLY - never
+    /// mutates the queue, never arms. See [`FieldCmd`] and [`parse_field`].
+    Field(FieldCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
+}
+
+/// A parsed `field` subcommand (the latent-field first-slice surface).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldCmd {
+    /// `field` - render the live pulls with provenance + decayed strength (SEE).
+    Status,
+    /// `field <word...>` - SET a pull toward a named direction via the lexicon.
+    Set(String),
+    /// `field less|back|more` - one-nudge correction of the most-recent pull.
+    Nudge(FieldNudge),
+    /// `field clear` - drop every pull (correct the system's beliefs, non-destructive).
+    Clear,
+}
+
+/// The one-nudge correction directions for `field`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldNudge {
+    /// `less` / `back` - attenuate the most-recent pull (halve it).
+    Less,
+    /// `more` - strengthen the most-recent pull.
+    More,
+}
+
+/// Parse a `field` request. `field` alone reads the field; the reserved keywords
+/// `clear`, `less`, `back`, `more` are the correction/clear verbs; anything else is
+/// a SET whose joined text is mapped through the mood lexicon by the handler (an
+/// unmapped word yields the honest "no pull felt" echo, never an error here).
+fn parse_field(args: &[String], _line: &str) -> MpdCommand {
+    if args.is_empty() {
+        return MpdCommand::Field(FieldCmd::Status);
+    }
+    if args.len() == 1 {
+        match args[0].to_lowercase().as_str() {
+            "clear" => return MpdCommand::Field(FieldCmd::Clear),
+            "less" | "back" => return MpdCommand::Field(FieldCmd::Nudge(FieldNudge::Less)),
+            "more" => return MpdCommand::Field(FieldCmd::Nudge(FieldNudge::More)),
+            _ => {}
+        }
+    }
+    MpdCommand::Field(FieldCmd::Set(args.join(" ")))
 }
 
 /// Which way the physical-potentiometer knob turns. One press = one equal-loudness
@@ -1041,6 +1089,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "sleep" => parse_sleep(&args, line),
         "winddown" => parse_winddown(&args, line),
         "wake" => parse_wake(&args, line),
+        "field" => parse_field(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),

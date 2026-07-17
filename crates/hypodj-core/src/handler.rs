@@ -40,7 +40,10 @@ use crate::fade::{
     StartleBounds,
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
-use crate::intelligence::{FeatureStore, MetadataStore};
+use crate::intelligence::{
+    lexicon_pull, pull_reweight, FeatureStore, MetadataStore, PullField, TrackFeatures,
+    LEXICON_PULL_STRENGTH,
+};
 use crate::model::{AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId};
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
@@ -50,8 +53,8 @@ use crate::subsonic::SubsonicError;
 use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
 use crate::mpd::{
-    FadeArgs, FadeKind, KnobDir, MpdCommand, MpdHandler, MpdResponse, NlCmd, PlanCmd, SleepCmd,
-    StickerCmd, WakeCmd, WakeWhen, WinddownCmd,
+    FadeArgs, FadeKind, FieldCmd, FieldNudge, KnobDir, MpdCommand, MpdHandler, MpdResponse, NlCmd,
+    PlanCmd, SleepCmd, StickerCmd, WakeCmd, WakeWhen, WinddownCmd,
 };
 use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
@@ -898,6 +901,13 @@ pub struct HypodjHandler {
     /// READ-ONLY via pure `features(...)` calls - no lock, never held across an
     /// `.await`.
     store: Arc<dyn FeatureStore>,
+    /// The latent-field FIRST SLICE: a small, decaying set of active PULLS biasing
+    /// P4 candidate ranking. `FieldSource` with its wings folded
+    /// (docs/design/latent-field-interface.md). Read/mutated under a SHORT std-`Mutex`
+    /// scope, NEVER held across an `.await` - the pure `intelligence::pull_*` work
+    /// happens on cloned values. Empty by default: with no pull the selection path is
+    /// byte-identical to today.
+    pulls: Mutex<PullField>,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -1036,6 +1046,7 @@ impl HypodjHandler {
             state_path: Mutex::new(None),
             last_elapsed_ms: Arc::new(AtomicU64::new(0)),
             store: Arc::new(MetadataStore),
+            pulls: Mutex::new(PullField::new()),
         }
     }
 
@@ -1596,11 +1607,112 @@ impl HypodjHandler {
                 calmer_rerank(self.store.as_ref(), &seed, pool, want)
             }
         };
+        // THE REWEIGHT HOOK: the single seam P4 HEURISTIC candidate selection
+        // funnels through. When a latent-field pull is active, reorder these
+        // resolved candidates toward the pulled direction (biasing WHICH tracks lead
+        // the append), relative to the current track. When no pull is active this is
+        // a no-op and the enqueue order is byte-identical to today. It ONLY reorders
+        // candidate ranking - it never touches the queue, never arms.
+        //
+        // CRUCIALLY it is gated to the heuristic pools (Similar/Calmer) only. The
+        // deterministic/explicit selectors (Exact, Query, Genre, Radio) name a
+        // definite, user/plan-specified ordered list; a live pull must NEVER silently
+        // reorder that observable list. Exact especially is an explicit ordered add.
+        let songs = if matches!(selector, Selector::Similar(_) | Selector::Calmer(_)) {
+            self.pull_rerank(songs)
+        } else {
+            songs
+        };
         let n = songs.len();
         for s in songs {
             self.enqueue_song(s).await;
         }
         Ok(n)
+    }
+
+    /// Snapshot the currently-playing library [`Song`] (a clone), or `None` when
+    /// nothing is playing or the current entry is a stream. Short lock scope, no
+    /// `.await` held.
+    fn current_song(&self) -> Option<Song> {
+        let st = self.state.lock().unwrap();
+        match st.current.and_then(|i| st.queue.get(i)) {
+            Some(item) => match &item.entry {
+                QueueEntry::Song(s) => Some(s.clone()),
+                QueueEntry::Stream { .. } => None,
+            },
+            None => None,
+        }
+    }
+
+    /// Apply the active latent-field pulls to a resolved candidate list, biasing the
+    /// ranking toward the pulled direction relative to the current track (or a neutral
+    /// center when nothing is playing). Returns the list UNCHANGED when no pull is
+    /// active - the "degrades to today exactly" guarantee. Pure work on cloned values;
+    /// the `pulls` lock is dropped before the reweight.
+    fn pull_rerank(&self, songs: Vec<Song>) -> Vec<Song> {
+        let now = Instant::now();
+        let field = {
+            let mut f = self.pulls.lock().unwrap();
+            f.prune(now);
+            if !f.is_active(now) {
+                return songs;
+            }
+            f.clone()
+        };
+        // reference_features = the current track, or a neutral center (0.5, 0.5).
+        let reference = self
+            .current_song()
+            .and_then(|s| self.store.features(&s))
+            .unwrap_or(TrackFeatures { energy: 0.5, valence: 0.5, embedding: None });
+        pull_reweight(&field, now, self.store.as_ref(), &reference, songs)
+    }
+
+    /// Dispatch a parsed `field` command: SET a pull, SEE the field, one-nudge
+    /// correct, or clear. All non-destructive - it only reads/edits the belief list.
+    fn handle_field(&self, cmd: FieldCmd) -> MpdResponse {
+        let now = Instant::now();
+        match cmd {
+            FieldCmd::Status => {
+                let lines = {
+                    let mut f = self.pulls.lock().unwrap();
+                    f.prune(now);
+                    f.describe(now)
+                };
+                if lines.is_empty() {
+                    return MpdResponse::pairs().pair("field", "no pulls active").build();
+                }
+                let mut b = MpdResponse::pairs();
+                for line in lines {
+                    b = b.pair("pull", line);
+                }
+                b.build()
+            }
+            FieldCmd::Set(words) => match lexicon_pull(&words, LEXICON_PULL_STRENGTH, now) {
+                Some(pull) => {
+                    let label = pull.label.clone();
+                    self.pulls.lock().unwrap().add(pull, now);
+                    MpdResponse::pairs().pair("pull_set", label).build()
+                }
+                // The honest echo the design mandates: never "not understood".
+                None => MpdResponse::pairs()
+                    .pair("field", format!("no pull felt from '{}' - say more?", words.trim()))
+                    .build(),
+            },
+            FieldCmd::Nudge(dir) => {
+                let factor = match dir {
+                    FieldNudge::Less => 0.5,
+                    FieldNudge::More => 1.5,
+                };
+                match self.pulls.lock().unwrap().nudge_recent(factor, now) {
+                    Some(label) => MpdResponse::pairs().pair("pull_nudged", label).build(),
+                    None => MpdResponse::pairs().pair("field", "no pulls active").build(),
+                }
+            }
+            FieldCmd::Clear => {
+                self.pulls.lock().unwrap().clear();
+                MpdResponse::ok()
+            }
+        }
     }
 
     /// The searchable text for one queue entry (title + artist + album), used by a
@@ -3872,6 +3984,7 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::Sleep(cmd) => self.handle_sleep(cmd),
             MpdCommand::Winddown(cmd) => self.handle_winddown(cmd),
             MpdCommand::Wake(cmd) => self.handle_wake(cmd),
+            MpdCommand::Field(cmd) => self.handle_field(cmd),
             MpdCommand::Next => {
                 // A manual `next` always advances (single governs only auto-advance);
                 // random/repeat/consume are honored via plan_next. The transition
