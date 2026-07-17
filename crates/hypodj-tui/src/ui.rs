@@ -48,8 +48,10 @@ pub fn render(f: &mut Frame, state: &TuiState) {
     render_now(f, chunks[3], state);
     render_command(f, chunks[4], state);
     // Confirm is a small centered popup over the list/now region so the thin bottom
-    // bar never grows (no layout jump when toggling modes).
-    if state.mode == Mode::Confirm {
+    // bar never grows (no layout jump when toggling modes). On the DJ (chat) screen
+    // the confirm is rendered INLINE in the chat scrollback (pushed by enter_confirm),
+    // so no popup - the y/N prompt reads as part of the conversation.
+    if state.mode == Mode::Confirm && state.screen != Screen::Dj {
         render_confirm_popup(f, list_area, state);
     }
     // The `?` help overlay sits above everything else (a normal-mode modal). It gets

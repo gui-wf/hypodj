@@ -585,8 +585,23 @@ impl TuiState {
         self.now = now;
     }
 
-    /// Enter the confirm popup for a pending plan.
+    /// Enter the confirm for a pending plan. On the DJ (chat) screen the echo +
+    /// y/N prompt is pushed INLINE into the chat scrollback so it reads as part of
+    /// the conversation (ui.rs skips the centered popup for Screen::Dj); on the
+    /// other screens the popup carries it.
     pub fn enter_confirm(&mut self, pending: Pending) {
+        if self.screen == Screen::Dj {
+            if let Some(trust) = &pending.trust {
+                self.push_dj_log(trust.clone());
+            }
+            for step in &pending.steps {
+                self.push_dj_log(step.clone());
+            }
+            if let Some(note) = &pending.note {
+                self.push_dj_log(format!("! {note}"));
+            }
+            self.push_dj_log("confirm? [y/N]".to_string());
+        }
         self.pending = Some(pending);
         self.mode = Mode::Confirm;
         self.input.clear();
@@ -1333,6 +1348,26 @@ mod tests {
         // Empty queue -> selected 0.
         s.apply_snapshot(NowPlaying::default(), vec![]);
         assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn dj_screen_confirm_is_inline_in_chat_not_popup() {
+        let mut s = TuiState::new();
+        s.screen = Screen::Dj;
+        s.enter_confirm(Pending {
+            steps: vec!["[1] add 5 calmer tracks".into()],
+            note: Some("append-only".into()),
+            ..Default::default()
+        });
+        assert_eq!(s.mode, Mode::Confirm);
+        // The echo + y/N prompt landed inline in the chat scrollback, not only a popup.
+        assert!(s.dj_log.iter().any(|l| l.contains("add 5 calmer tracks")));
+        assert!(s.dj_log.iter().any(|l| l == "! append-only"));
+        assert!(s.dj_log.iter().any(|l| l == "confirm? [y/N]"));
+        // On a non-DJ screen the confirm does NOT touch the chat log (popup carries it).
+        let mut q = TuiState::new();
+        q.enter_confirm(Pending { steps: vec!["clear".into()], ..Default::default() });
+        assert!(q.dj_log.is_empty());
     }
 
     #[test]
