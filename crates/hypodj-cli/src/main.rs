@@ -84,9 +84,17 @@ fn parse_args(raw: Vec<String>) -> Result<Parsed, String> {
             }
             "-h" | "--help" => help = true,
             // Everything after the first non-flag word is part of the phrase.
+            // Flatten each argv element on whitespace so a single quoted arg
+            // ("favorite this song") and the unquoted form (favorite this song)
+            // both yield the same WORD tokens - route() needs per-word tokens to
+            // recognize a bare-favorite phrase, and the TUI already splits this
+            // way. Collapsing repeated internal whitespace is fine for the NL
+            // reconstruction (route joins the words back with single spaces).
             _ => {
-                words.push(a);
-                words.extend(it.by_ref());
+                words.extend(a.split_whitespace().map(str::to_string));
+                for rest in it.by_ref() {
+                    words.extend(rest.split_whitespace().map(str::to_string));
+                }
                 break;
             }
         }
@@ -320,6 +328,52 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
         println!("cancelled");
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_splits_single_quoted_phrase_into_word_tokens() {
+        // `dj "favorite this song"` arrives as ONE argv element; it must flatten to
+        // per-word tokens so route() sees the bare-favorite phrase (the live miss).
+        let p = parse_args(v(&["favorite this song"])).unwrap();
+        assert_eq!(p.words, v(&["favorite", "this", "song"]));
+        assert_eq!(route::route(&p.words), Action::FavoriteCurrent);
+    }
+
+    #[test]
+    fn parse_args_unquoted_words_match_quoted_form() {
+        // Quoted and unquoted phrasings produce IDENTICAL tokens on both surfaces.
+        let quoted = parse_args(v(&["fav current music"])).unwrap();
+        let unquoted = parse_args(v(&["fav", "current", "music"])).unwrap();
+        assert_eq!(quoted.words, unquoted.words);
+        assert_eq!(quoted.words, v(&["fav", "current", "music"]));
+        assert_eq!(route::route(&quoted.words), Action::FavoriteCurrent);
+    }
+
+    #[test]
+    fn parse_args_collapses_internal_whitespace_for_nl() {
+        // Repeated internal whitespace collapses; NL reconstruction stays clean.
+        let p = parse_args(v(&["wake me   at 7  with jazz"])).unwrap();
+        assert_eq!(
+            route::route(&p.words),
+            Action::Nl("wake me at 7 with jazz".into())
+        );
+    }
+
+    #[test]
+    fn parse_args_flags_still_parse_before_phrase() {
+        let p = parse_args(v(&["--host", "example", "--port", "6601", "next song"])).unwrap();
+        assert_eq!(p.host.as_deref(), Some("example"));
+        assert_eq!(p.port, Some(6601));
+        assert_eq!(p.words, v(&["next", "song"]));
+    }
 }
 
 /// A default-No y/N prompt. Only "y"/"yes" (case-insensitive) confirm; bare
