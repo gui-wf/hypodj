@@ -76,6 +76,15 @@ pub fn probe_bg(out: &mut impl Write, env: &Env, timeout: Duration) -> TermBg {
                 return TermBg::from_rgb(rgb, BgSource::Osc11);
             }
         }
+        // We WROTE the query but got no valid reply within the deadline. A slow terminal
+        // (foot/xterm over SSH with RTT+render past the deadline) can still emit its
+        // `ESC ]11;rgb:... ESC\` reply AFTER we returned; those bytes would otherwise sit
+        // in the tty buffer and be read by the crossterm event loop as spurious key
+        // events (a stray escape burst stealing/injecting keystrokes at startup). Drain a
+        // late/pending OSC reply so nothing bogus reaches the event loop. Bounded by the
+        // same deadline so this can never hang, and gated to only consume a genuine OSC
+        // introducer (`ESC ]`) so real typeahead is left untouched.
+        drain_pending_osc(timeout);
     }
     if let Some(v) = (env.get)("COLORFGBG") {
         if let Some(rgb) = parse_colorfgbg(&v) {
@@ -128,6 +137,91 @@ fn read_osc_reply(timeout: Duration) -> Option<String> {
         return None;
     }
     String::from_utf8(buf).ok()
+}
+
+/// A pending OSC 11 reply is `ESC ]11;rgb:RRRR/GGGG/BBBB` + terminator - at least ~20
+/// bytes, delivered by the terminal in a single write. Ordinary typeahead trickles one
+/// key (or a 3-byte arrow) at a time. So a burst of at least this many bytes waiting on
+/// the fd is the terminal's late reply, not something the user typed; below it we assume
+/// typeahead and never touch the buffer. This is the discriminator that keeps the drain
+/// ZERO-steal for real input.
+const OSC_REPLY_MIN_BYTES: i32 = 12;
+
+/// Drain a LATE OSC reply that a slow terminal emits after [`read_osc_reply`] already
+/// gave up, so the crossterm event loop never reads `ESC ]11;rgb:...` as bogus key
+/// events. Runs on the caller's thread, bounded by `grace`. It waits for input to become
+/// readable, then only drains when (a) a full OSC-reply-sized BURST is already queued
+/// (see [`OSC_REPLY_MIN_BYTES`]) and (b) it actually begins with the OSC introducer
+/// `ESC ]`. Ordinary typeahead - a keystroke or two, which is both too short and not an
+/// OSC introducer - is left in the buffer untouched. Best-effort: if nothing arrives
+/// within `grace`, or what arrives is not the solicited reply, it returns without
+/// disturbing the buffer.
+fn drain_pending_osc(grace: Duration) {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    drain_pending_osc_fd(fd, grace);
+}
+
+/// Bytes currently queued on `fd` (`FIONREAD`), or 0 on error. Lets the drain tell a
+/// full OSC-reply burst from a stray keystroke WITHOUT consuming anything.
+fn pending_bytes(fd: std::os::fd::RawFd) -> i32 {
+    let mut n: libc::c_int = 0;
+    let r = unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) };
+    if r == 0 {
+        n
+    } else {
+        0
+    }
+}
+
+/// The fd-parameterized core of [`drain_pending_osc`], so a pipe can stand in for the
+/// tty under test.
+fn drain_pending_osc_fd(fd: std::os::fd::RawFd, grace: Duration) {
+    use std::time::Instant;
+    let deadline = Instant::now() + grace;
+    let mut byte = [0u8; 1];
+    let read_one = |b: &mut [u8; 1]| -> Option<u8> {
+        // A raw fd read; one byte or nothing (EOF / error).
+        let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n == 1 {
+            Some(b[0])
+        } else {
+            None
+        }
+    };
+    // Wait until something is readable, then decide from the QUEUED count alone (no
+    // destructive read): only an OSC-reply-sized burst is drainable; anything shorter is
+    // treated as typeahead and left alone.
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return };
+    if !wait_readable(fd, remaining) {
+        return;
+    }
+    if pending_bytes(fd) < OSC_REPLY_MIN_BYTES {
+        return;
+    }
+    // Big enough to be the reply. Confirm the OSC introducer `ESC ]` before draining; if
+    // it is not there (some other large burst, e.g. a paste), stop.
+    if read_one(&mut byte) != Some(0x1b) {
+        return;
+    }
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return };
+    if !wait_readable(fd, remaining) || read_one(&mut byte) != Some(b']') {
+        return;
+    }
+    // Confirmed OSC introducer: swallow the rest of the sequence up to its terminator
+    // (BEL, or ST = ESC `\`), bounded by the grace deadline and a byte cap.
+    let mut prev = 0u8;
+    for _ in 0..128 {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { return };
+        if !wait_readable(fd, remaining) {
+            return;
+        }
+        let Some(b) = read_one(&mut byte) else { return };
+        if b == 0x07 || (b == b'\\' && prev == 0x1b) {
+            return;
+        }
+        prev = b;
+    }
 }
 
 /// Block until `fd` is readable or `timeout` elapses. `true` => readable, `false` =>
@@ -361,14 +455,30 @@ pub fn info_color(swatch: Rgb, bg: TermBg, truecolor: bool) -> Color {
     Color::Indexed(quantize_256(info_neutral(bg)).0)
 }
 
+/// The DECORATION distraction ceiling: a sigil may never reach the >= 3:1 INFO floor
+/// (that would read as information, not decoration). Kept comfortably below it so even
+/// a light-dominant cover on a dark terminal stays a quiet texture.
+const DECO_CEILING: f32 = 2.0;
+
 /// DECORATION policy (the album sigil): pull chroma down ~50% and nudge lightness
 /// TOWARD the background so the sigil sits BELOW a distraction ceiling - present, but
-/// never a 3:1 attention-grabber. Pure and unit-tested.
+/// never a 3:1 attention-grabber. A light-dominant cover on a dark bg (or vice versa)
+/// can still clear the ceiling after the fixed blend, so we then pull lightness the rest
+/// of the way toward the bg in small steps until contrast drops under [`DECO_CEILING`].
+/// Pure and unit-tested.
 pub fn fit_decoration(swatch: Rgb, bg: TermBg) -> Rgb {
     let mut o = srgb_to_oklch(swatch);
     let bgo = srgb_to_oklch(bg.rgb);
     o.c *= 0.5;
     o.l = o.l * 0.55 + bgo.l * 0.45;
+    // Enforce the distraction ceiling: step lightness toward the bg's lightness until
+    // the realized contrast sits under the cap (or we have collapsed onto the bg).
+    for _ in 0..50 {
+        if contrast_ratio(oklch_to_srgb(o), bg.rgb) <= DECO_CEILING {
+            break;
+        }
+        o.l += (bgo.l - o.l) * 0.2;
+    }
     oklch_to_srgb(o)
 }
 
@@ -622,6 +732,14 @@ mod tests {
         assert_eq!(parse_osc11("rgb:ff/80/00"), Some([0xff, 0x80, 0x00]));
         // 1-digit channel (f -> full).
         assert_eq!(parse_osc11("rgb:f/0/0"), Some([0xff, 0x00, 0x00]));
+        // ST-terminated reply (ESC backslash) parses identically to BEL-terminated:
+        // foot and other ST-replying terminals must be honored, not just BEL.
+        assert_eq!(
+            parse_osc11("\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\"),
+            Some([0x1c, 0x1c, 0x1c])
+        );
+        // ST with 2-digit channels too.
+        assert_eq!(parse_osc11("rgb:ff/80/00\x1b\\"), Some([0xff, 0x80, 0x00]));
         // Malformed -> None.
         assert_eq!(parse_osc11("garbage"), None);
         assert_eq!(parse_osc11("rgb:zz/00/00"), None);
@@ -752,6 +870,27 @@ mod tests {
     }
 
     #[test]
+    fn fit_decoration_caps_light_cover_below_ceiling() {
+        // A near-white cover on a dark terminal would be a 3:1+ grabber if left alone;
+        // the decoration policy must cap it under the distraction ceiling. Checked on
+        // dark AND light backgrounds and for a vivid light swatch.
+        for bg in [
+            TermBg::dark_default(),
+            TermBg::from_rgb([0xf4, 0xf4, 0xf4], BgSource::DarkDefault),
+        ] {
+            for swatch in [[0xf0, 0xf0, 0xf0], [0xff, 0xd0, 0x40], [0x10, 0x10, 0x10]] {
+                let deco = fit_decoration(swatch, bg);
+                assert!(
+                    contrast_ratio(deco, bg.rgb) <= DECO_CEILING + 0.01,
+                    "sigil {swatch:?} on bg {:?} exceeds ceiling: {:.2}",
+                    bg.rgb,
+                    contrast_ratio(deco, bg.rgb)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn extract_palette_from_two_tone() {
         // A two-tone image: half vivid red, half dark grey.
         let mut img = image::RgbImage::new(48, 48);
@@ -809,13 +948,100 @@ mod tests {
         assert!(matches!(to_color([10, 20, 30], false), Color::Indexed(_)));
     }
 
+    /// A unix pipe pre-loaded with `bytes`, with its WRITE end already closed so reads
+    /// see EOF after the fed bytes (nothing can block on a still-open writer). Returns
+    /// the read fd; the caller closes it.
+    fn eof_pipe(bytes: &[u8]) -> std::os::fd::RawFd {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        if !bytes.is_empty() {
+            let n = unsafe { libc::write(wr, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
+            assert_eq!(n, bytes.len() as isize);
+        }
+        unsafe { libc::close(wr) };
+        rd
+    }
+
+    /// Read all remaining bytes on `fd` until EOF.
+    fn read_remaining(fd: std::os::fd::RawFd) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut b = [0u8; 64];
+        loop {
+            let n = unsafe { libc::read(fd, b.as_mut_ptr() as *mut libc::c_void, b.len()) };
+            if n <= 0 {
+                break;
+            }
+            out.extend_from_slice(&b[..n as usize]);
+        }
+        out
+    }
+
+    #[test]
+    fn drain_pending_osc_swallows_late_reply_leaving_following_bytes() {
+        // A slow terminal's late ST-terminated OSC 11 reply, followed by a real
+        // keystroke the user typed after it. The drain must eat the WHOLE OSC sequence
+        // (up to the ST terminator) and leave the trailing keystroke for the event loop.
+        let rd = eof_pipe(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\q");
+        drain_pending_osc_fd(rd, Duration::from_millis(200));
+        assert_eq!(read_remaining(rd), b"q", "OSC reply drained up to ST, 'q' preserved");
+        unsafe { libc::close(rd) };
+
+        // BEL-terminated reply, nothing trailing.
+        let rd = eof_pipe(b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+        drain_pending_osc_fd(rd, Duration::from_millis(200));
+        assert!(read_remaining(rd).is_empty(), "BEL-terminated reply fully drained");
+        unsafe { libc::close(rd) };
+    }
+
+    #[test]
+    fn drain_pending_osc_leaves_non_osc_typeahead() {
+        // Ordinary typed keys arrive as a short burst (a key or two), well under an
+        // OSC-reply-sized burst, so the count gate returns WITHOUT consuming a single
+        // byte. `q` is the classic startle-quit key - it must reach the event loop intact.
+        let rd = eof_pipe(b"quit");
+        drain_pending_osc_fd(rd, Duration::from_millis(50));
+        assert_eq!(read_remaining(rd), b"quit", "plain typeahead is never consumed");
+        unsafe { libc::close(rd) };
+
+        // Even a lone ESC-started key sequence (an arrow key, 3 bytes) is below the burst
+        // threshold, so it too is left untouched rather than mistaken for a reply.
+        let rd = eof_pipe(b"\x1b[A");
+        drain_pending_osc_fd(rd, Duration::from_millis(50));
+        assert_eq!(read_remaining(rd), b"\x1b[A", "short escape sequence preserved");
+        unsafe { libc::close(rd) };
+    }
+
+    #[test]
+    fn drain_pending_osc_returns_promptly_when_nothing_pending() {
+        // A non-answering terminal never sends bytes: the drain waits out the grace on
+        // poll(2) and returns, consuming nothing - it must not hang.
+        let rd = eof_pipe(b"");
+        let started = std::time::Instant::now();
+        drain_pending_osc_fd(rd, Duration::from_millis(30));
+        assert!(started.elapsed() < Duration::from_millis(2000), "drain must not hang");
+        unsafe { libc::close(rd) };
+    }
+
     #[test]
     fn probe_bg_falls_back_without_osc_answer() {
-        // A sink that accepts the query; stdin is not fed, so the read times out fast
-        // and we fall back to COLORFGBG.
+        // A sink that accepts the query; stdin is not fed (a non-answering terminal /
+        // tmux without passthrough), so the read must time out FAST on its own thread
+        // and fall back - never block the caller and never leave a reader thread behind
+        // to later steal the user's keystrokes. The wall-clock bound (generous vs the
+        // 30ms deadline) proves the probe returned promptly rather than hanging on fd0.
         let e = env_of(&[("COLORFGBG", "15;0")]);
         let mut sink: Vec<u8> = Vec::new();
+        let started = std::time::Instant::now();
         let bg = probe_bg(&mut sink, &mkenv(&e), Duration::from_millis(30));
+        assert!(
+            started.elapsed() < Duration::from_millis(2000),
+            "probe must not block on a non-answering terminal (took {:?})",
+            started.elapsed()
+        );
+        // The query WAS written (so a real terminal would have answered), and we still
+        // consumed no stdin - the fallback owns the result.
+        assert_eq!(sink, b"\x1b]11;?\x07");
         assert_eq!(bg.source, BgSource::ColorFgBg);
         assert_eq!(bg.rgb, [0, 0, 0]);
         assert!(bg.is_dark);

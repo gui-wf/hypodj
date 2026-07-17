@@ -92,10 +92,14 @@ fn run() -> Result<(), MpdError> {
     // + truecolor come from the env only (no query). See album_color for the tmux note.
     state.image_protocol = album_color::image_protocol(&env);
     state.truecolor = album_color::truecolor(&env);
+    // A slightly tolerant deadline so a slow reply over SSH still lands before we fall
+    // back (a non-answering terminal still degrades within this bound - the read is a
+    // single bounded poll(2), never a block). Done before the event loop starts reading
+    // stdin, so the OSC answer is never interleaved with - or misparsed as - real input.
     state.term_bg = album_color::probe_bg(
         terminal.backend_mut(),
         &env,
-        Duration::from_millis(100),
+        Duration::from_millis(150),
     );
     // Prime the panes before the first draw: request the initial snapshot (the
     // response lands within the first few poll cycles).
