@@ -31,11 +31,25 @@ fn is_favorite_verb(w: &str) -> bool {
 }
 
 /// Filler words allowed in the tail of a bare-favorite phrase ("favorite THIS
-/// SONG", "star THE CURRENT track"). A superset of `is_filler_noun` plus the
-/// articles/determiners a human sprinkles in. ANY token outside this set in the
-/// tail means a real target ("favorite jazz") and disqualifies the shortcut.
+/// SONG", "star THE CURRENT track", "fav CURRENT MUSIC", "star THIS TUNE PLEASE").
+/// A superset of `is_filler_noun` plus the articles/determiners and the soft
+/// nouns/adverbs a human sprinkles after a favorite verb. ANY token outside this
+/// set in the tail means a real target ("favorite jazz", "favorite miles davis",
+/// "star rating 5") and disqualifies the shortcut - a genre/artist/number is a
+/// real argument, never filler.
 fn is_filler_word(w: &str) -> bool {
-    is_filler_noun(w) || matches!(w, "the" | "a" | "that" | "my")
+    is_filler_noun(w)
+        || matches!(
+            w,
+            "the" | "a"
+                | "that"
+                | "my"
+                | "music"
+                | "tune"
+                | "playing"
+                | "now"
+                | "please"
+        )
 }
 
 /// A bare-favorite is a favorite verb followed only by filler words, at any
@@ -202,6 +216,26 @@ mod tests {
         assert_eq!(r("favorite jazz"), Action::Nl("favorite jazz".into()));
         assert_eq!(r("star rating 5"), Action::Nl("star rating 5".into()));
         // Unrelated intent untouched.
+        assert_eq!(r("queue jazz"), Action::Nl("queue jazz".into()));
+    }
+
+    #[test]
+    fn route_bare_favorite_widened_filler_vocab() {
+        // The natural words a human sprinkles after a favorite verb must all still
+        // resolve to the bare gesture ("fav current music" was the live miss).
+        assert_eq!(r("fav current music"), Action::FavoriteCurrent);
+        assert_eq!(r("favorite this tune"), Action::FavoriteCurrent);
+        assert_eq!(r("favorite the tune playing now"), Action::FavoriteCurrent);
+        assert_eq!(r("star this one please"), Action::FavoriteCurrent);
+        assert_eq!(r("favorite the music playing"), Action::FavoriteCurrent);
+        assert_eq!(r("fav this now"), Action::FavoriteCurrent);
+        // Regression guards MUST hold: a genre/artist/number is a real argument.
+        assert_eq!(r("favorite jazz"), Action::Nl("favorite jazz".into()));
+        assert_eq!(
+            r("favorite miles davis"),
+            Action::Nl("favorite miles davis".into())
+        );
+        assert_eq!(r("star rating 5"), Action::Nl("star rating 5".into()));
         assert_eq!(r("queue jazz"), Action::Nl("queue jazz".into()));
     }
 

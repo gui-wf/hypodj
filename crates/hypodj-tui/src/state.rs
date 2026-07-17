@@ -1056,9 +1056,13 @@ impl TuiState {
         }
     }
 
-    /// DJ View input: printable chars build the "ask>" query, Enter submits it as a
-    /// CC translation (always NL - a DJ query is never a bare verb), Esc leaves back
-    /// to the Queue screen. A blank Enter is a no-op.
+    /// DJ View input: printable chars build the "ask>" query, Enter submits it,
+    /// Esc leaves back to the Queue screen. A blank Enter is a no-op. Enter routes
+    /// the phrase through the SAME client route() the ':' command line uses, so a
+    /// bare-favorite phrase ("favorite this song") stars the current track here too
+    /// instead of falling to the CC translator that has no favorite capability;
+    /// anything else stays a CC translation (a DJ query is otherwise never a bare
+    /// verb).
     fn key_dj(&mut self, key: KeyEvent) -> Option<Intent> {
         match key.code {
             KeyCode::Esc => {
@@ -1077,6 +1081,11 @@ impl TuiState {
                     return None;
                 }
                 self.push_dj_log(format!("> {phrase}"));
+                let words: Vec<String> =
+                    phrase.split_whitespace().map(str::to_string).collect();
+                if route(&words) == Action::FavoriteCurrent {
+                    return self.favorite_current();
+                }
                 self.dj_phase = Some("thinking...".to_string());
                 Some(Intent::Cc(phrase))
             }
@@ -1820,6 +1829,24 @@ mod tests {
         let mut s2 = TuiState::new();
         s2.handle_key(key(KeyCode::F(4)));
         assert_eq!(s2.handle_key(key(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn dj_bare_favorite_phrase_stars_current_track() {
+        // A bare-favorite phrase typed in the DJ view routes through the SAME
+        // route() the ':' line uses, so it stars the current track instead of
+        // falling to the CC translator (which has no favorite capability).
+        let mut s = TuiState::new();
+        s.now.file = Some("song/7".into());
+        s.handle_key(key(KeyCode::F(4)));
+        s.dj_input = "favorite this song".into();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            Some(Intent::Command("playlistadd Starred song/7".into()))
+        );
+        // No spurious CC thinking phase on the favorite path.
+        assert_eq!(s.dj_phase, None);
+        assert_eq!(s.dj_input, "");
     }
 
     #[test]
