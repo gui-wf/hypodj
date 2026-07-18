@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use hypodj_client::model::{fmt_remaining, ArmedFeatures, NowPlaying};
+use hypodj_client::model::{fmt_remaining, ArmedFeatures, FieldState, NowPlaying};
 
 use crate::keymap;
 use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
@@ -313,11 +313,16 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     }
 
     let armed_line = armed_hud(&np.armed);
+    // The active latent-field pull, as its own subtle line (the quietest voice),
+    // mirroring the armed HUD: present ONLY when a pull is active, so a resting field
+    // reserves no row and never jumps the layout.
+    let field_line = field_hud(&np.field);
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
     if stopped || empty {
-        // A stopped deck can still hold an armed wake alarm - surface it as a subtle
-        // second line so the machine's hold on the night stays visible.
+        // A stopped deck can still hold an armed wake alarm or a held pull - surface
+        // them as subtle lines so the machine's hold stays visible. Field is the last,
+        // quietest line.
         let mut lines = vec![Line::from("nothing playing")];
         if let Some(a) = &armed_line {
             lines.push(Line::from(Span::styled(
@@ -325,14 +330,22 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
                 Style::default().add_modifier(Modifier::DIM),
             )));
         }
+        if let Some(fl) = &field_line {
+            lines.push(Line::from(Span::styled(
+                fl.clone(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
         f.render_widget(Paragraph::new(lines), inner);
         return;
     }
 
-    // Reserve up to 4 rows (5 with an armed-feature HUD line) at the bottom for
-    // title/artist/album + the playback status line (state | volume fader |
-    // position) + the optional armed line; the rest is art.
-    let text_h = if armed_line.is_some() { 5u16 } else { 4u16 }.min(inner.height);
+    // Reserve up to 4 base rows at the bottom for title/artist/album + the playback
+    // status line (state | volume fader | position), plus one more per optional HUD
+    // line (armed, then field); the rest is art. Reserving no row when a HUD line is
+    // absent is what keeps the layout from jumping when it vanishes at rest.
+    let extra = armed_line.is_some() as u16 + field_line.is_some() as u16;
+    let text_h = (4u16 + extra).min(inner.height);
     let art_h = inner.height.saturating_sub(text_h);
     if art_h > 0 {
         // Keep the art roughly square: each cell renders 2 vertical pixels, so a
@@ -397,6 +410,13 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
             Style::default().add_modifier(Modifier::DIM),
         )));
     }
+    // The field pull is the last, faintest line - the quietest voice in the pane.
+    if let Some(fl) = field_line {
+        lines.push(Line::from(Span::styled(
+            fl,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
     f.render_widget(Paragraph::new(lines), text_area);
 }
 
@@ -421,6 +441,23 @@ fn armed_hud(a: &ArmedFeatures) -> Option<String> {
         bits.push(format!("wake in {}", fmt_remaining(s)));
     }
     Some(format!("[armed] {}", bits.join(" | ")))
+}
+
+/// The active latent-field pulls as one subtle HUD line, e.g.
+/// `toward calmer 0.58 3m | toward warmer 0.41 1m`. `None` when no pull is active, so
+/// a resting field renders no line (and reserves no row). Mirrors the CLI's
+/// `render_field` so the passive "see the field" HUD reads identically in both clients.
+fn field_hud(field: &FieldState) -> Option<String> {
+    if !field.active() {
+        return None;
+    }
+    let line = field
+        .pulls
+        .iter()
+        .map(|p| format!("toward {} {:.2} {}m", p.label, p.strength as f32 / 100.0, p.age_mins))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(line)
 }
 
 /// A dim placeholder shown when there is no cover art (stream, missing, or a fetch
@@ -519,11 +556,11 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        armed_hud, dj_prompt_line, hit_style, level_wave_row, match_spans, track_seed,
+        armed_hud, dj_prompt_line, field_hud, hit_style, level_wave_row, match_spans, track_seed,
         volume_slider, wave_glyphs, wave_row, window_title, BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
-    use hypodj_client::model::{ArmedFeatures, NowPlaying};
+    use hypodj_client::model::{ArmedFeatures, FieldPull, FieldState, NowPlaying};
     use ratatui::style::Style;
 
     #[test]
@@ -541,6 +578,55 @@ mod tests {
         assert!(hud.contains("sleep 12m"), "hud: {hud}");
         assert!(hud.contains("winding down"), "hud: {hud}");
         assert!(hud.contains("wake in 7h 00m"), "hud: {hud}");
+    }
+
+    #[test]
+    fn field_hud_reads_pulls_and_absent_at_rest() {
+        // No pull -> no line (the resting field is silent).
+        assert_eq!(field_hud(&FieldState::default()), None);
+        // Active pulls render as the pipe-joined "toward <label> <strength> <age>m"
+        // line, mirroring the CLI's render_field verbatim.
+        let field = FieldState {
+            pulls: vec![
+                FieldPull { label: "calmer".into(), strength: 58, age_mins: 3 },
+                FieldPull { label: "warmer".into(), strength: 41, age_mins: 1 },
+            ],
+        };
+        let hud = field_hud(&field).expect("active");
+        assert_eq!(hud, "toward calmer 0.58 3m | toward warmer 0.41 1m");
+    }
+
+    #[test]
+    fn now_playing_pane_shows_active_field_pull() {
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Blue in Green".into());
+        s.now.artist = Some("Miles Davis".into());
+        s.now.field = FieldState {
+            pulls: vec![FieldPull { label: "calmer".into(), strength: 58, age_mins: 3 }],
+        };
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("toward calmer 0.58 3m"), "field pull line drawn:\n{out}");
+    }
+
+    #[test]
+    fn now_playing_pane_at_rest_absent_and_layout_unchanged() {
+        // A resting field draws no line AND does not perturb the layout: the whole
+        // rendered buffer is byte-identical to a state with no field at all.
+        let mut base = TuiState::new();
+        base.now.state = Some("play".into());
+        base.now.title = Some("Blue in Green".into());
+        base.now.artist = Some("Miles Davis".into());
+        let at_rest = render_to_lines_sized(&base, 100, 40);
+        assert!(
+            !at_rest.join("\n").contains("toward"),
+            "no field line at rest:\n{}",
+            at_rest.join("\n")
+        );
+        // Explicitly-empty field state must render the exact same bytes as the default.
+        base.now.field = FieldState::default();
+        let empty_field = render_to_lines_sized(&base, 100, 40);
+        assert_eq!(at_rest, empty_field, "an empty field never jumps the layout");
     }
 
     #[test]
