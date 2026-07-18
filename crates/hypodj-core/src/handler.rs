@@ -1437,6 +1437,43 @@ impl HypodjHandler {
         out
     }
 
+    /// Surface the ACTIVE latent-field pulls as X- status pairs, mirroring
+    /// [`Self::armed_feature_pairs`]. PURE surfacing of the pulls the daemon already
+    /// holds - it recomputes NO selection. Emits ZERO pairs when the field is not
+    /// active (all pulls pruned/dead), so a resting field leaves status lean and the
+    /// clients render nothing.
+    ///
+    /// - `X-hypodj-field-count`         number of live pulls
+    /// - `X-hypodj-field-{i}-label`     the i-th pull's label (lexicon token(s))
+    /// - `X-hypodj-field-{i}-strength`  decayed strength as an integer 0..=100
+    /// - `X-hypodj-field-{i}-age`       whole minutes since the pull was born
+    ///
+    /// The values are digit/ASCII, colon/newline-free, so the status line stays
+    /// well-formed. The client re-renders the compact HUD line from these numbers,
+    /// so decay shows numerically each poll (strength ticks down, age climbs).
+    pub fn field_feature_pairs(&self) -> Vec<(String, String)> {
+        let now = Instant::now();
+        // SHORT std-Mutex scope: prune, snapshot the live pulls into owned values,
+        // then drop the lock BEFORE building the pairs (Status is synchronous, but
+        // the clone-then-drop discipline keeps the std Mutex off any await).
+        let snapshot: Vec<(String, u8, u64)> = {
+            let mut f = self.pulls.lock().unwrap();
+            f.prune(now);
+            if !f.is_active(now) {
+                return Vec::new();
+            }
+            f.snapshot(now)
+        };
+        let mut out = Vec::new();
+        out.push(("X-hypodj-field-count".to_string(), snapshot.len().to_string()));
+        for (i, (label, strength, age)) in snapshot.iter().enumerate() {
+            out.push((format!("X-hypodj-field-{i}-label"), label.clone()));
+            out.push((format!("X-hypodj-field-{i}-strength"), strength.to_string()));
+            out.push((format!("X-hypodj-field-{i}-age"), age.to_string()));
+        }
+        out
+    }
+
     /// Resolve the next future civil `h:m` (today if still ahead, else tomorrow) in
     /// the handler's fixed-offset zone, as an absolute UTC instant. Mirrors the P3
     /// nl civil-time seam so `wake at 7` is deterministic under a fixed civil now.
@@ -3912,6 +3949,11 @@ impl MpdHandler for HypodjHandler {
                 // X- extension pairs, present ONLY when armed so status stays lean.
                 for (k, v) in self.armed_feature_pairs() {
                     b = b.pair(k, v);
+                }
+                // Surface the active latent-field pulls as X- extension pairs, present
+                // ONLY when a pull is active so the passive HUD auto-clears at rest.
+                for (k, v) in self.field_feature_pairs() {
+                    b = b.pair(&k, v);
                 }
                 b.build()
             }
@@ -8448,6 +8490,45 @@ mod tests {
         let resp = h.handle(MpdCommand::Field(FieldCmd::Nudge(FieldNudge::Less))).await;
         assert_eq!(pair(&resp, "pull_nudged"), Some("calmer"));
         assert_eq!(h.state.lock().unwrap().queue.len(), 0);
+    }
+
+    // The passive field HUD state surfaces as X- status pairs ONLY when a pull is
+    // active - a fresh handler emits none; setting a mood pull adds the count/label/
+    // strength/age pairs; time decays the surfaced strength; a cleared field removes
+    // the pairs again (status stays lean, the HUD auto-clears at rest).
+    #[tokio::test(start_paused = true)]
+    async fn status_surfaces_field_pull_only_when_active_and_reflects_decay() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Nothing active: no field pairs.
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "X-hypodj-field-count"), None);
+
+        // Set a calmer mood pull -> the field pairs appear.
+        h.handle(MpdCommand::Field(FieldCmd::Set("play something calmer".into()))).await;
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "X-hypodj-field-count"), Some("1"));
+        assert_eq!(pair(&resp, "X-hypodj-field-0-label"), Some("calmer"));
+        assert_eq!(pair(&resp, "X-hypodj-field-0-age"), Some("0"));
+        let hot: u8 = pair(&resp, "X-hypodj-field-0-strength")
+            .expect("strength pair present")
+            .parse()
+            .expect("digits");
+        // A fresh lexicon pull is strength 0.6 -> 60 on the basis-of-100 wire scale.
+        assert_eq!(hot, 60, "fresh pull surfaces at 60");
+
+        // Advance one half-life: the surfaced strength halves and age climbs, so the
+        // HUD ticks down each poll.
+        tokio::time::advance(crate::intelligence::PULL_HALF_LIFE).await;
+        let resp = h.handle(MpdCommand::Status).await;
+        let cold: u8 = pair(&resp, "X-hypodj-field-0-strength").expect("present").parse().unwrap();
+        assert!(cold < hot, "decay lowers surfaced strength: {cold} < {hot}");
+        let age: u64 = pair(&resp, "X-hypodj-field-0-age").expect("present").parse().unwrap();
+        assert!(age >= 10, "age climbs to ~10 min: {age}");
+
+        // Clear the field: the pairs disappear (HUD auto-clears).
+        h.handle(MpdCommand::Field(FieldCmd::Clear)).await;
+        let resp = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&resp, "X-hypodj-field-count"), None, "cleared field emits no pairs");
     }
 
     /// LIVE proof against a REAL backend on a throwaway queue (never touches live

@@ -407,17 +407,21 @@ impl PullField {
     /// a near-parallel direction (cosine > [`PULL_MERGE_COS`]): strengths add
     /// (clamped to 1.0), `set_at` refreshes to `now`, the label is kept. "Warmer...
     /// warmer" is one stronger, freshly-born pull, not two entries. Prunes first so a
-    /// merge never targets a corpse.
+    /// merge never targets a corpse. A merged pull MOVES to the end so insertion order
+    /// stays recency order (most-recently-meant last) - the invariant `nudge_recent`,
+    /// `describe`, and `snapshot` all rely on.
     pub fn add(&mut self, pull: Pull, now: Instant) {
         self.prune(now);
-        if let Some(existing) = self
+        if let Some(idx) = self
             .pulls
-            .iter_mut()
-            .find(|p| cosine(&p.axes, &pull.axes) > PULL_MERGE_COS)
+            .iter()
+            .position(|p| cosine(&p.axes, &pull.axes) > PULL_MERGE_COS)
         {
+            let mut existing = self.pulls.remove(idx);
             existing.strength = (existing.strength_now(now) + pull.strength).clamp(0.0, 1.0);
             existing.set_at = now;
             existing.half_life = pull.half_life;
+            self.pulls.push(existing);
             return;
         }
         self.pulls.push(pull);
@@ -441,6 +445,22 @@ impl PullField {
     /// corrects the system's BELIEFS, never the queue.
     pub fn clear(&mut self) {
         self.pulls.clear();
+    }
+
+    /// A compact, owned snapshot of the live pulls for the passive field HUD:
+    /// `(label, strength as 0..=100, age minutes)` per live pull, insertion order
+    /// preserved (most recent last). Strength is `round(strength_now * 100)` so the
+    /// value is colon-free and re-renderable client-side; a fresh full-strength pull
+    /// reads 60 (the lexicon default). Empty when no pull is alive. PURE.
+    pub fn snapshot(&self, now: Instant) -> Vec<(String, u8, u64)> {
+        self.pulls
+            .iter()
+            .filter(|p| p.is_alive(now))
+            .map(|p| {
+                let s = (p.strength_now(now) * 100.0).round().clamp(0.0, 100.0) as u8;
+                (p.label.clone(), s, p.age_mins(now))
+            })
+            .collect()
     }
 
     /// The summed bias for one candidate over ALL live pulls, relative to a reference
@@ -560,21 +580,36 @@ pub fn pull_reweight(
 pub fn lexicon_pull(words: &str, strength: f32, now: Instant) -> Option<Pull> {
     // (token, [d_energy, d_valence]). Case-insensitive whole-word match.
     const LEX: &[(&str, [f32; 2])] = &[
+        // ENERGY down (calmer / slower / softer feel).
         ("calmer", [-1.0, 0.0]),
         ("calm", [-1.0, 0.0]),
         ("softer", [-1.0, 0.0]),
         ("gentler", [-1.0, 0.0]),
         ("mellower", [-1.0, 0.0]),
+        ("slower", [-1.0, 0.0]),
+        ("spacier", [-1.0, 0.0]),
+        ("chiller", [-1.0, 0.0]),
+        // ENERGY up (harder / faster / punchier feel).
         ("energy", [1.0, 0.0]),
         ("energetic", [1.0, 0.0]),
         ("harder", [1.0, 0.0]),
         ("louder", [1.0, 0.0]),
+        ("punchier", [1.0, 0.0]),
+        ("faster", [1.0, 0.0]),
+        ("driving", [1.0, 0.0]),
+        ("intense", [1.0, 0.0]),
+        // VALENCE up (brighter / warmer / happier feel).
         ("warmer", [0.0, 1.0]),
         ("happier", [0.0, 1.0]),
         ("brighter", [0.0, 1.0]),
+        ("dreamier", [0.0, 1.0]),
+        ("sweeter", [0.0, 1.0]),
+        // VALENCE down (darker / moodier feel).
         ("darker", [0.0, -1.0]),
         ("sadder", [0.0, -1.0]),
         ("moodier", [0.0, -1.0]),
+        ("gloomier", [0.0, -1.0]),
+        ("bleaker", [0.0, -1.0]),
     ];
     // Negation words INVERT the direction of the term they qualify. Without this a
     // softener/inverter the user adds ("less energy", "not calmer") would be silently
@@ -918,6 +953,34 @@ mod pull_tests {
         assert!(lexicon_pull("", 0.6, now).is_none());
     }
 
+    // The expanded phrase set maps each new comparative onto the right EXISTING
+    // energy/valence axis (no new axes) - punchier/faster/driving pull up in energy,
+    // slower/spacier down; dreamier/sweeter up in valence, gloomier/bleaker down.
+    #[tokio::test(start_paused = true)]
+    async fn expanded_lexicon_maps_to_right_axis() {
+        let now = Instant::now();
+        // ENERGY up: positive energy, zero valence.
+        for w in ["punchier", "faster", "driving", "intense"] {
+            let p = lexicon_pull(w, 0.6, now).unwrap_or_else(|| panic!("{w} pulls"));
+            assert_eq!(p.axes, vec![1.0, 0.0], "{w} pulls up in energy");
+        }
+        // ENERGY down: negative energy, zero valence.
+        for w in ["slower", "spacier", "chiller"] {
+            let p = lexicon_pull(w, 0.6, now).unwrap_or_else(|| panic!("{w} pulls"));
+            assert_eq!(p.axes, vec![-1.0, 0.0], "{w} pulls down in energy");
+        }
+        // VALENCE up: zero energy, positive valence.
+        for w in ["dreamier", "sweeter"] {
+            let p = lexicon_pull(w, 0.6, now).unwrap_or_else(|| panic!("{w} pulls"));
+            assert_eq!(p.axes, vec![0.0, 1.0], "{w} pulls up in valence");
+        }
+        // VALENCE down: zero energy, negative valence.
+        for w in ["gloomier", "bleaker"] {
+            let p = lexicon_pull(w, 0.6, now).unwrap_or_else(|| panic!("{w} pulls"));
+            assert_eq!(p.axes, vec![0.0, -1.0], "{w} pulls down in valence");
+        }
+    }
+
     // The label is the matched DIRECTION token(s), not the whole sentence, so the
     // `field` echo reads "toward calmer" for a fuzzy ask like "play something calmer".
     #[tokio::test(start_paused = true)]
@@ -950,6 +1013,24 @@ mod pull_tests {
         assert!(lines[0].contains("calmer"), "{}", lines[0]);
         assert!(lines[0].contains("3 min ago"), "{}", lines[0]);
         assert!(lines[0].contains("fading"), "{}", lines[0]);
+    }
+
+    // Reinforcing an EARLIER pull makes it the most-recently-meant one: the merge
+    // moves it to the end so a following nudge lands on it, not on a later-but-
+    // untouched pull. Regression for the in-place-merge recency bug.
+    #[tokio::test(start_paused = true)]
+    async fn reinforce_updates_recency_order() {
+        let now = Instant::now();
+        let mut field = PullField::new();
+        field.add(Pull::new("calmer", vec![-1.0, 0.0], 0.6, now), now);
+        field.add(Pull::new("warmer", vec![0.0, 1.0], 0.6, now), now);
+        // Reinforce "calmer" - it is now the just-meant pull, so it must move last.
+        field.add(Pull::new("calmer", vec![-1.0, 0.0], 0.2, now), now);
+        let lines = field.describe(now);
+        assert!(lines.last().unwrap().contains("calmer"), "{:?}", lines);
+        // A nudge must attenuate the reinforced "calmer", not the older "warmer".
+        let label = field.nudge_recent(0.5, now).unwrap();
+        assert_eq!(label, "calmer");
     }
 
     // "less"/"too much" halves the most-recent pull; "more" strengthens it.

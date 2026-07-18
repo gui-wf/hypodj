@@ -27,6 +27,67 @@ pub struct NowPlaying {
     /// present ONLY when armed. Startle-safe equals trust only if the machine's
     /// hold on the night is VISIBLE - these back that render.
     pub armed: ArmedFeatures,
+    /// The active latent-field pulls, surfaced by the daemon as X- status pairs and
+    /// present ONLY while a pull is active. Backs the passive "see the field" HUD:
+    /// an inspectable, decaying magnetism map is what makes the nondeterministic
+    /// field trustworthy.
+    pub field: FieldState,
+}
+
+/// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
+/// `strength` is a basis-of-100 integer (the wire value); render as `strength/100`.
+#[derive(Debug, Default, PartialEq, Clone)]
+pub struct FieldPull {
+    /// The pull label - the matched lexicon token(s), e.g. `calmer` or `less energy`.
+    pub label: String,
+    /// Decayed strength as an integer 0..=100 (the wire basis-of-100 value).
+    pub strength: u8,
+    /// Whole minutes since the pull was born/reinforced.
+    pub age_mins: u64,
+}
+
+/// The active latent-field, parsed from the daemon's `X-hypodj-field-*` status
+/// pairs. Empty when no pull is active, so a lean status leaves this empty and the
+/// clients render nothing.
+#[derive(Debug, Default, PartialEq, Clone)]
+pub struct FieldState {
+    /// The live pulls in insertion order (most recent last).
+    pub pulls: Vec<FieldPull>,
+}
+
+impl FieldState {
+    /// `true` when at least one pull is active - the HUD render gate.
+    pub fn active(&self) -> bool {
+        !self.pulls.is_empty()
+    }
+
+    fn parse(status: &[(String, String)]) -> Self {
+        let count = find(status, "X-hypodj-field-count")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut pulls = Vec::new();
+        for i in 0..count {
+            // Skip any index missing a key (defensive against a torn snapshot).
+            let label = match find(status, &format!("X-hypodj-field-{i}-label")) {
+                Some(l) => l.to_string(),
+                None => continue,
+            };
+            let strength = match find(status, &format!("X-hypodj-field-{i}-strength"))
+                .and_then(|v| v.parse::<u8>().ok())
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            let age_mins = match find(status, &format!("X-hypodj-field-{i}-age"))
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                Some(a) => a,
+                None => continue,
+            };
+            pulls.push(FieldPull { label, strength, age_mins });
+        }
+        FieldState { pulls }
+    }
 }
 
 /// The armed sleep / wind-down / wake state parsed from the daemon's X- status
@@ -84,6 +145,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         file: find(current, "file").map(str::to_string),
         starred: find(current, "X-Starred").is_some(),
         armed: ArmedFeatures::parse(status),
+        field: FieldState::parse(status),
     }
 }
 
@@ -237,6 +299,49 @@ mod tests {
     fn armed_absent_when_no_pairs() {
         let np = now_playing(&p(&[("state", "play")]), &[]);
         assert_eq!(np.armed, ArmedFeatures::default());
+    }
+
+    #[test]
+    fn nowplaying_parses_field_pull_pairs() {
+        let status = p(&[
+            ("state", "play"),
+            ("X-hypodj-field-count", "2"),
+            ("X-hypodj-field-0-label", "calmer"),
+            ("X-hypodj-field-0-strength", "58"),
+            ("X-hypodj-field-0-age", "3"),
+            ("X-hypodj-field-1-label", "warmer"),
+            ("X-hypodj-field-1-strength", "41"),
+            ("X-hypodj-field-1-age", "1"),
+        ]);
+        let np = now_playing(&status, &[]);
+        assert!(np.field.active());
+        assert_eq!(np.field.pulls.len(), 2);
+        assert_eq!(np.field.pulls[0], FieldPull { label: "calmer".into(), strength: 58, age_mins: 3 });
+        assert_eq!(np.field.pulls[1], FieldPull { label: "warmer".into(), strength: 41, age_mins: 1 });
+    }
+
+    #[test]
+    fn field_absent_when_no_pairs() {
+        let np = now_playing(&p(&[("state", "play")]), &[]);
+        assert!(!np.field.active());
+        assert_eq!(np.field, FieldState::default());
+    }
+
+    #[test]
+    fn field_skips_torn_index_missing_key() {
+        // A count of 2 but the second pull's strength pair is missing (a torn
+        // snapshot): the incomplete index is skipped, never a garbage pull.
+        let status = p(&[
+            ("X-hypodj-field-count", "2"),
+            ("X-hypodj-field-0-label", "calmer"),
+            ("X-hypodj-field-0-strength", "58"),
+            ("X-hypodj-field-0-age", "3"),
+            ("X-hypodj-field-1-label", "warmer"),
+            ("X-hypodj-field-1-age", "1"),
+        ]);
+        let np = now_playing(&status, &[]);
+        assert_eq!(np.field.pulls.len(), 1);
+        assert_eq!(np.field.pulls[0].label, "calmer");
     }
 
     #[test]
