@@ -281,6 +281,12 @@ fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents
                 let _ = tx.send(Req::Nl(phrase));
             }
             Intent::ConfirmArm => {
+                // Echo the choice INTO the DJ chat immediately so the keypress is
+                // acknowledged the instant it lands (the armed result banner follows
+                // from the worker); on other screens the popup already reflects it.
+                if state.screen == Screen::Dj {
+                    state.push_dj_log("> y".to_string());
+                }
                 let pending = state.pending.take();
                 state.mode = Mode::Normal;
                 if let Some(p) = pending {
@@ -288,6 +294,10 @@ fn dispatch(tx: &Sender<Req>, cc_tx: &Sender<Req>, state: &mut TuiState, intents
                 }
             }
             Intent::ConfirmCancel => {
+                if state.screen == Screen::Dj {
+                    state.push_dj_log("> n".to_string());
+                    state.push_dj_log("cancelled".to_string());
+                }
                 let token = state.pending.as_ref().and_then(|p| p.token.clone());
                 state.pending = None;
                 state.mode = Mode::Normal;
@@ -654,4 +664,60 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Re
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use state::Pending;
+
+    /// Pressing `y` on the DJ confirm echoes "> y" into the chat immediately AND still
+    /// arms via the SAME Req::Arm path (no new arming, no double-arm) - the keypress is
+    /// acknowledged instantly while the armed banner follows from the worker.
+    #[test]
+    fn dj_confirm_arm_echoes_choice_and_arms() {
+        let (tx, rx) = mpsc::channel::<Req>();
+        let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        state.screen = Screen::Dj;
+        state.enter_confirm(Pending {
+            command: Some("plan add x".into()),
+            token: None,
+            steps: vec!["add 5 calmer tracks".into()],
+            note: None,
+            trust: None,
+        });
+        dispatch(&tx, &cc_tx, &mut state, vec![Intent::ConfirmArm]);
+        assert!(state.dj_log.iter().any(|l| l == "> y"), "choice echoed to chat");
+        assert_eq!(state.mode, Mode::Normal, "confirm dismissed");
+        assert!(state.pending.is_none(), "pending consumed");
+        // Exactly one Req::Arm (no double-arm); a trailing Refresh is expected too.
+        let reqs: Vec<Req> = rx.try_iter().collect();
+        assert_eq!(
+            reqs.iter().filter(|r| matches!(r, Req::Arm(_))).count(),
+            1,
+            "armed once through the same Req::Arm path"
+        );
+    }
+
+    /// Pressing `n` on the DJ confirm echoes the cancellation into the chat and cancels
+    /// (Req::Cancel), leaving no pending plan.
+    #[test]
+    fn dj_confirm_cancel_echoes_cancelled() {
+        let (tx, rx) = mpsc::channel::<Req>();
+        let (cc_tx, _cc_rx) = mpsc::channel::<Req>();
+        let mut state = TuiState::new();
+        state.screen = Screen::Dj;
+        state.enter_confirm(Pending {
+            token: Some("nl-1".into()),
+            ..Default::default()
+        });
+        dispatch(&tx, &cc_tx, &mut state, vec![Intent::ConfirmCancel]);
+        assert!(state.dj_log.iter().any(|l| l == "cancelled"), "cancellation echoed");
+        assert_eq!(state.mode, Mode::Normal);
+        assert!(state.pending.is_none());
+        let reqs: Vec<Req> = rx.try_iter().collect();
+        assert!(reqs.iter().any(|r| matches!(r, Req::Cancel(_))), "cancel dispatched");
+    }
 }

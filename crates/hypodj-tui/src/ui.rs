@@ -519,8 +519,8 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        armed_hud, hit_style, level_wave_row, match_spans, track_seed, volume_slider, wave_glyphs,
-        wave_row, window_title, BLOCK_GLYPHS,
+        armed_hud, dj_prompt_line, hit_style, level_wave_row, match_spans, track_seed,
+        volume_slider, wave_glyphs, wave_row, window_title, BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
     use hypodj_client::model::{ArmedFeatures, NowPlaying};
@@ -927,6 +927,67 @@ mod tests {
     }
 
     #[test]
+    fn dj_prompt_line_flags_only_interactive_lines() {
+        assert!(dj_prompt_line("confirm? [y/N]"));
+        assert!(dj_prompt_line("> y"));
+        assert!(dj_prompt_line("> n"));
+        assert!(dj_prompt_line("cancelled"));
+        assert!(!dj_prompt_line("> fade out"));
+        assert!(!dj_prompt_line("armed: add 5 tracks"));
+        assert!(!dj_prompt_line("ok: next"));
+    }
+
+    #[test]
+    fn render_dj_confirm_prompt_is_differentiated() {
+        // A confirm on the DJ screen pushes "confirm? [y/N]" into the chat; it must
+        // render DIFFERENTIATED (bold + the theme accent), not as plain chat, so it
+        // reads as an interactive prompt.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.enter_confirm(crate::state::Pending {
+            command: Some("plan add x".into()),
+            token: None,
+            steps: vec!["add 5 calmer tracks".into()],
+            note: None,
+            trust: None,
+        });
+        assert!(s.dj_log.iter().any(|l| l == "confirm? [y/N]"), "prompt pushed to chat");
+        let accent =
+            crate::album_color::info_color([0xff, 0xd0, 0x66], s.term_bg, s.truecolor);
+        let colors = render_fg_colors(&s, 80, 30);
+        assert!(colors.contains(&accent), "confirm prompt uses the accent color:\n{colors:?}");
+        // The caret stays alive during the confirm (the pane must not read as dead).
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal.draw(|f| super::render(f, &s)).unwrap();
+        assert!(terminal.get_cursor_position().is_ok());
+    }
+
+    #[test]
+    fn render_dj_armed_line_visible_after_y() {
+        // The command-arm banner ("armed: ...") folds into the DJ chat (main.rs routes
+        // a Screen::Dj Banner to push_dj_log); it must be visible in the pane.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.push_dj_log("> y".into());
+        s.push_dj_log("armed: add 5 calmer tracks".into());
+        let out = render_to_lines_sized(&s, 80, 30).join("\n");
+        assert!(out.contains("> y"), "choice echo visible:\n{out}");
+        assert!(out.contains("armed: add 5 calmer tracks"), "armed line visible:\n{out}");
+    }
+
+    #[test]
+    fn render_dj_cancelled_line_visible_after_n() {
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.push_dj_log("> n".into());
+        s.push_dj_log("cancelled".into());
+        let out = render_to_lines_sized(&s, 80, 30).join("\n");
+        assert!(out.contains("cancelled"), "cancelled line visible:\n{out}");
+    }
+
+    #[test]
     fn wave_row_length_matches_width() {
         // The row is exactly `width` glyphs, including the degenerate 0/1 widths.
         for w in [0usize, 1, 5, 20, 79] {
@@ -1139,7 +1200,25 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
             Style::default().add_modifier(Modifier::DIM),
         ))]
     } else {
-        state.dj_log[start..].iter().map(|l| Line::from(l.clone())).collect()
+        // Style interactive-prompt lines DIFFERENTIATED so a confirm reads as a live
+        // prompt, not plain chat: the "confirm? [y/N]" line and the y/n choice echo
+        // get a bold, theme-aware accent (INFO policy off the terminal background);
+        // everything else stays plain. Keeps dj_log a Vec<String> - the styling is
+        // decided at render time by matching the line content.
+        let accent = crate::album_color::info_color([0xff, 0xd0, 0x66], state.term_bg, state.truecolor);
+        state.dj_log[start..]
+            .iter()
+            .map(|l| {
+                if dj_prompt_line(l) {
+                    Line::from(Span::styled(
+                        l.clone(),
+                        Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Line::from(l.clone())
+                }
+            })
+            .collect()
     };
     f.render_widget(Paragraph::new(log_lines), rows[0]);
 
@@ -1165,10 +1244,19 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
         Span::raw(state.dj_input.clone()),
     ]);
     f.render_widget(Paragraph::new(input_line), rows[2]);
-    if state.screen == Screen::Dj && state.mode == Mode::Normal {
+    // Keep the caret alive during the y/N confirm too (not just Normal): during
+    // Mode::Confirm the pane must not read as dead while it waits for the keypress.
+    if state.screen == Screen::Dj && matches!(state.mode, Mode::Normal | Mode::Confirm) {
         let caret_x = rows[2].x + 5 + state.dj_input.chars().count() as u16;
         f.set_cursor_position((caret_x.min(rows[2].x + rows[2].width.saturating_sub(1)), rows[2].y));
     }
+}
+
+/// Whether a DJ scrollback line is an interactive-prompt line that should render
+/// DIFFERENTIATED (the `confirm? [y/N]` prompt and the y/n choice echo), so the
+/// confirm reads as a live prompt rather than plain chat. Pure - unit-tested.
+fn dj_prompt_line(line: &str) -> bool {
+    line == "confirm? [y/N]" || line == "> y" || line == "> n" || line == "cancelled"
 }
 
 /// Whether to use unicode block glyphs for the ambient wave. Kept as a const so a
