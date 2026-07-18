@@ -466,10 +466,9 @@ impl PullField {
             .filter(|p| p.is_alive(now))
             .map(|p| {
                 format!(
-                    "toward {} ({:.2}, from {}, {} min ago, fading)",
+                    "toward {} ({:.2}, from the ask, {} min ago, fading)",
                     p.label,
                     p.strength_now(now),
-                    p.label,
                     p.age_mins(now),
                 )
             })
@@ -587,6 +586,10 @@ pub fn lexicon_pull(words: &str, strength: f32, now: Instant) -> Option<Pull> {
     let mut axes = [0.0f32; 2];
     let mut hit = false;
     let mut neg = false;
+    // The matched DIRECTION token(s) become the label, so the `field` echo reads
+    // "toward calmer" rather than echoing the whole sentence ("play something
+    // calmer"). A leading negator is kept on its term ("less energy").
+    let mut label_toks: Vec<String> = Vec::new();
     for tok in lc.split_whitespace() {
         if NEGATORS.contains(&tok) {
             neg = true;
@@ -597,13 +600,19 @@ pub fn lexicon_pull(words: &str, strength: f32, now: Instant) -> Option<Pull> {
             axes[0] += sign * d[0];
             axes[1] += sign * d[1];
             hit = true;
+            if neg {
+                label_toks.push(format!("less {tok}"));
+            } else {
+                label_toks.push(tok.to_string());
+            }
             neg = false;
         }
     }
     if !hit || (axes[0] == 0.0 && axes[1] == 0.0) {
         return None;
     }
-    Some(Pull::new(words.trim(), vec![axes[0], axes[1]], strength, now))
+    let label = label_toks.join(" ");
+    Some(Pull::new(label, vec![axes[0], axes[1]], strength, now))
 }
 
 /// The default strength for a lexicon-set pull (a comparative is a held, mid-band
@@ -907,6 +916,25 @@ mod pull_tests {
         // Unknown words -> None (no pull felt from that).
         assert!(lexicon_pull("banana sandwich", 0.6, now).is_none());
         assert!(lexicon_pull("", 0.6, now).is_none());
+    }
+
+    // The label is the matched DIRECTION token(s), not the whole sentence, so the
+    // `field` echo reads "toward calmer" for a fuzzy ask like "play something calmer".
+    #[tokio::test(start_paused = true)]
+    async fn lexicon_label_is_matched_token_not_whole_phrase() {
+        let now = Instant::now();
+        let p = lexicon_pull("play something calmer", LEXICON_PULL_STRENGTH, now).unwrap();
+        assert_eq!(p.label, "calmer", "label is the matched token, not the sentence");
+        assert_eq!(p.strength, LEXICON_PULL_STRENGTH);
+        // A negated term keeps its softener in the label.
+        let n = lexicon_pull("give me less energy please", 0.6, now).unwrap();
+        assert_eq!(n.label, "less energy");
+        // The render then reads cleanly with the "from the ask" origin marker.
+        let mut field = PullField::new();
+        field.add(p, now);
+        let line = &field.describe(now)[0];
+        assert!(line.contains("toward calmer"), "{line}");
+        assert!(line.contains("from the ask"), "{line}");
     }
 
     // The `field` render carries provenance + decayed strength + age.

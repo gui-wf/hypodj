@@ -41,7 +41,7 @@ use crate::fade::{
 };
 use crate::event::{Cursor, EntrySnapshot, QueueId, QueueSnapshot};
 use crate::intelligence::{
-    lexicon_pull, pull_reweight, FeatureStore, MetadataStore, PullField, TrackFeatures,
+    lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
     LEXICON_PULL_STRENGTH,
 };
 use crate::model::{AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId};
@@ -1608,20 +1608,43 @@ impl HypodjHandler {
             }
         };
         // THE REWEIGHT HOOK: the single seam P4 HEURISTIC candidate selection
-        // funnels through. When a latent-field pull is active, reorder these
-        // resolved candidates toward the pulled direction (biasing WHICH tracks lead
-        // the append), relative to the current track. When no pull is active this is
-        // a no-op and the enqueue order is byte-identical to today. It ONLY reorders
-        // candidate ranking - it never touches the queue, never arms.
+        // funnels through. It ALSO owns setting the latent-field pull, because a pull
+        // must be registered EXACTLY when a mood enqueue is COMMITTED (this method runs
+        // only after `nl confirm`/arm), never speculatively before confirmation - so a
+        // rejected or non-enqueue ask can never leave a lingering bias behind. It ONLY
+        // reorders candidate ranking + edits the belief field; it never touches the
+        // queue, never arms.
         //
-        // CRUCIALLY it is gated to the heuristic pools (Similar/Calmer) only. The
-        // deterministic/explicit selectors (Exact, Query, Genre, Radio) name a
-        // definite, user/plan-specified ordered list; a live pull must NEVER silently
-        // reorder that observable list. Exact especially is an explicit ordered add.
-        let songs = if matches!(selector, Selector::Similar(_) | Selector::Calmer(_)) {
-            self.pull_rerank(songs)
-        } else {
-            songs
+        // Per selector:
+        // - A MOOD `Query` ("calmer tracks") carries a lexicon direction word: it
+        //   SEEDS a lingering pull from its own text AND biases THIS enqueue toward it
+        //   (the cc translator resolves a mood/comparative ask to `Query`, so this is
+        //   the seam that makes the pull bias the very enqueue it was primed for). An
+        //   EXPLICIT `Query` (a title/artist, no direction word) yields no pull and is
+        //   left byte-identical - an explicit ordered list is NEVER silently reordered,
+        //   and a lingering pull from an earlier ask never reorders it either.
+        // - `Calmer` seeds a "calmer" pull (its intrinsic direction) then biases THIS
+        //   enqueue - the daemon-rules mood path's parity with the cc `Query` path.
+        // - `Similar`/`Radio` carry no intrinsic direction (they seed nothing) but are
+        //   NON-DETERMINISTIC pools, so an already-active lingering pull may reorder
+        //   WHICH picks lead the append (harmless + byte-identical when no pull is set).
+        // - `Exact`/`Genre` name a definite user/plan-specified ordered list; a live
+        //   pull must NEVER silently reorder that observable list, so they are left as-is.
+        let songs = match selector {
+            Selector::Query(q) => match lexicon_pull(q, LEXICON_PULL_STRENGTH, Instant::now()) {
+                Some(pull) => {
+                    self.pulls.lock().unwrap().add(pull, Instant::now());
+                    self.pull_rerank(songs)
+                }
+                None => songs,
+            },
+            Selector::Calmer(_) => {
+                let pull = Pull::new("calmer", vec![-1.0, 0.0], LEXICON_PULL_STRENGTH, Instant::now());
+                self.pulls.lock().unwrap().add(pull, Instant::now());
+                self.pull_rerank(songs)
+            }
+            Selector::Similar(_) | Selector::Radio => self.pull_rerank(songs),
+            Selector::Exact(_) | Selector::Genre(_) => songs,
         };
         let n = songs.len();
         for s in songs {
@@ -8376,5 +8399,133 @@ mod tests {
         // The desync does not survive a resume: still on idx0.
         assert_eq!(h.state.lock().unwrap().current, Some(0));
         assert_eq!(h.state.lock().unwrap().pending_skip, None);
+    }
+
+    // A MOOD ask primed as `field set <phrase>` registers a lingering pull with
+    // provenance and NEVER mutates the queue (bias-only). A GENRE/explicit ask carries
+    // no lexicon direction word, so it sets NO pull (byte-identical to today). This is
+    // exactly the daemon side of the client mood-priming seam.
+    #[tokio::test(start_paused = true)]
+    async fn field_set_from_ask_sets_mood_pull_but_not_genre_and_never_mutates_queue() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+
+        // Empty field to start.
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
+        assert_eq!(pair(&resp, "field"), Some("no pulls active"));
+
+        // A MOOD ask (as the client primes it): a direction word is felt -> a pull is
+        // set, labeled by the matched token, with "from the ask" provenance.
+        let resp = h
+            .handle(MpdCommand::Field(FieldCmd::Set("play something calmer".into())))
+            .await;
+        assert_eq!(pair(&resp, "pull_set"), Some("calmer"), "mood ask sets a pull");
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
+        let line = pair(&resp, "pull").expect("a live pull");
+        assert!(line.contains("toward calmer"), "provenance label: {line}");
+        assert!(line.contains("from the ask"), "origin marker: {line}");
+        // Bias-only: setting a pull never touched the queue.
+        assert_eq!(h.state.lock().unwrap().queue.len(), 0, "pull never enqueues");
+
+        // A GENRE ask carries no lexicon direction word -> NO pull is added; the honest
+        // "no pull felt" echo, and the field is unchanged beyond the prior mood pull.
+        let resp = h
+            .handle(MpdCommand::Field(FieldCmd::Set("play some jazz".into())))
+            .await;
+        assert!(
+            pair(&resp, "field").unwrap_or_default().contains("no pull felt"),
+            "genre ask sets no pull: {resp:?}"
+        );
+        // Still exactly one pull (the calmer one), no spurious jazz pull, queue empty.
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
+        let pulls = match &resp {
+            MpdResponse::Pairs(p) => p.iter().filter(|(k, _)| k == "pull").count(),
+            _ => 0,
+        };
+        assert_eq!(pulls, 1, "no spurious pull from a genre ask");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 0, "no ask ever mutated the queue");
+
+        // Nudge "less" attenuates the pull (still non-destructive, queue untouched).
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Nudge(FieldNudge::Less))).await;
+        assert_eq!(pair(&resp, "pull_nudged"), Some("calmer"));
+        assert_eq!(h.state.lock().unwrap().queue.len(), 0);
+    }
+
+    /// LIVE proof against a REAL backend on a throwaway queue (never touches live
+    /// 6600, no secrets): a MOOD ask sets a lingering pull that BIASES a Radio
+    /// enqueue calmer-first; a GENRE ask sets NO pull; the pull never mutates the
+    /// queue (bias-only). Run with `--ignored` and env pointing at a throwaway
+    /// backend.
+    ///
+    /// Env: `HYPODJ_LIVE_URL`, `HYPODJ_LIVE_USER`, `HYPODJ_LIVE_PASS`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_mood_pull_biases_radio_enqueue_and_genre_sets_none() {
+        let (url, user, pass) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw)) => (u, us, pw),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig {
+            url,
+            username: user,
+            password: pass,
+            client_name: "hypodj-live-test".to_string(),
+        };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(client, player);
+
+        // (1) field shows no pull.
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
+        assert_eq!(pair(&resp, "field"), Some("no pulls active"), "clean field to start");
+
+        // (2) a MOOD ask (as the client primes it) -> a lingering "calmer" pull WITH
+        // provenance.
+        let resp = h
+            .handle(MpdCommand::Field(FieldCmd::Set("play something calmer".into())))
+            .await;
+        assert_eq!(pair(&resp, "pull_set"), Some("calmer"), "mood ask registers a pull");
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
+        let line = pair(&resp, "pull").expect("live pull");
+        assert!(line.contains("toward calmer") && line.contains("from the ask"), "{line}");
+
+        // The Radio enqueue is now biased calmer-FIRST: with a live pull active, the
+        // resolved random pool is reordered so lower-energy tracks lead the append.
+        let n = h.plan_enqueue(&Selector::Radio, 12).await.expect("radio enqueue");
+        assert!(n >= 4, "need a few tracks to see the bias, got {n}");
+        let energies: Vec<f32> = {
+            let st = h.state.lock().unwrap();
+            st.queue
+                .iter()
+                .filter_map(|it| match &it.entry {
+                    QueueEntry::Song(s) => Some(crate::intelligence::energy_score(s)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Bias-only: the queue is exactly the appended count (never mutated/deleted).
+        assert_eq!(energies.len(), n, "queue is a definite array of the appended picks");
+        let half = energies.len() / 2;
+        let mean = |xs: &[f32]| xs.iter().sum::<f32>() / xs.len().max(1) as f32;
+        let front = mean(&energies[..half]);
+        let back = mean(&energies[half..]);
+        assert!(front <= back + 1e-3, "calmer pull leads with lower-energy picks: {front} <= {back}");
+
+        // (3) a GENRE ask -> NO mood pull is set (no spurious pull). Clear first so we
+        // read the genre ask in isolation.
+        h.handle(MpdCommand::Field(FieldCmd::Clear)).await;
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Set("play some jazz".into()))).await;
+        assert!(
+            pair(&resp, "field").unwrap_or_default().contains("no pull felt"),
+            "genre ask sets no pull: {resp:?}"
+        );
+        let resp = h.handle(MpdCommand::Field(FieldCmd::Status)).await;
+        assert_eq!(pair(&resp, "field"), Some("no pulls active"), "field unchanged by a genre ask");
     }
 }
