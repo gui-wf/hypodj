@@ -66,10 +66,41 @@ fn is_bare_favorite(args: &[String]) -> bool {
     }
 }
 
+/// Is `w` one of the resume/unpause bare verbs.
+fn is_resume_verb(w: &str) -> bool {
+    matches!(w, "resume" | "unpause" | "continue")
+}
+
+/// Filler words allowed in the tail of a bare-resume phrase ("resume PLAYBACK",
+/// "continue PLAYING", "resume THE TRACK", "unpause IT", "resume THIS"). A
+/// superset of `is_filler_word` plus the resume-specific soft nouns/adverbs
+/// ("playback", "again"). ANY token outside this set means a real target
+/// ("resume jazz", "continue at 30") and disqualifies the shortcut.
+fn is_resume_filler(w: &str) -> bool {
+    is_filler_word(w) || matches!(w, "playback" | "again")
+}
+
+/// A bare-resume is a resume verb followed only by filler words, at any length:
+/// "continue playing", "resume playback", "resume the track", "unpause it". This
+/// runs BEFORE the length match so the natural multi-word phrasings resolve to the
+/// DETERMINISTIC `pause 0` (startle-safe resume-from-position) instead of falling
+/// to the AI, which plans a jump-to-current Play that restarts the track at 0.
+fn is_bare_resume(args: &[String]) -> bool {
+    match args.split_first() {
+        Some((verb, rest)) => {
+            is_resume_verb(verb) && rest.iter().all(|w| is_resume_filler(w))
+        }
+        None => false,
+    }
+}
+
 /// Route the argument vector (already split into tokens) to an Action.
 pub fn route(args: &[String]) -> Action {
     if is_bare_favorite(args) {
         return Action::FavoriteCurrent;
+    }
+    if is_bare_resume(args) {
+        return Action::Command("pause 0".into());
     }
     match args.len() {
         0 => Action::NowPlaying,
@@ -85,6 +116,12 @@ fn route_one(verb: &str, args: &[String]) -> Action {
         "queue" => Action::Queue,
         "play" => Action::Command("play".into()),
         "pause" => Action::Command("pause".into()),
+        // `resume` is NOT `play`. `play` reloads the current track and restarts it
+        // at 0; the startle-safe resume-from-position is `pause 0`
+        // (Pause(Some(false)) -> the resume_with_fade arm). Route it through the
+        // DETERMINISTIC verb layer here so resume never falls to the AI (which
+        // planned a jump-to-current Play that restarted at 0).
+        "resume" | "unpause" | "continue" => Action::Command("pause 0".into()),
         "stop" => Action::Command("stop".into()),
         "next" | "skip" => Action::Command("next".into()),
         "prev" | "previous" | "back" => Action::Command("previous".into()),
@@ -153,6 +190,37 @@ mod tests {
         assert_eq!(r("previous"), Action::Command("previous".into()));
         assert_eq!(r("clear"), Action::ClearConfirm);
         assert_eq!(r("help"), Action::Help);
+    }
+
+    #[test]
+    fn route_resume_is_deterministic_pause_zero() {
+        // `resume` must go through the VERB layer (never the AI) and map to
+        // `pause 0` - the startle-safe resume AT the paused position, NOT `play`
+        // (which reloads the current track and restarts it at 0).
+        assert_eq!(r("resume"), Action::Command("pause 0".into()));
+        assert_eq!(r("unpause"), Action::Command("pause 0".into()));
+        assert_eq!(r("continue"), Action::Command("pause 0".into()));
+        // No regression: play/pause stay their own deterministic verbs.
+        assert_eq!(r("play"), Action::Command("play".into()));
+        assert_eq!(r("pause"), Action::Command("pause".into()));
+    }
+
+    #[test]
+    fn route_resume_natural_multiword_phrases() {
+        // Natural multi-word resume phrasings must resolve to the DETERMINISTIC
+        // `pause 0` (resume-from-position), never fall to the AI (which restarts
+        // the track at 0 via a jump-to-current Play).
+        assert_eq!(r("continue playing"), Action::Command("pause 0".into()));
+        assert_eq!(r("resume playback"), Action::Command("pause 0".into()));
+        assert_eq!(r("resume the track"), Action::Command("pause 0".into()));
+        assert_eq!(r("resume this"), Action::Command("pause 0".into()));
+        assert_eq!(r("unpause it"), Action::Command("pause 0".into()));
+        assert_eq!(r("resume the current song"), Action::Command("pause 0".into()));
+        assert_eq!(r("continue playing now"), Action::Command("pause 0".into()));
+        assert_eq!(r("resume playback please"), Action::Command("pause 0".into()));
+        // Regression guards: a real target is NOT a bare resume -> NL.
+        assert_eq!(r("resume jazz"), Action::Nl("resume jazz".into()));
+        assert_eq!(r("continue at 30"), Action::Nl("continue at 30".into()));
     }
 
     #[test]
