@@ -58,6 +58,13 @@ nix develop --command cargo test  -j4 --workspace
   being caught post-merge). A `let Some(..) = handler_with_null_player()` unit test
   CANNOT prove a real-mpv path (warm-skip, EOF auto-advance, astats) - those need
   an `#[ignore]` live-libmpv test that the gate actually runs.
+- **A workflow live-proof that spins up an isolated daemon MUST force
+  `audio = null` (e.g. `HYPODJ_AUDIO=null`), never clone the user's real audio
+  device.** The runtime config at `/run/user/1000/hypodj/config.toml` binds the
+  real speakers, so a test daemon copied from it plays sound through the user's
+  room on the alt port. Always override audio to null in the copied config (and
+  MPRIS off) so the live proof stays SILENT - your process must leave no sound in
+  the human's environment. Also always tear the test daemon down afterward.
 - **Devshell `cargo test` green does NOT mean the Nix package builds.**
   `nix/package.nix` and `nix/clients.nix` run `doCheck` with `-p hypodj-core` in a
   CERTLESS, network-less sandbox where `handler_with_null_player()` returns `None`.
