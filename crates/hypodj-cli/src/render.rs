@@ -3,7 +3,7 @@
 //! NowPlaying + queue parsing lives in the client. A stopped/empty deck renders a
 //! friendly "nothing playing".
 
-use hypodj_client::model::{fmt_remaining, parse_queue, ArmedFeatures, NowPlaying};
+use hypodj_client::model::{fmt_remaining, parse_queue, ArmedFeatures, FieldState, NowPlaying};
 
 /// Render the now-playing card as plain text (a couple of lines). A stopped or
 /// empty deck is "nothing playing" - never a leftover title/artist.
@@ -11,13 +11,15 @@ pub fn render_card(np: &NowPlaying) -> String {
     let stopped = np.state.as_deref() == Some("stop");
     let empty = np.title.is_none() && np.artist.is_none() && np.album.is_none();
     let armed = render_armed(&np.armed);
+    let field = render_field(&np.field);
     if stopped || empty {
-        // A stopped deck can still hold an armed wake alarm - surface it so the
-        // machine's hold on the night stays visible even with nothing playing.
-        return match armed {
-            Some(a) => format!("nothing playing\n{a}"),
-            None => "nothing playing".to_string(),
-        };
+        // A stopped deck can still hold an armed wake alarm or a held pull - surface
+        // them so the machine's hold stays visible even with nothing playing. Field
+        // is the last, quietest line.
+        let mut lines = vec!["nothing playing".to_string()];
+        lines.extend(armed);
+        lines.extend(field);
+        return lines.join("\n");
     }
     let mut lines = Vec::new();
     if let Some(t) = &np.title {
@@ -64,7 +66,28 @@ pub fn render_card(np: &NowPlaying) -> String {
     if let Some(a) = armed {
         lines.push(a);
     }
+    // The field is the last, faintest line of the card - the quietest voice.
+    if let Some(fl) = field {
+        lines.push(fl);
+    }
     lines.join("\n")
+}
+
+/// The active latent-field pulls as one unobtrusive line, e.g.
+/// `toward calmer 0.58 3m | toward warmer 0.41 1m`. `None` when no pull is active,
+/// so a resting field renders no line. Reconstructed from the numeric X- pairs; the
+/// verbose provenance prose stays reserved for the interactive `field` command.
+fn render_field(field: &FieldState) -> Option<String> {
+    if !field.active() {
+        return None;
+    }
+    let line = field
+        .pulls
+        .iter()
+        .map(|p| format!("toward {} {:.2} {}m", p.label, p.strength as f32 / 100.0, p.age_mins))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    Some(line)
 }
 
 /// The armed human-features as one unobtrusive line, e.g.
@@ -213,6 +236,48 @@ mod tests {
         let card = render_card(&now_playing(&status, &current));
         assert!(!card.contains("sleep"));
         assert!(!card.contains("wake"));
+    }
+
+    #[test]
+    fn card_shows_field_pull_line() {
+        let status = p(&[
+            ("state", "play"),
+            ("song", "0"),
+            ("X-hypodj-field-count", "2"),
+            ("X-hypodj-field-0-label", "calmer"),
+            ("X-hypodj-field-0-strength", "58"),
+            ("X-hypodj-field-0-age", "3"),
+            ("X-hypodj-field-1-label", "warmer"),
+            ("X-hypodj-field-1-strength", "41"),
+            ("X-hypodj-field-1-age", "1"),
+        ]);
+        let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(card.contains("toward calmer 0.58 3m"), "card: {card}");
+        assert!(card.contains("toward warmer 0.41 1m"), "card: {card}");
+        assert!(card.contains("toward calmer 0.58 3m | toward warmer 0.41 1m"), "card: {card}");
+    }
+
+    #[test]
+    fn card_no_field_line_at_rest() {
+        let status = p(&[("state", "play"), ("song", "0")]);
+        let current = p(&[("file", "song/1"), ("Title", "X"), ("Artist", "Y")]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(!card.contains("toward"), "no field line at rest: {card}");
+    }
+
+    #[test]
+    fn card_stopped_still_shows_held_pull() {
+        let status = p(&[
+            ("state", "stop"),
+            ("X-hypodj-field-count", "1"),
+            ("X-hypodj-field-0-label", "calmer"),
+            ("X-hypodj-field-0-strength", "58"),
+            ("X-hypodj-field-0-age", "3"),
+        ]);
+        let card = render_card(&now_playing(&status, &[]));
+        assert!(card.contains("nothing playing"));
+        assert!(card.contains("toward calmer 0.58 3m"), "card: {card}");
     }
 
     #[test]
