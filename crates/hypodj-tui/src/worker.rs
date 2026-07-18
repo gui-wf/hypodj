@@ -398,7 +398,11 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
             }
             Err(_) => true,
         },
-        Req::Nl(phrase) => match conn.command(&nl_request(&phrase)) {
+        Req::Nl(phrase) => {
+            // NOTE: the latent-field pull is set DAEMON-SIDE at the confirmed enqueue
+            // (`plan_enqueue`), never primed here before the user confirms - a rejected
+            // or non-enqueue ask must never leave a lingering bias behind.
+            match conn.command(&nl_request(&phrase)) {
             Ok(pairs) => {
                 match token_from_pairs(&pairs) {
                     Some(token) => {
@@ -428,7 +432,8 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
                 false
             }
             Err(_) => true,
-        },
+            }
+        }
         Req::Arm(pending) => {
             let result = match (&pending.command, &pending.token) {
                 (Some(cmd), _) => conn.command(cmd).map(|_| None),

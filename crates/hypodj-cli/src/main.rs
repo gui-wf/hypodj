@@ -194,6 +194,9 @@ fn print_card(conn: &mut MpdConn) -> Result<(), MpdError> {
 /// boundary as `nl confirm`). When `cc` is off, `claude` is absent, or the call
 /// fails, it falls through to today's daemon `nl` path unchanged.
 fn nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<(), MpdError> {
+    // NOTE: the latent-field pull is set DAEMON-SIDE at the confirmed enqueue
+    // (`plan_enqueue`), never speculatively primed here before the user confirms - a
+    // rejected or non-enqueue ask must never leave a lingering bias behind.
     #[cfg(feature = "cc")]
     {
         if hypodj_nl::cc::cc_available() {
