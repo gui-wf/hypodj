@@ -597,6 +597,7 @@ fn selector_phrase(sel: &Selector) -> String {
         Selector::Genre(g) => format!("\"{g}\""),
         Selector::Radio => "random tracks".to_string(),
         Selector::Similar(_) => "similar tracks".to_string(),
+        Selector::SimilarToCurrent => "the current track".to_string(),
         Selector::Calmer(_) => "calmer tracks".to_string(),
         Selector::Exact(_) => "those tracks".to_string(),
     }
@@ -1965,6 +1966,39 @@ impl HypodjHandler {
                 songs.truncate(want);
                 songs
             }
+            Selector::SimilarToCurrent => {
+                // The MODEL emitted no id (off-surface-id boundary): fill the seed
+                // server-side from the current (or first-queued) track. Nothing to
+                // seed from -> honest 0 (empty vec), NEVER a fabricated pick.
+                match self.similar_seed_id() {
+                    Some(id) => {
+                        // Same graceful degrade as Selector::Similar: sonic/similar,
+                        // then the seed's genre, then random - never an error on a
+                        // plain-Subsonic backend that lacks the endpoint.
+                        let seed = self.client.song(&id).await.map_err(|e| e.to_string())?;
+                        let mut songs =
+                            self.client.similar(&id, Some(want as i32)).await.unwrap_or_default();
+                        if songs.is_empty() {
+                            if let Some(g) = &seed.genre {
+                                songs =
+                                    self.client.songs_by_genre(g).await.map_err(|e| e.to_string())?;
+                            }
+                        }
+                        if songs.is_empty() {
+                            songs = self
+                                .client
+                                .random_songs(Some(want as i32))
+                                .await
+                                .map_err(|e| e.to_string())?;
+                        }
+                        // Never re-enqueue the seed (the track already playing/queued).
+                        songs.retain(|s| s.id != id);
+                        songs.truncate(want);
+                        songs
+                    }
+                    None => Vec::new(),
+                }
+            }
             Selector::Calmer(id) => {
                 // Over-fetch the candidate pool (2x) so the calmer half can still
                 // fill `count`; same graceful genre/random fallback as Similar.
@@ -2027,7 +2061,9 @@ impl HypodjHandler {
                 self.pulls.lock().unwrap().add(pull, Instant::now());
                 self.pull_rerank(songs)
             }
-            Selector::Similar(_) | Selector::Radio => self.pull_rerank(songs),
+            Selector::Similar(_) | Selector::SimilarToCurrent | Selector::Radio => {
+                self.pull_rerank(songs)
+            }
             Selector::Exact(_) | Selector::Genre(_) => songs,
         };
         let n = songs.len();
@@ -2070,6 +2106,25 @@ impl HypodjHandler {
             },
             None => None,
         }
+    }
+
+    /// The library [`SongId`] to seed a "more like what is playing" enqueue from:
+    /// the CURRENT playing song, else the FIRST queued song (nothing playing yet).
+    /// Streams have no library id and are skipped. `None` when there is nothing to
+    /// seed from - the caller then yields an honest 0, never a fabricated pick. The
+    /// std `Mutex` is read then dropped here, NEVER held across the later `.await`.
+    fn similar_seed_id(&self) -> Option<SongId> {
+        let st = self.state.lock().unwrap();
+        let current_song_id = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+            QueueEntry::Song(s) => Some(s.id.clone()),
+            QueueEntry::Stream { .. } => None,
+        });
+        current_song_id.or_else(|| {
+            st.queue.iter().find_map(|it| match &it.entry {
+                QueueEntry::Song(s) => Some(s.id.clone()),
+                QueueEntry::Stream { .. } => None,
+            })
+        })
     }
 
     /// Apply the active latent-field pulls to a resolved candidate list, biasing the
@@ -5979,6 +6034,41 @@ mod tests {
         assert_eq!(ids, vec![SongId("s-1".into()), SongId("s-2".into())]);
     }
 
+    // similar_to_current seeds from the CURRENT song, else the FIRST queued song,
+    // and yields NO seed (-> honest 0) when nothing playable is queued. Streams are
+    // skipped (no library id). This is the id the daemon fills server-side; the
+    // model never names it.
+    #[tokio::test]
+    async fn similar_seed_id_prefers_current_then_first_queued() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Empty queue -> nothing to seed from.
+        assert_eq!(h.similar_seed_id(), None);
+        // A raw stream first (no id) then two songs: with nothing playing, the seed
+        // is the FIRST song, skipping the id-less stream.
+        h.enqueue_stream_for_test(NTS).await;
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-2")).await;
+        assert_eq!(h.similar_seed_id(), Some(SongId("s-1".into())));
+        // Start playback on the second song -> the seed follows the CURRENT track.
+        h.handle(MpdCommand::Play(Some(2))).await;
+        assert_eq!(h.similar_seed_id(), Some(SongId("s-2".into())));
+    }
+
+    // "queue more like this" with NOTHING to seed from is an HONEST 0 - it never
+    // touches the network (no fabricated pick) and leaves the queue unchanged.
+    #[tokio::test]
+    async fn plan_enqueue_similar_to_current_honest_zero_when_nothing_queued() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let before = h.state.lock().unwrap().queue.len();
+        let n = h
+            .plan_enqueue(&Selector::SimilarToCurrent, 5)
+            .await
+            .expect("honest 0, not an error");
+        let after = h.state.lock().unwrap().queue.len();
+        assert_eq!(n, 0, "nothing playing/queued to seed from -> honest 0");
+        assert_eq!(before, after, "a no-seed ask leaves the queue unchanged");
+    }
+
     #[test]
     fn push_song_tags_emits_x_starred_only_when_starred() {
         // Not starred -> no X-Starred pair at all (never a `0` line).
@@ -9205,6 +9295,52 @@ mod tests {
         let q3 = h.state.lock().unwrap().queue.len();
         assert_eq!(n0, 0, "pure nonsense must resolve to an honest 0 (no fabrication)");
         assert_eq!(q2, q3, "a 0-match ask leaves the queue unchanged");
+    }
+
+    /// LIVE: "more like what is playing" resolves against a REAL backend. Seeds a
+    /// real track as the current song, then proves plan_enqueue(SimilarToCurrent)
+    /// (the id-free selector the model emits) fills the seed server-side and appends
+    /// N>0 REAL tracks; and that an EMPTY deck yields an HONEST 0 (no fabrication,
+    /// queue unchanged). Env: HYPODJ_LIVE_URL/USER/PASS. Run with
+    /// `cargo test -p hypodj-core -- --ignored live_similar_to_current`.
+    #[tokio::test]
+    #[ignore = "requires a live backend (HYPODJ_LIVE_URL/USER/PASS)"]
+    async fn live_similar_to_current_resolves_from_the_playing_seed() {
+        let (url, user, pass) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw)) => (u, us, pw),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username: user, password: pass, client_name: "hypodj-live-test".into() };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(Arc::clone(&client), player);
+
+        // (a) EMPTY deck: nothing to seed from -> honest 0, queue unchanged.
+        let n0 = h.plan_enqueue(&Selector::SimilarToCurrent, 5).await.expect("honest 0");
+        assert_eq!(n0, 0, "no current/queued song -> honest 0");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 0, "no-seed ask leaves queue empty");
+
+        // Seed a REAL track and START it, so there is a current song to be like.
+        let seed = client.random_songs(Some(1)).await.expect("random seed");
+        let seed = seed.into_iter().next().expect("a real track in the library");
+        h.enqueue_song_for_test(seed.clone()).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(h.similar_seed_id(), Some(seed.id.clone()), "the current track is the seed");
+
+        // (b) "queue more like this" -> resolves via similar(current id) and appends
+        // N>0 REAL tracks (append-only delta); the seed itself is never re-appended.
+        let before = h.state.lock().unwrap().queue.len();
+        let n = h.plan_enqueue(&Selector::SimilarToCurrent, 5).await.expect("similar enqueue");
+        let after = h.state.lock().unwrap().queue.len();
+        assert!(n > 0, "similar_to_current must resolve the playing seed to real tracks");
+        assert_eq!(after - before, n, "reported count equals the real queue delta");
     }
 
     #[tokio::test]

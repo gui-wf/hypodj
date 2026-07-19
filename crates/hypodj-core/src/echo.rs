@@ -88,6 +88,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Radio => format!("action enqueue radio {count}"),
             Selector::Query(q) => format!("action enqueue query {} {count}", dsl_value(q)?),
             Selector::Genre(g) => format!("action enqueue genre {} {count}", dsl_value(g)?),
+            Selector::SimilarToCurrent => format!("action enqueue similar_current {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -97,6 +98,7 @@ fn action_dsl(a: &Action) -> Option<String> {
             Selector::Radio => format!("action playnow radio {count}"),
             Selector::Query(q) => format!("action playnow query {} {count}", dsl_value(q)?),
             Selector::Genre(g) => format!("action playnow genre {} {count}", dsl_value(g)?),
+            Selector::SimilarToCurrent => format!("action playnow similar_current {count}"),
             // Exact/Similar/Calmer are not expressible in the keyword DSL.
             _ => return None,
         },
@@ -183,6 +185,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::Query(q) => format!("tracks matching \"{q}\""),
                 Selector::Radio => "random tracks".to_string(),
                 Selector::Similar(_) => "similar tracks".to_string(),
+                Selector::SimilarToCurrent => "tracks like the current one".to_string(),
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
             };
@@ -214,6 +217,7 @@ pub fn describe_plan(raw: &RawPlan) -> String {
                 Selector::Query(q) => format!("tracks matching \"{q}\""),
                 Selector::Radio => "random tracks".to_string(),
                 Selector::Similar(_) => "similar tracks".to_string(),
+                Selector::SimilarToCurrent => "tracks like the current one".to_string(),
                 Selector::Calmer(_) => "calmer tracks".to_string(),
                 Selector::Exact(_) => "tracks".to_string(),
             };
@@ -414,6 +418,17 @@ mod tests {
             count: 3,
         }));
         assert_round_trip(&imm(Action::PlayNow { selector: Selector::Radio, count: 5 }));
+        // similar_to_current ("more like what is playing") is keyword-DSL-expressible
+        // (no id in the DSL - the daemon fills the seed) and round-trips for both
+        // enqueue and play_now.
+        assert_round_trip(&imm(Action::Enqueue {
+            selector: Selector::SimilarToCurrent,
+            count: 5,
+        }));
+        assert_round_trip(&imm(Action::PlayNow {
+            selector: Selector::SimilarToCurrent,
+            count: 3,
+        }));
     }
 
     // The PlayNow confirm surface is HONEST that it starts playback (not append-only),

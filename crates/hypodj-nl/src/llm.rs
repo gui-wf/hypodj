@@ -61,6 +61,11 @@ pub enum LlmQSel {
     Range,
     Query,
     Last,
+    /// CONTENT selector (enqueue/play_now only): "more like what is playing".
+    /// Carries NO id - the daemon fills the current-track seed server-side, so the
+    /// off-surface-id boundary is untouched. Rejected for the queue-edit actions
+    /// (remove/move/clear/play) by [`build_qsel`]: it is not a live-queue selector.
+    SimilarToCurrent,
 }
 
 /// Closed move-destination lexicon (FLAT).
@@ -179,6 +184,10 @@ fn build_qsel(p: &LlmRawPlan) -> Result<QueueSelector, String> {
         LlmQSel::Query => Ok(QueueSelector::QueryMatch(
             p.query.clone().ok_or("sel=query needs query")?,
         )),
+        // similar_to_current is a CONTENT selector (enqueue/play_now), never a
+        // live-queue target - refuse it here so a remove/move/clear/play cannot
+        // smuggle it in.
+        LlmQSel::SimilarToCurrent => Err("similar_to_current is not a queue selector".into()),
     }
 }
 
@@ -231,30 +240,36 @@ impl TryFrom<LlmRawPlan> for RawPlan {
             LlmActionKind::Pause => Action::Pause,
             LlmActionKind::SetVolume => Action::SetVolume(p.level.ok_or("set_volume needs level")?),
             LlmActionKind::Enqueue => {
-                // Presence-only inference: radio wins, then genre, then query.
-                // No SongId path exists, so this can only build Query/Genre/Radio.
-                let selector = if p.radio {
+                // similar_to_current wins (an explicit "more like this" token); else
+                // presence-only inference: radio, then genre, then query. NO SongId
+                // path exists, so this builds only SimilarToCurrent/Query/Genre/Radio
+                // (the daemon fills the seed id server-side for SimilarToCurrent).
+                let selector = if matches!(p.sel, Some(LlmQSel::SimilarToCurrent)) {
+                    Selector::SimilarToCurrent
+                } else if p.radio {
                     Selector::Radio
                 } else if let Some(g) = p.genre {
                     Selector::Genre(g)
                 } else if let Some(q) = p.query {
                     Selector::Query(q)
                 } else {
-                    return Err("enqueue needs query, genre, or radio".into());
+                    return Err("enqueue needs query, genre, radio, or similar_to_current".into());
                 };
                 Action::Enqueue { selector, count: p.count.unwrap_or(1) }
             }
             LlmActionKind::PlayNow => {
-                // Same presence-only inference as Enqueue (radio > genre > query);
-                // no SongId path exists, so only Query/Genre/Radio are reachable.
-                let selector = if p.radio {
+                // Same inference as Enqueue (similar_to_current > radio > genre > query);
+                // no SongId path exists, so only SimilarToCurrent/Query/Genre/Radio.
+                let selector = if matches!(p.sel, Some(LlmQSel::SimilarToCurrent)) {
+                    Selector::SimilarToCurrent
+                } else if p.radio {
                     Selector::Radio
                 } else if let Some(g) = p.genre {
                     Selector::Genre(g)
                 } else if let Some(q) = p.query {
                     Selector::Query(q)
                 } else {
-                    return Err("play_now needs query, genre, or radio".into());
+                    return Err("play_now needs query, genre, radio, or similar_to_current".into());
                 };
                 Action::PlayNow { selector, count: p.count.unwrap_or(1) }
             }
@@ -583,6 +598,45 @@ mod tests {
                 .action,
             Action::Enqueue { selector: Selector::Query(_), .. }
         ));
+    }
+
+    // "more like what is playing": the model emits sel=similar_to_current (NO id,
+    // no query/genre) on enqueue OR play_now, and it parses to the id-free
+    // Selector::SimilarToCurrent. The daemon fills the seed server-side, so the
+    // off-surface-id boundary is untouched.
+    #[test]
+    fn parse_similar_to_current_carries_no_id() {
+        // enqueue "more like this one".
+        let p = parse_llm_output(
+            r#"{"type":"enqueue","sel":"similar_to_current","count":5}"#,
+        )
+        .unwrap();
+        match p.action {
+            Action::Enqueue { selector: Selector::SimilarToCurrent, count } => {
+                assert_eq!(count, 5);
+            }
+            other => panic!("expected enqueue(similar_to_current), got {other:?}"),
+        }
+        // play_now "play more like what is playing"; omitted count defaults to 1.
+        let p = parse_llm_output(r#"{"type":"play_now","sel":"similar_to_current"}"#).unwrap();
+        assert!(matches!(
+            p.action,
+            Action::PlayNow { selector: Selector::SimilarToCurrent, count: 1 }
+        ));
+        // similar_to_current wins even if the model ALSO (wrongly) attaches an id or
+        // query: the id is ignored (no field lands it) and the selector stays id-free.
+        let p = parse_llm_output(
+            r#"{"type":"enqueue","sel":"similar_to_current","id":"song-42","query":"x","count":3}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            p.action,
+            Action::Enqueue { selector: Selector::SimilarToCurrent, .. }
+        ));
+        // similar_to_current is a CONTENT selector, NOT a live-queue selector: a
+        // remove/move/play/clear that tries it is rejected (never a wrong-target op).
+        assert!(parse_llm_output(r#"{"type":"remove","sel":"similar_to_current"}"#).is_err());
+        assert!(parse_llm_output(r#"{"type":"play","sel":"similar_to_current"}"#).is_err());
     }
 
     // A queue-edit action with a MISSING required scalar fails loud (no fabricated

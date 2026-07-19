@@ -112,6 +112,16 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     - enqueue selector: a music GENRE (jazz, ambient, bossa nova, techno...) -> \"genre\"; \
     a mood/descriptive phrase (calmer, upbeat, calmer tracks) -> \"query\"; \"radio\"/\"station\" \
     -> \"radio\":true (never a \"query\"). Set exactly ONE of them.\n\
+    - \"more like THIS\" (like the song playing): when the user asks for music LIKE the CURRENT \
+    track / what is playing - \"more like this one\", \"more like this\", \"similar to what is \
+    playing\", \"more of this vibe\", \"keep this going\" - set \"sel\":\"similar_to_current\" (a \
+    CONTENT selector; NO \"query\"/\"genre\"/\"id\" - the player seeds from the current track \
+    itself). Use enqueue for \"queue/add more like this\", play_now for \"play more like this\". \
+    DISTINGUISH from a described mood: a NAMED mood/feel with no reference to the current track \
+    (\"something upbeat\", \"chill stuff\") is a \"query\", NOT similar_to_current. Only \"like \
+    THIS / what is playing / this vibe\" is similar_to_current. A MIXED ask (\"more like this but \
+    calmer\") -> resolve the \"like this\" part as similar_to_current (the modifier has no field \
+    yet; similar_to_current is the honest best). NEVER emit a song id.\n\
     - count from vague quantity: \"a couple\"=2, \"a few\"=3, \"some\"/\"a bunch\"/a bare plural \
     (\"some jazz\", \"radio station\")=5, \"a track\"/\"a song\"/singular=1. Never default a \
     plural request to 1.\n\
@@ -150,6 +160,11 @@ pub const DJ_SYSTEM_PROMPT: &str = "You are the intent translator for a music pl
     Request: queue the track called so what -> {\"type\":\"enqueue\",\"query\":\"so what\",\"count\":1}\n\
     Request: add so what to the queue -> {\"type\":\"enqueue\",\"query\":\"so what\",\"count\":1}\n\
     Request: jump to track 6 -> {\"type\":\"play\",\"sel\":\"position\",\"slot\":6}\n\
+    Request: queue more like this one -> {\"type\":\"enqueue\",\"sel\":\"similar_to_current\",\"count\":5}\n\
+    Request: put more music like this on -> {\"type\":\"enqueue\",\"sel\":\"similar_to_current\",\"count\":5}\n\
+    Request: play more like what is playing -> {\"type\":\"play_now\",\"sel\":\"similar_to_current\",\"count\":5}\n\
+    Request: give me more of this vibe -> {\"type\":\"enqueue\",\"sel\":\"similar_to_current\",\"count\":5}\n\
+    Request: more like this but calmer -> {\"type\":\"enqueue\",\"sel\":\"similar_to_current\",\"count\":5}\n\
     Request: what is the airspeed of an unladen swallow -> {\"type\":\"noop\"}\n\
     GROUNDING: if the user prompt carries an \"Available in the library:\" block, PREFER a \
     genre/artist/query DRAWN FROM those real listed names over inventing one - pick the closest \

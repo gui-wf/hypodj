@@ -281,6 +281,11 @@ pub enum Selector {
     Query(String),
     Exact(Vec<SongId>),
     Similar(SongId),
+    /// "More like what is playing." Carries NO id - the MODEL emits this token
+    /// (the off-surface-id safety boundary forbids the model naming a library id),
+    /// and the daemon fills the seed server-side at EXECUTE time from the current
+    /// (or first-queued) song. An honest no-op when nothing is playing/queued.
+    SimilarToCurrent,
     Calmer(SongId),
     Genre(String),
     Radio,
