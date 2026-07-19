@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
-use hypodj_client::model::{fmt_remaining, ArmedFeatures, FieldState, NowPlaying};
+use hypodj_client::model::{fmt_remaining, ArmedFeatures, FieldState, HintKind, NowPlaying};
 
 use crate::keymap;
 use crate::state::{album_mark, queue_mark_glyph, Browse, Mode, Screen, TuiState};
@@ -336,6 +336,20 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
                 Style::default().add_modifier(Modifier::DIM),
             )));
         }
+        // The ambient context hint is the last, faintest line: a stopped deck still
+        // surfaces what the DJ would seed from. Exactly ONE faint hint line per screen:
+        // on Screen::Dj the DJ pane owns the full "btw, DJ knows" voice, so the card
+        // stays silent (never both at once); off the DJ screen the card is the owner
+        // and shows the bare phrase. An up-next hint never draws here either - the
+        // always-visible "Up Next" pane already lists that track (see hint_earns_line).
+        if let Some(hint) = &np.hint {
+            if state.screen != Screen::Dj && hint_earns_line(&hint.kind) {
+                lines.push(Line::from(Span::styled(
+                    hint.phrase(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+        }
         f.render_widget(Paragraph::new(lines), inner);
         return;
     }
@@ -460,6 +474,16 @@ fn field_hud(field: &FieldState) -> Option<String> {
     Some(line)
 }
 
+/// Whether an ambient hint earns its OWN faint line. Only the just-finished track
+/// does: it has already left the queue, so no other pane shows it. An up-next hint
+/// always names the first-queued track, which the always-visible "Up Next" preview
+/// pane already lists - drawing it as a hint line too would duplicate that pane, so
+/// it is suppressed. The single gate both the card and the DJ pane consult, keeping
+/// the ambient surface to one honest, non-redundant line.
+fn hint_earns_line(kind: &HintKind) -> bool {
+    matches!(kind, HintKind::JustFinished)
+}
+
 /// A dim placeholder shown when there is no cover art (stream, missing, or a fetch
 /// failure): a bordered box with a centered music glyph, so the layout still reads.
 fn art_placeholder(_np: &NowPlaying) -> Paragraph<'static> {
@@ -560,7 +584,7 @@ mod tests {
         volume_slider, wave_glyphs, wave_row, window_title, BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
-    use hypodj_client::model::{ArmedFeatures, FieldPull, FieldState, NowPlaying};
+    use hypodj_client::model::{AmbientHint, ArmedFeatures, FieldPull, FieldState, HintKind, NowPlaying};
     use ratatui::style::Style;
 
     #[test]
@@ -1013,6 +1037,145 @@ mod tests {
     }
 
     #[test]
+    fn render_dj_shows_ambient_hint_above_input() {
+        // The "btw, DJ knows" ambient surface: a just-finished hint rides its own faint
+        // row directly above the ask> input, in the full DJ voice.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.now.hint = Some(AmbientHint {
+            kind: HintKind::JustFinished,
+            title: "303 (Ninajirachi Remix)".into(),
+        });
+        // A wide terminal so the DJ pane (half the width) fits the full phrase.
+        let out = render_to_lines_sized(&s, 160, 40).join("\n");
+        assert!(
+            out.contains("btw, DJ knows: just finished 303 (Ninajirachi Remix)"),
+            "ambient hint drawn in the DJ voice:\n{out}"
+        );
+        // The input row is still present (the hint did not displace it).
+        assert!(out.contains("ask>"), "ask> input still drawn:\n{out}");
+    }
+
+    #[test]
+    fn render_dj_no_hint_row_when_absent() {
+        // No hint -> no "btw, DJ knows" line AND the layout is unperturbed (the pane
+        // reserves no row for an absent hint, mirroring the armed/field HUD discipline).
+        let mut base = TuiState::new();
+        base.screen = crate::state::Screen::Dj;
+        let no_hint = render_to_lines_sized(&base, 100, 40);
+        assert!(
+            !no_hint.join("\n").contains("btw, DJ knows"),
+            "no hint line when absent:\n{}",
+            no_hint.join("\n")
+        );
+    }
+
+    #[test]
+    fn now_playing_pane_shows_ambient_hint_when_stopped() {
+        // A stopped deck surfaces the just-finished hint as the faintest line under
+        // "nothing playing" (the bare phrase, no btw prefix in the card register).
+        let mut s = TuiState::new();
+        s.now.state = Some("stop".into());
+        s.now.hint = Some(AmbientHint {
+            kind: HintKind::JustFinished,
+            title: "303 (Ninajirachi Remix)".into(),
+        });
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("nothing playing"), "stopped deck labelled:\n{out}");
+        assert!(
+            out.contains("just finished 303 (Ninajirachi Remix)"),
+            "ambient hint drawn on the stopped pane:\n{out}"
+        );
+    }
+
+    #[test]
+    fn now_playing_pane_never_duplicates_current_track_with_hint() {
+        // While a track plays the Now Playing pane shows the track by title; it must
+        // NOT also render a hint (which would duplicate the pane). In practice the
+        // daemon suppresses the now-playing hint, but even a leaked hint is ignored by
+        // the playing branch.
+        let mut s = TuiState::new();
+        s.now.state = Some("play".into());
+        s.now.title = Some("Blue in Green".into());
+        s.now.artist = Some("Miles Davis".into());
+        s.now.hint = Some(AmbientHint {
+            kind: HintKind::JustFinished,
+            title: "Some Other Track".into(),
+        });
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("Blue in Green"), "current track shown:\n{out}");
+        assert!(!out.contains("just finished"), "no hint line while playing:\n{out}");
+        assert!(!out.contains("Some Other Track"), "hint never duplicates the pane:\n{out}");
+    }
+
+    #[test]
+    fn dj_screen_draws_ambient_hint_in_exactly_one_region() {
+        // On Screen::Dj both the DJ pane and the always-drawn Now Playing card could
+        // surface the same just-finished hint. Enforce ONE faint line: the DJ pane owns
+        // the full "btw, DJ knows" voice and the card stays silent, so the phrase renders
+        // exactly once (a stopped deck, which would otherwise draw the card's bare hint).
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.now.state = Some("stop".into());
+        s.now.hint = Some(AmbientHint {
+            kind: HintKind::JustFinished,
+            title: "Alpha One".into(),
+        });
+        let out = render_to_lines_sized(&s, 160, 40).join("\n");
+        assert_eq!(
+            out.matches("just finished Alpha One").count(),
+            1,
+            "the just-finished hint is drawn in exactly one region on Screen::Dj:\n{out}"
+        );
+        assert!(
+            out.contains("btw, DJ knows: just finished Alpha One"),
+            "the DJ pane is the single owner on Screen::Dj:\n{out}"
+        );
+    }
+
+    #[test]
+    fn up_next_hint_never_duplicates_the_up_next_pane() {
+        // An up-next hint names the first-queued track, which the always-visible "Up
+        // Next" preview pane already lists. It must NOT also draw as a faint hint line -
+        // only the pane shows it (off the DJ screen, the card is the would-be owner).
+        let mut s = TuiState::new();
+        s.now.state = Some("stop".into());
+        s.queue = vec![hypodj_client::model::QueueItem {
+            pos: 0,
+            title: "Track Zed".into(),
+            artist: None,
+            uri: Some("song/9".into()),
+            album_uri: None,
+        }];
+        s.now.hint = Some(AmbientHint {
+            kind: HintKind::UpNext,
+            title: "Track Zed".into(),
+        });
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("Track Zed"), "the Up Next pane lists the track:\n{out}");
+        assert!(
+            !out.contains("up next Track Zed"),
+            "no up-next hint line duplicating the always-visible Up Next pane:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dj_pane_suppresses_up_next_hint() {
+        // On Screen::Dj the "btw, DJ knows" line is reserved for a hint that earns a
+        // line; an up-next hint (already shown by the Up Next pane) draws nothing and
+        // reserves no row, so the pane never jumps for a redundant hint.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Dj;
+        s.now.hint = Some(AmbientHint {
+            kind: HintKind::UpNext,
+            title: "Track Zed".into(),
+        });
+        let out = render_to_lines_sized(&s, 160, 40).join("\n");
+        assert!(!out.contains("btw, DJ knows"), "no btw line for an up-next hint:\n{out}");
+        assert!(!out.contains("up next Track Zed"), "up-next hint never drawn in the DJ pane:\n{out}");
+    }
+
+    #[test]
     fn dj_prompt_line_flags_only_interactive_lines() {
         assert!(dj_prompt_line("confirm? [y/N]"));
         assert!(dj_prompt_line("> y"));
@@ -1270,15 +1433,30 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let rows = Layout::vertical([
+    // The ambient context hint ("btw, DJ knows") rides its OWN row directly above the
+    // ask> input - the "about to ask" position - but ONLY when a hint that earns a line
+    // is present, so a resting deck (or an up-next hint the Up Next pane already shows)
+    // reserves no row and the pane never jumps (mirrors the armed/field HUD discipline).
+    // The row order is scrollback, spinner/phase, [hint], ask> input.
+    let has_hint = state.now.hint.as_ref().is_some_and(|h| hint_earns_line(&h.kind));
+    let mut constraints = vec![
         Constraint::Min(1),    // scrollback log
         Constraint::Length(1), // spinner + phase
-        Constraint::Length(1), // "ask>" input
-    ])
-    .split(inner);
+    ];
+    if has_hint {
+        constraints.push(Constraint::Length(1)); // ambient hint
+    }
+    constraints.push(Constraint::Length(1)); // "ask>" input
+    let rows = Layout::vertical(constraints).split(inner);
+    let log_row = rows[0];
+    let phase_row = rows[1];
+    // The hint row (when present) sits between the phase row and the input row; the
+    // input row is always the LAST row, whatever the dynamic insert did to the indices.
+    let hint_row = if has_hint { Some(rows[2]) } else { None };
+    let input_row = rows[rows.len() - 1];
 
     // Scrollback, bottom-pinned: show the last rows that fit.
-    let log_h = rows[0].height as usize;
+    let log_h = log_row.height as usize;
     let start = state.dj_log.len().saturating_sub(log_h);
     let log_lines: Vec<Line> = if state.dj_log.is_empty() {
         vec![Line::from(Span::styled(
@@ -1306,7 +1484,7 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
             })
             .collect()
     };
-    f.render_widget(Paragraph::new(log_lines), rows[0]);
+    f.render_widget(Paragraph::new(log_lines), log_row);
 
     // Spinner + phase line (only while a call is in flight).
     let phase_line = match &state.dj_phase {
@@ -1322,19 +1500,30 @@ fn render_dj(f: &mut Frame, area: Rect, state: &TuiState) {
         }
         _ => Line::from(""),
     };
-    f.render_widget(Paragraph::new(phase_line), rows[1]);
+    f.render_widget(Paragraph::new(phase_line), phase_row);
+
+    // The ambient "btw, DJ knows" hint row (present only when a hint exists). Plain
+    // DIM - it must not compete with the confirm accent or the ask> caret; it is the
+    // quietest, out-of-the-way voice, just above where the user is about to type.
+    if let (Some(row), Some(hint)) = (hint_row, state.now.hint.as_ref()) {
+        let line = Line::from(Span::styled(
+            format!("btw, DJ knows: {}", hint.phrase()),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        f.render_widget(Paragraph::new(line), row);
+    }
 
     // The "ask>" input row; place the caret when the DJ View has focus.
     let input_line = Line::from(vec![
         Span::styled("ask> ", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(state.dj_input.clone()),
     ]);
-    f.render_widget(Paragraph::new(input_line), rows[2]);
+    f.render_widget(Paragraph::new(input_line), input_row);
     // Keep the caret alive during the y/N confirm too (not just Normal): during
     // Mode::Confirm the pane must not read as dead while it waits for the keypress.
     if state.screen == Screen::Dj && matches!(state.mode, Mode::Normal | Mode::Confirm) {
-        let caret_x = rows[2].x + 5 + state.dj_input.chars().count() as u16;
-        f.set_cursor_position((caret_x.min(rows[2].x + rows[2].width.saturating_sub(1)), rows[2].y));
+        let caret_x = input_row.x + 5 + state.dj_input.chars().count() as u16;
+        f.set_cursor_position((caret_x.min(input_row.x + input_row.width.saturating_sub(1)), input_row.y));
     }
 }
 

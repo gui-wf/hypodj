@@ -166,8 +166,8 @@ struct State {
     /// plain u64 (not a heavyweight RNG) so it is trivially seedable from tests
     /// via [`State::seed_rng`], keeping `random` advance assertions non-flaky.
     rng_state: u64,
-    /// The library [`SongId`] of the track that most recently reached its natural
-    /// EOF (finished playing), if any. Set ONLY on a real natural track-end (the
+    /// The library [`Song`] that most recently reached its natural EOF (finished
+    /// playing), if any. Set ONLY on a real natural track-end (the
     /// [`Self::advance_on_eof`] path); a live/continuous stream leaves it untouched
     /// (streams have no library id and must never become a similar seed). It is the
     /// RECENCY seed for "more like this one" when nothing is currently playing: the
@@ -175,14 +175,69 @@ struct State {
     /// almost certainly listening to it when they typed the ask. Preferred over the
     /// first-queued song, but the current playing song still wins over it. A user
     /// skip does NOT set it (advance_on_eof early-returns on a pending skip), so it
-    /// only ever holds a track that genuinely played through to its end.
-    last_finished: Option<SongId>,
+    /// only ever holds a track that genuinely played through to its end. The whole
+    /// [`Song`] (not just its [`SongId`]) is kept so the synchronous status render can
+    /// name the finished title without an `.await`, and so it survives consume mode
+    /// where the finished entry is already evicted from the queue by status time.
+    last_finished: Option<Song>,
+    /// The MPD id ([`QueueItem::id`]) of the FIRST song appended by the most recent
+    /// fresh IDLE enqueue gesture (an append that landed while `current` was `None`).
+    /// `None` at rest and whenever a track is/was playing since the last idle gesture
+    /// (every play-time current-commit clears it). LATEST GESTURE WINS: a fresh idle
+    /// enqueue of new music makes that newly-appended music the pertinent context, so
+    /// [`Self::seed_source`] must seed from the freshly-appended tail rather than a
+    /// finished track still LINGERING at the queue head (consume-off leaves the played
+    /// entry at pos 0). Scenarios R (recency) and G (gesture) present an IDENTICAL
+    /// queue/current/last_finished snapshot; the ONLY difference is temporal - in G a
+    /// fresh idle enqueue happened AFTER the finish, in R it did not - so that bit must
+    /// be RECORDED when it happens (it cannot be recovered from the snapshot). A raw id
+    /// (not a bool, not a position) is the honest floor: it BOTH records that a fresh
+    /// gesture occurred AND names which tail to seed past the lingering head, and qids
+    /// are monotonic + stable across removals (positions are not), so the anchor keeps
+    /// pointing at the fresh music even as the lingering head is deleted or the queue
+    /// reorders. EPHEMERAL: never persisted to resume.toml (a daemon restart is not a
+    /// fresh gesture), so it defaults `None` after a restart.
+    fresh_enqueue_anchor: Option<u64>,
     /// Deterministic RNG state for the volume-glide human-noise DITHER, SEPARATE
     /// from `rng_state` so drawing a dither on every setvol never desyncs the
     /// `random` next-track selection (whose seeded advances tests assert). Seeded
     /// from a fixed non-zero constant in Default and the wall clock in the
     /// constructor; tests pin it directly.
     vol_dither_state: u64,
+}
+
+/// Which pertinence branch a [`Handler::seed_source`] resolution landed on - the
+/// SINGLE source of truth shared by the enqueue seed and the ambient context hint.
+/// The seed_source ladder ranks: `NowPlaying` -> fresh-gesture tail (`UpNext`) ->
+/// `JustFinished` -> first-queued fallback (`UpNext`). What is playing beats a fresh
+/// idle-enqueue gesture (latest gesture wins over recency), which beats what merely
+/// finished, which beats what is merely queued. `UpNext` covers BOTH the fresh-gesture
+/// tail and the cold-start first-queued song (both are "what is up"); the temporal
+/// distinction between them lives in the ladder order, not the kind. The future
+/// centroid extends this enum (a `Selected` / `TimeOfDay` / `Ask` variant) without
+/// forking the ranking.
+#[derive(Debug, Clone, PartialEq)]
+enum SeedKind {
+    /// A library song is currently playing - it wins over everything.
+    NowPlaying,
+    /// Nothing is playing; the most recently finished track is the recency seed.
+    JustFinished,
+    /// What is up: the freshly-enqueued tail (latest gesture) or, at cold start, the
+    /// first queued library song (nothing has played yet).
+    UpNext,
+}
+
+/// The one resolved seed the DJ would enqueue "more like this" from, with the
+/// pertinence branch it came from and the title captured synchronously (so a
+/// non-`await` status render can name it). Produced by [`Handler::seed_source`] and
+/// read by BOTH [`Handler::similar_seed_id`] (the enqueue seed) and
+/// [`Handler::ambient_hint_pairs`] (the hint) - one computation, two readers, so the
+/// hint can never name a seed the enqueue would not use.
+#[derive(Debug, Clone, PartialEq)]
+struct SeedSource {
+    kind: SeedKind,
+    id: SongId,
+    title: String,
 }
 
 /// One splitmix64 step: advance `state` and return a well-mixed u64. The shared
@@ -251,6 +306,9 @@ impl Default for State {
             rng_state: 0x243F_6A88_85A3_08D3,
             // No track has finished yet at construction.
             last_finished: None,
+            // No fresh idle enqueue gesture at rest; also defaults None after a
+            // restart (never persisted - a restart is not a fresh gesture).
+            fresh_enqueue_anchor: None,
             // A fixed non-zero default seed for the glide dither; production seeds
             // it from the wall clock at construction, tests pin it directly.
             vol_dither_state: 0x8B7F_A1C2_D3E4_F506,
@@ -856,6 +914,11 @@ fn fade_task(
                         let mut st = state.lock().unwrap();
                         st.current = Some(idx);
                         st.pending_skip = None;
+                        // A track is now current: clear any fresh-enqueue anchor
+                        // (defensive - a skip always starts from a playing deck, so the
+                        // anchor is already None; keeps the "cleared the instant any
+                        // track becomes current" invariant total across every commit).
+                        st.fresh_enqueue_anchor = None;
                         st.live_gain_db = dip_floor_db;
                         st.fading = true;
                         st.fade_epoch += 1;
@@ -1366,10 +1429,30 @@ impl HypodjHandler {
                 PlanOutcome::Effect(format!("set volume to {v}"))
             }
             // Strictly append-only (adds to the END, never starts/jumps).
-            Action::Enqueue { selector, count } => match self.plan_enqueue(selector, *count).await {
-                Ok(n) => PlanOutcome::Added { n, selector: selector_phrase(selector) },
-                Err(e) => PlanOutcome::Failed(e),
-            },
+            Action::Enqueue { selector, count } => {
+                // Snapshot the id the FIRST appended song will take BEFORE the append
+                // (plan_enqueue pushes via enqueue_song, each bumping next_id), so the
+                // arm below anchors the freshly-appended tail. Single local client, so
+                // this capture cannot race a concurrent append.
+                let first = self.state.lock().unwrap().next_id;
+                match self.plan_enqueue(selector, *count).await {
+                    Ok(n) => {
+                        // This append-only ask is a NEWER gesture than any prior finish:
+                        // while the deck is idle (no autoplay here) anchor the just-queued
+                        // music so the hint/seed names it, skipping a track that finished
+                        // before this ask and lingers at the queue head (exactly the
+                        // staleness this feature exists to prevent, on its most central
+                        // entry point - the DJ NL surface). Scoped to THIS action, so the
+                        // autoplay paths (PlayNow, wake) - which start playback and let the
+                        // now-current track win the seed - and the shared enqueue_song
+                        // helper stay untouched. Idle- and empty-gated inside (a no-op on
+                        // an honest 0 or a playing deck).
+                        self.arm_fresh_enqueue_anchor_on_append(first, n);
+                        PlanOutcome::Added { n, selector: selector_phrase(selector) }
+                    }
+                    Err(e) => PlanOutcome::Failed(e),
+                }
+            }
             // Play a library song NOW: enqueue-then-start; name the started track.
             Action::PlayNow { selector, count } => {
                 match self.plan_play_now(selector, *count).await {
@@ -1774,6 +1857,33 @@ impl HypodjHandler {
         out
     }
 
+    /// Surface the single MOST-PERTINENT context string as X- status pairs - the
+    /// ambient "btw, DJ knows" hint. A PURE re-surfacing of [`Self::seed_source`] (the
+    /// same ordering the enqueue seed reads), so the hint can never name a seed the DJ
+    /// would not enqueue from.
+    ///
+    /// - `X-hypodj-hint-kind`   the pertinence branch: `just-finished` | `up-next`
+    /// - `X-hypodj-hint-title`  the seed song title verbatim
+    ///
+    /// Emits TWO pairs or ZERO. The `NowPlaying` branch is suppressed AT the daemon (the
+    /// Now Playing pane already shows the current track, so a hint would only duplicate
+    /// it), as is `None` - so while a library track plays, or nothing is seedable, the
+    /// wire carries no hint pair at all and every downstream renderer stays dumb (draw
+    /// one faint line iff a hint is present, no per-client play-state check). Defensive:
+    /// refuses to emit a title carrying a newline, which would tear the status line.
+    pub fn ambient_hint_pairs(&self) -> Vec<(&'static str, String)> {
+        let (kind, title) = match self.seed_source() {
+            Some(SeedSource { kind: SeedKind::JustFinished, title, .. }) => ("just-finished", title),
+            Some(SeedSource { kind: SeedKind::UpNext, title, .. }) => ("up-next", title),
+            // NowPlaying (the pane already shows it) and None -> lean status, no hint.
+            _ => return Vec::new(),
+        };
+        if title.contains('\n') {
+            return Vec::new();
+        }
+        vec![("X-hypodj-hint-kind", kind.to_string()), ("X-hypodj-hint-title", title)]
+    }
+
     /// Resolve the next future civil `h:m` (today if still ahead, else tomorrow) in
     /// the handler's fixed-offset zone, as an absolute UTC instant. Mirrors the P3
     /// nl civil-time seam so `wake at 7` is deterministic under a fixed civil now.
@@ -2121,36 +2231,140 @@ impl HypodjHandler {
         }
     }
 
-    /// The library [`SongId`] to seed a "more like what is playing" enqueue from,
-    /// in strict preference order:
+    /// Resolve the one seed to "more like what is playing" from, in strict
+    /// preference order (the branch is captured in [`SeedSource::kind`]):
     ///
     /// 1. the CURRENT playing song (what is playing wins over everything);
-    /// 2. else the RECENTLY-FINISHED song ([`State::last_finished`]) - the track
+    /// 2. else the FRESH-GESTURE tail - LATEST GESTURE WINS: when a fresh idle
+    ///    enqueue armed [`State::fresh_enqueue_anchor`], seed from the first library
+    ///    Song AT OR AFTER the anchor position, SKIPPING the already-played track
+    ///    consume-off leaves LINGERING at the queue head. This sits ABOVE recency so
+    ///    a fresh enqueue of new music moves the seed to that music rather than the
+    ///    just-finished track (scenario G); only reached while idle (NowPlaying
+    ///    handled `current` above). A dangling anchor finds no position and falls
+    ///    through to recency (self-healing);
+    /// 3. else the RECENTLY-FINISHED song ([`State::last_finished`]) - the track
     ///    that just ended is the most pertinent recency seed when nothing is
-    ///    playing (the scenario: a track finished, then the user asks "more like
-    ///    this one" - they meant the one that was just playing, not an unrelated
-    ///    queued song). This also covers the stream-as-current edge: a live stream
-    ///    has no library id, so the current-song branch yields `None` and we fall
-    ///    to the last real finished track rather than an unrelated first-queued one;
-    /// 3. else the FIRST queued Song (nothing has played yet - seed from what is up);
-    /// 4. else `None` - the caller then yields an HONEST 0, never a fabricated pick.
+    ///    playing and no fresh gesture followed the finish (scenario R: a track
+    ///    finished, then the user asks "more like this one" - they meant the one
+    ///    that was just playing, not an unrelated queued song). This also covers the
+    ///    stream-as-current edge: a live stream has no library id, so the
+    ///    current-song branch yields `None` and we fall to the last real finished
+    ///    track rather than an unrelated first-queued one;
+    /// 4. else the FIRST queued Song (nothing has played yet - seed from what is up);
+    /// 5. else `None` - the caller then yields an HONEST 0, never a fabricated pick.
     ///
     /// Streams have no library id and are skipped at every level. The std `Mutex` is
     /// read then dropped here, NEVER held across the later `.await`.
-    fn similar_seed_id(&self) -> Option<SongId> {
+    ///
+    /// This is the SINGLE resolution of the seed ordering: both the enqueue seed
+    /// ([`Self::similar_seed_id`]) and the ambient hint ([`Self::ambient_hint_pairs`])
+    /// read it, so the hint can never name a seed the DJ would not enqueue from. The
+    /// resolved [`SeedSource`] also carries the branch it came from and the seed
+    /// title, captured under the lock so a synchronous render can name it without an
+    /// `.await`.
+    fn seed_source(&self) -> Option<SeedSource> {
         let st = self.state.lock().unwrap();
-        let current_song_id = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
-            QueueEntry::Song(s) => Some(s.id.clone()),
+        // 1. the CURRENT playing library song (a live stream has no library id, so
+        //    the current-song branch yields None and we fall through to recency).
+        if let Some(item) = st.current.and_then(|i| st.queue.get(i)) {
+            if let QueueEntry::Song(s) = &item.entry {
+                return Some(SeedSource {
+                    kind: SeedKind::NowPlaying,
+                    id: s.id.clone(),
+                    title: s.title.clone(),
+                });
+            }
+        }
+        // 2. FreshGesture (LATEST-GESTURE-WINS) - a fresh idle enqueue anchored the
+        //    newly appended music; seed from the first library Song AT OR AFTER the
+        //    anchor position, SKIPPING the already-played lingering head consume-off
+        //    leaves at the front. Consulted ONLY while idle: branch 1 already returned
+        //    for a current LIBRARY song, but a current STREAM (no library id) falls
+        //    through it, so this guards `current.is_none()` explicitly - a stream that
+        //    is playing must fall to the recency seed (branch 3), not an anchored tail
+        //    (the reset discipline already clears the anchor the instant any track
+        //    becomes current, so this guard is defense in depth). Self-heals: a dangling
+        //    anchor finds no position and falls through to recency.
+        if st.current.is_none() {
+            if let Some(anchor) = st.fresh_enqueue_anchor {
+                if let Some(pos) = st.queue.iter().position(|it| it.id == anchor) {
+                    if let Some(s) = st.queue[pos..].iter().find_map(|it| match &it.entry {
+                        QueueEntry::Song(s) => Some(s),
+                        QueueEntry::Stream { .. } => None,
+                    }) {
+                        return Some(SeedSource {
+                            kind: SeedKind::UpNext,
+                            id: s.id.clone(),
+                            title: s.title.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        // 3. else the RECENTLY-FINISHED song (the recency seed).
+        if let Some(s) = st.last_finished.as_ref() {
+            return Some(SeedSource {
+                kind: SeedKind::JustFinished,
+                id: s.id.clone(),
+                title: s.title.clone(),
+            });
+        }
+        // 4. else the FIRST queued library song (nothing has played yet).
+        st.queue.iter().find_map(|it| match &it.entry {
+            QueueEntry::Song(s) => Some(SeedSource {
+                kind: SeedKind::UpNext,
+                id: s.id.clone(),
+                title: s.title.clone(),
+            }),
             QueueEntry::Stream { .. } => None,
-        });
-        current_song_id
-            .or_else(|| st.last_finished.clone())
-            .or_else(|| {
-                st.queue.iter().find_map(|it| match &it.entry {
-                    QueueEntry::Song(s) => Some(s.id.clone()),
-                    QueueEntry::Stream { .. } => None,
-                })
-            })
+        })
+    }
+
+    /// The library [`SongId`] to seed a "more like what is playing" enqueue from, in
+    /// the strict preference order documented on [`Self::seed_source`]. A thin
+    /// projection of that single resolution to just the id - behaviorally identical
+    /// to the pre-refactor ladder for a given state.
+    fn similar_seed_id(&self) -> Option<SongId> {
+        self.seed_source().map(|s| s.id)
+    }
+
+    /// Arm the fresh-gesture anchor ([`State::fresh_enqueue_anchor`]) at
+    /// `first_qid` - the MPD id of the FIRST song a fresh idle enqueue just appended -
+    /// when the enqueue landed while the deck is stopped/idle (`current` is `None`).
+    /// LATEST GESTURE WINS: a just-finished track A lingering at the queue head is the
+    /// pertinent seed only until the user makes a newer gesture; enqueuing a fresh
+    /// selection D is more recent than A, so the seed - and the ambient hint that
+    /// re-surfaces it - must move to D rather than keep naming A (a hint that says
+    /// "just finished A" right after the user loaded D is exactly the staleness this
+    /// feature exists to avoid). Unlike the prior clear-last_finished approach we KEEP
+    /// `last_finished` (the honest recency memory that survives consume eviction) and
+    /// instead RECORD the fresh gesture as an anchor, so [`Self::seed_source`] branch 2
+    /// seeds from the freshly-appended tail past the lingering head. Each arm
+    /// OVERWRITES the anchor, so the newest gesture always wins. A no-op while a track
+    /// is current (the current-song branch wins the seed there anyway).
+    fn arm_fresh_enqueue_anchor(&self, first_qid: u64) {
+        let mut st = self.state.lock().unwrap();
+        if st.current.is_none() {
+            st.fresh_enqueue_anchor = Some(first_qid);
+        }
+    }
+
+    /// Arm the fresh-gesture anchor after an APPEND-ONLY [`Action::Enqueue`] landed
+    /// fresh music on an idle deck. `first_qid` is the id the first appended song took
+    /// (the caller snapshots `next_id` BEFORE the append); `n` is the count actually
+    /// appended: an honest 0 (no library match) is a no-op so no stale anchor is set
+    /// without any fresh music behind it, mirroring the empty-list no-op of
+    /// [`Self::enqueue_songs`]. The idle-gating lives in
+    /// [`Self::arm_fresh_enqueue_anchor`] (a no-op while a track is current). This is
+    /// the ONE seam scoped to the append-only Enqueue action: [`Self::plan_enqueue`]
+    /// is shared with the autoplay `PlayNow`/`wake` paths (which start playback and let
+    /// the now-current track win the seed), so the arm lives HERE rather than inside
+    /// `plan_enqueue` or the shared [`Self::enqueue_song`] helper - those stay unarmed.
+    fn arm_fresh_enqueue_anchor_on_append(&self, first_qid: u64, n: usize) {
+        if n > 0 {
+            self.arm_fresh_enqueue_anchor(first_qid);
+        }
     }
 
     /// Apply the active latent-field pulls to a resolved candidate list, biasing the
@@ -2755,12 +2969,18 @@ impl HypodjHandler {
     /// Append already-resolved songs to the queue as ONE atomic push (a single
     /// playlist_version bump and ONE notify_change), mirroring the album fan-out in
     /// [`enqueue_uri`](Self::enqueue_uri). An empty list is a no-op (no spurious
-    /// wake). Backs `load` appending a playlist's songs to the queue.
+    /// wake). THE shared idle-append point for every batch enqueue that does NOT
+    /// autoplay - `load` (a named playlist / `Starred`) and `findadd`/`searchadd` all
+    /// funnel through here - so the fresh-enqueue anchor is armed at THIS single seam
+    /// and no such path can forget it (see [`Self::arm_fresh_enqueue_anchor`]).
     fn enqueue_songs(&self, songs: Vec<Song>) {
         if songs.is_empty() {
             return;
         }
         let mut st = self.state.lock().unwrap();
+        // The id the FIRST appended song will take, so a fresh idle enqueue can anchor
+        // the freshly-appended tail (non-empty is guaranteed by the guard above).
+        let first = st.next_id;
         for song in songs {
             let qid = st.next_id;
             st.next_id += 1;
@@ -2769,6 +2989,10 @@ impl HypodjHandler {
         st.playlist_version += 1;
         drop(st);
         self.notify_change();
+        // A fresh idle enqueue outranks a prior finish - anchor the just-appended
+        // music so the hint/seed names it, skipping any track that finished before this
+        // gesture and lingers at the queue head. A no-op while a track is current.
+        self.arm_fresh_enqueue_anchor(first);
     }
 
     /// THE MPD-facing fade entry point: convert the parsed [`FadeArgs`] DSL into a
@@ -3813,12 +4037,14 @@ impl HypodjHandler {
             // Record the finishing track as the recency seed BEFORE the advance
             // repoints `current`. Only a real library Song counts: a live/continuous
             // stream has no id and must never become a similar seed, so a stream EOF
-            // leaves `last_finished` at the last real track that ended.
-            if let Some(id) = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
-                QueueEntry::Song(s) => Some(s.id.clone()),
+            // leaves `last_finished` at the last real track that ended. The whole Song
+            // is captured (not just its id) so the synchronous status render can name
+            // the title, and so it survives consume mode evicting the queue entry.
+            if let Some(song) = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+                QueueEntry::Song(s) => Some(s.clone()),
                 QueueEntry::Stream { .. } => None,
             }) {
-                st.last_finished = Some(id);
+                st.last_finished = Some(song);
             }
         }
         let next = self.plan_next(true);
@@ -4169,6 +4395,12 @@ impl HypodjHandler {
         {
             let mut st = self.state.lock().unwrap();
             st.current = Some(idx);
+            // A track is now current: the pending fresh-enqueue gesture is consumed /
+            // superseded by playback, so the anchor must clear (the NowPlaying branch
+            // wins the seed now). This is the universal choke every fresh play, EOF
+            // auto-advance, and PlayNow funnels through - the primary clear that keeps a
+            // stale anchor from overriding recency on a LATER finish (scenario R).
+            st.fresh_enqueue_anchor = None;
         }
         self.notify_change();
         Ok(())
@@ -4204,6 +4436,8 @@ impl HypodjHandler {
             st.playlist_version += 1;
             drop(st);
             self.notify_change();
+            // A fresh idle enqueue outranks a prior finish (see enqueue_songs).
+            self.arm_fresh_enqueue_anchor(first);
             return Ok(first);
         }
         let entry = if is_stream_uri(uri) {
@@ -4231,15 +4465,19 @@ impl HypodjHandler {
         st.playlist_version += 1;
         drop(st);
         self.notify_change();
+        // A fresh idle enqueue outranks a prior finish (see enqueue_songs).
+        self.arm_fresh_enqueue_anchor(id);
         Ok(id)
     }
 
     /// Append an already-resolved [`Song`] to the queue, returning its MPD id.
     /// This is the shared, INFALLIBLE push path (no network, no parse): it mirrors
     /// [`enqueue_uri`](Self::enqueue_uri)'s id/version/notify bookkeeping. Used by
-    /// `findadd`/`searchadd`, whose matches are already full `Song`s from
-    /// `collect_matches`, so re-fetching each via `song/<id>` would be a wasted
-    /// round-trip.
+    /// the plan heuristic enqueue (`plan_enqueue`), which backs BOTH the append-only
+    /// `Enqueue` and the autoplay `PlayNow` actions - so it deliberately does NOT
+    /// arm the fresh-enqueue anchor (a `PlayNow` track legitimately becomes `current`
+    /// and wins the seed anyway; the idle-arm belongs on the non-autoplay batch path,
+    /// [`enqueue_songs`](Self::enqueue_songs), and the append-only action seam).
     async fn enqueue_song(&self, song: Song) -> u64 {
         let mut st = self.state.lock().unwrap();
         let id = st.next_id;
@@ -4426,6 +4664,12 @@ impl MpdHandler for HypodjHandler {
                 // ONLY when a pull is active so the passive HUD auto-clears at rest.
                 for (k, v) in self.field_feature_pairs() {
                     b = b.pair(&k, v);
+                }
+                // Surface the single most-pertinent context string as the ambient
+                // hint, present ONLY for a just-finished or up-next seed (NowPlaying is
+                // suppressed here so the pane is never duplicated, None keeps it lean).
+                for (k, v) in self.ambient_hint_pairs() {
+                    b = b.pair(k, v);
                 }
                 b.build()
             }
@@ -4617,6 +4861,8 @@ impl MpdHandler for HypodjHandler {
 
             // ── queue ─────────────────────────────────────────────────────
             MpdCommand::Add(uri) => match self.enqueue_uri(&uri).await {
+                // enqueue_uri itself arms the fresh-enqueue anchor on a fresh idle
+                // enqueue, so the hint/seed moves to what was just added.
                 Ok(_) => MpdResponse::ok(),
                 Err(e) => ack(ACK_ERROR_NO_EXIST, "add", &e),
             },
@@ -5659,10 +5905,9 @@ impl HypodjHandler {
             Ok(m) => m,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, cmd, &e),
         };
-        for s in matches {
-            self.enqueue_song(s).await;
-        }
-        self.notify_change();
+        // Funnel through enqueue_songs (ONE atomic push + the shared fresh-enqueue
+        // anchor arm), so findadd/searchadd cannot forget the fresh-enqueue seed move.
+        self.enqueue_songs(matches);
         MpdResponse::ok()
     }
 
@@ -6105,7 +6350,7 @@ mod tests {
         {
             let mut st = h.state.lock().unwrap();
             st.current = Some(0);
-            assert_eq!(st.last_finished, None, "nothing has finished yet");
+            assert!(st.last_finished.is_none(), "nothing has finished yet");
         }
         // The track reaches its natural EOF: end of queue -> current becomes None,
         // and the finishing track is latched as the recency seed.
@@ -6114,8 +6359,8 @@ mod tests {
             let st = h.state.lock().unwrap();
             assert_eq!(st.current, None, "end of queue stops the deck");
             assert_eq!(
-                st.last_finished,
-                Some(SongId("finished".into())),
+                st.last_finished.as_ref().map(|s| &s.id),
+                Some(&SongId("finished".into())),
                 "the finishing track is recorded as last_finished"
             );
         }
@@ -6132,7 +6377,7 @@ mod tests {
         // Truly nothing: no current, no finished, no queue -> honest 0.
         assert_eq!(h.similar_seed_id(), None);
         // A recently-finished track only (empty queue) -> recency is the seed.
-        h.state.lock().unwrap().last_finished = Some(SongId("recent".into()));
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("recent"));
         assert_eq!(h.similar_seed_id(), Some(SongId("recent".into())));
         // Add a first-queued song: recency STILL wins over first-queued.
         h.enqueue_song_for_test(playlist_test_song("queued")).await;
@@ -6162,7 +6407,7 @@ mod tests {
         {
             let mut st = h.state.lock().unwrap();
             st.current = Some(0); // the id-less stream is current
-            st.last_finished = Some(SongId("recent".into()));
+            st.last_finished = Some(playlist_test_song("recent"));
         }
         assert_eq!(
             h.similar_seed_id(),
@@ -6180,14 +6425,641 @@ mod tests {
         {
             let mut st = h.state.lock().unwrap();
             st.current = Some(0);
-            st.last_finished = Some(SongId("real".into()));
+            st.last_finished = Some(playlist_test_song("real"));
         }
         h.advance_on_eof().await;
         assert_eq!(
-            h.state.lock().unwrap().last_finished,
-            Some(SongId("real".into())),
+            h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
+            Some(&SongId("real".into())),
             "a stream EOF does not clobber the last real finished track"
         );
+    }
+
+    // Helper: the ambient hint's title (if any) names the SAME song the enqueue seed
+    // resolves to. The deterministic test title is "Song <id>", so tying the title back
+    // to `similar_seed_id`'s id proves the hint can never name a seed the DJ would not
+    // enqueue from (the ids-not-strings invariant).
+    fn assert_hint_matches_seed(h: &HypodjHandler) {
+        let title = h
+            .ambient_hint_pairs()
+            .into_iter()
+            .find(|(k, _)| *k == "X-hypodj-hint-title")
+            .map(|(_, v)| v);
+        if let Some(t) = title {
+            let seed = h.similar_seed_id().expect("a hint present implies a resolvable seed");
+            assert_eq!(t, format!("Song {}", seed.0), "hint title names the seed song");
+        }
+    }
+
+    // The ambient hint is a PURE re-surfacing of the enqueue seed: across the
+    // NowPlaying-suppressed / JustFinished / UpNext(anchor) / UpNext(fallback) branches
+    // alike, the surfaced title names the SAME song that similar_seed_id returns. One
+    // ordering, two readers - never a divergent ranking.
+    #[tokio::test]
+    async fn ambient_hint_title_names_same_song_as_seed() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // UpNext(fallback): nothing played, a queued song is the seed and the hint.
+        h.enqueue_song_for_test(playlist_test_song("B")).await;
+        assert_hint_matches_seed(&h);
+        // JustFinished wins over up-next: the recency seed is the hint now.
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        assert_hint_matches_seed(&h);
+        // UpNext(anchor) - the G-state: a fresh idle enqueue of D arms the anchor, so the
+        // hint moves to D even with A still the recency memory. Hint title == seed.
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "G-state seeds the anchored D");
+        assert_hint_matches_seed(&h);
+        // NowPlaying-suppressed: a library song current emits no hint, and the helper's
+        // "title present implies matching seed" holds vacuously (no title to compare).
+        h.state.lock().unwrap().current = Some(0);
+        assert!(h.ambient_hint_pairs().is_empty(), "NowPlaying suppresses the hint");
+        assert_hint_matches_seed(&h);
+    }
+
+    // A natural EOF into an empty queue latches the finished track: the Status response
+    // then carries the just-finished ambient hint (kind + captured title), end to end.
+    #[tokio::test]
+    async fn ambient_hint_just_finished_after_natural_eof() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("finished")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.advance_on_eof().await; // natural end-of-queue EOF, nothing playing after
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "X-hypodj-hint-kind"), Some("just-finished"));
+        assert_eq!(pair(&status, "X-hypodj-hint-title"), Some("Song finished"));
+    }
+
+    // A library song currently playing is SUPPRESSED at the daemon (the Now Playing
+    // pane already shows it): the Status response carries NO hint pair at all.
+    #[tokio::test]
+    async fn ambient_hint_suppressed_while_library_song_current() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("now")).await;
+        h.state.lock().unwrap().current = Some(0); // a library Song is current
+        assert!(h.ambient_hint_pairs().is_empty(), "NowPlaying emits no hint pair");
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "X-hypodj-hint-kind"), None);
+        assert_eq!(pair(&status, "X-hypodj-hint-title"), None);
+    }
+
+    // Nothing played yet, songs queued: the hint is up-next the FIRST queued song.
+    #[tokio::test]
+    async fn ambient_hint_up_next_when_nothing_played() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("B")).await;
+        h.enqueue_song_for_test(playlist_test_song("C")).await;
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "up-next".to_string()),
+                ("X-hypodj-hint-title", "Song B".to_string()),
+            ]
+        );
+    }
+
+    // Nothing seedable (empty queue, nothing playing, nothing finished): NO hint pair,
+    // keeping status lean exactly like the armed/field HUD at rest.
+    #[tokio::test]
+    async fn ambient_hint_absent_when_nothing_seedable() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        assert!(h.ambient_hint_pairs().is_empty());
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "X-hypodj-hint-kind"), None);
+        assert_eq!(pair(&status, "X-hypodj-hint-title"), None);
+    }
+
+    // Staleness guard (task yyzbyhl), REALISTIC post-EOF flow: track A finishes and
+    // LINGERS at queue pos0 (consume off - the deeper root cause), then a fresh user
+    // enqueue [D] lands while stopped. The seed AND the hint must move to the newer D,
+    // skipping the lingering finished A - NEVER keep naming stale A. Uses the real EOF
+    // path (not an artificially emptied queue) so a future artificial-empty-queue test
+    // can never again mask this. Fails without the fresh-enqueue anchor + branch-2 skip.
+    #[tokio::test]
+    async fn ambient_hint_fresh_enqueue_beats_prior_finish() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // A single real song plays, then reaches natural EOF into an empty queue with
+        // consume OFF: A LINGERS at pos0 (state stop, current None, last_finished A).
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.advance_on_eof().await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 1, "A lingers at the queue head (consume off)");
+            assert_eq!(st.current, None, "end of queue stops the deck");
+            assert_eq!(
+                st.last_finished.as_ref().map(|s| &s.id),
+                Some(&SongId("A".into())),
+                "A is the recency memory"
+            );
+        }
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "just-finished".to_string()),
+                ("X-hypodj-hint-title", "Song A".to_string()),
+            ],
+            "before a fresh gesture the hint is just-finished A"
+        );
+        // The user enqueues a fresh selection D while stopped: the fresh gesture arms
+        // the anchor, so the seed/hint move to D, skipping the lingering finished A.
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 2, "A still lingering at pos0, D appended at pos1");
+            assert!(
+                matches!(&st.queue[0].entry, QueueEntry::Song(s) if s.id == SongId("A".into())),
+                "A is NOT evicted (consume off)"
+            );
+        }
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed skips A to D");
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "up-next".to_string()),
+                ("X-hypodj-hint-title", "Song D".to_string()),
+            ],
+            "the hint honestly reads up-next D, never just-finished A"
+        );
+    }
+
+    // The fresh-enqueue anchor fix is WIRED into the user Add command: a stream add
+    // (offline, no network) while stopped arms the anchor end to end. The stream itself
+    // has no library id, but arming still happens; the recency memory last_finished is
+    // KEPT (honest across consume eviction), not wiped.
+    #[tokio::test]
+    async fn add_command_arms_fresh_anchor_when_idle() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        // Deck is stopped/idle (current None). A user Add lands.
+        h.handle(MpdCommand::Add(NTS.to_string())).await;
+        let st = h.state.lock().unwrap();
+        assert!(st.fresh_enqueue_anchor.is_some(), "a fresh idle enqueue arms the anchor");
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "the recency memory is kept, not wiped"
+        );
+    }
+
+    // The arm now lives at the SHARED batch-append seam (enqueue_songs), so every idle
+    // enqueue that funnels through it - `load <name>`, `load Starred`, and
+    // findadd/searchadd - arms the anchor and the seed moves to the just-appended track.
+    // The recency memory (last_finished) is KEPT, not wiped. Offline: enqueue_songs
+    // takes already-resolved Songs.
+    #[tokio::test]
+    async fn enqueue_songs_arms_fresh_anchor_when_idle() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        // The user loads a fresh selection D while stopped (current None).
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        {
+            let st = h.state.lock().unwrap();
+            assert!(st.fresh_enqueue_anchor.is_some(), "the batch-append seam arms the anchor");
+            assert_eq!(
+                st.last_finished.as_ref().map(|s| s.id.clone()),
+                Some(SongId("A".into())),
+                "the recency memory is kept, not wiped"
+            );
+        }
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed moves to D");
+    }
+
+    // The shared arm is a NO-OP while a track is current: a batch enqueue behind a
+    // playing deck must not arm (the current-song branch wins the seed anyway) and must
+    // leave last_finished untouched for when playback stops.
+    #[tokio::test]
+    async fn enqueue_songs_keeps_recency_seed_while_current() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        {
+            let mut st = h.state.lock().unwrap();
+            st.last_finished = Some(playlist_test_song("A"));
+            st.current = Some(0); // a track is playing
+        }
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        let st = h.state.lock().unwrap();
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "a current track keeps the recency seed untouched"
+        );
+        assert!(st.fresh_enqueue_anchor.is_none(), "no anchor is armed behind a playing deck");
+    }
+
+    // The autoplay-shared push helper (enqueue_song, behind plan_enqueue -> PlayNow)
+    // must NOT arm the anchor: a played track legitimately becomes `current` and wins the
+    // seed on its own, so the idle-arm stays off this path. last_finished stays untouched.
+    #[tokio::test]
+    async fn enqueue_song_does_not_arm_fresh_anchor() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        // Idle (current None), but the autoplay helper must not arm and must leave
+        // last_finished alone.
+        h.enqueue_song(playlist_test_song("D")).await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "the autoplay push path never drops the recency seed"
+        );
+        assert!(st.fresh_enqueue_anchor.is_none(), "the autoplay push path never arms the anchor");
+    }
+
+    // The append-only Enqueue ACTION seam (the DJ NL surface: "queue up some jazz")
+    // arms the fresh anchor when fresh music lands on an idle deck - the SAME fix the MPD
+    // Add/load paths got, now on the feature's most central entry point. Driven at the
+    // post-append seam (arm_fresh_enqueue_anchor_on_append) so it needs no network to
+    // resolve songs; the real dispatch wiring is proved LIVE by
+    // live_enqueue_action_seeds_appended_over_lingering. A finished A lingers, then a
+    // fresh selection D is queued while stopped -> the seed moves to D, never stale A,
+    // and the recency memory is kept.
+    #[tokio::test]
+    async fn enqueue_action_arms_fresh_anchor_when_idle() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        // A fresh selection D landed on the idle deck (append-only, current still None).
+        // The action seam snapshots the first-appended qid BEFORE the append; mirror it.
+        let first = h.enqueue_song_for_test(playlist_test_song("D")).await;
+        h.arm_fresh_enqueue_anchor_on_append(first, 1);
+        let anchor = h.state.lock().unwrap().fresh_enqueue_anchor;
+        assert_eq!(anchor, Some(first), "an append-only Enqueue arms the anchor at the appended music");
+        assert_eq!(
+            h.state.lock().unwrap().last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "the recency memory is kept, not wiped"
+        );
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed moves to D");
+    }
+
+    // An append-only Enqueue that resolved NOTHING (honest 0 - no library match) must
+    // NOT arm an anchor: with no fresher music to point at, "just finished A" is still
+    // the most pertinent seed. Guards the n>0 empty-gate.
+    #[tokio::test]
+    async fn enqueue_action_keeps_recency_seed_on_zero_match() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        // Idle deck, but the ask resolved 0 songs - nothing fresher landed.
+        h.arm_fresh_enqueue_anchor_on_append(0, 0);
+        let st = h.state.lock().unwrap();
+        assert!(st.fresh_enqueue_anchor.is_none(), "a 0-match enqueue arms no anchor");
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "a 0-match enqueue keeps the recency seed (nothing fresher landed)"
+        );
+    }
+
+    // The append-only arm is a NO-OP while a track is current: an Enqueue action behind
+    // a playing deck must not arm (the current-song branch wins the seed anyway) and must
+    // leave last_finished untouched. Same idle-gate as
+    // enqueue_songs_keeps_recency_seed_while_current.
+    #[tokio::test]
+    async fn enqueue_action_keeps_recency_seed_while_current() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        {
+            let mut st = h.state.lock().unwrap();
+            st.last_finished = Some(playlist_test_song("A"));
+            st.current = Some(0); // a track is playing
+        }
+        h.arm_fresh_enqueue_anchor_on_append(7, 1);
+        let st = h.state.lock().unwrap();
+        assert!(st.fresh_enqueue_anchor.is_none(), "no anchor is armed behind a playing deck");
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "a current track keeps the recency seed untouched"
+        );
+    }
+
+    // THE realistic post-EOF test (scenario G): track A finishes and LINGERS at queue
+    // pos0 (consume OFF - the deeper root cause; the finished entry is what would replay),
+    // then a fresh idle enqueue [D] lands. The seed AND the hint must skip the lingering
+    // finished A and name the freshly-appended D. Drives the REAL EOF path (not an
+    // artificially emptied queue), so a future artificial-empty-queue test can never again
+    // mask this deeper root cause.
+    #[tokio::test]
+    async fn seed_skips_lingering_finished_head_after_fresh_enqueue() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // A single real song plays, then reaches natural EOF: consume off, so A LINGERS.
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.advance_on_eof().await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 1, "A lingers (consume off)");
+            assert_eq!(st.current, None, "deck stopped at end of queue");
+            assert_eq!(
+                st.last_finished.as_ref().map(|s| &s.id),
+                Some(&SongId("A".into())),
+                "A is the recency memory"
+            );
+        }
+        // Before the gesture the seed/hint is just-finished A.
+        assert_eq!(h.similar_seed_id(), Some(SongId("A".into())), "pre-gesture seed is A");
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "just-finished".to_string()),
+                ("X-hypodj-hint-title", "Song A".to_string()),
+            ]
+        );
+        // A fresh idle enqueue of D arms the anchor; A is still lingering at pos0.
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        assert_eq!(h.state.lock().unwrap().queue.len(), 2, "A lingering at pos0, D at pos1");
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed skips A to D");
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "up-next".to_string()),
+                ("X-hypodj-hint-title", "Song D".to_string()),
+            ],
+            "hint is up-next D, never the lingering just-finished A"
+        );
+    }
+
+    // Scenario R (recency wins, realistic + proves play clears the anchor): [A,B] are
+    // enqueued (arming the anchor), A plays and finishes single with NO fresh gesture
+    // after the finish. Both linger (consume off). The seed must be the just-finished A
+    // (recency), NOT B - because the play-time commit CLEARED the anchor armed at enqueue.
+    #[tokio::test]
+    async fn recency_wins_when_no_fresh_gesture_after_eof() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // [A,B] enqueued while idle -> the anchor arms at A.
+        h.enqueue_songs(vec![playlist_test_song("A"), playlist_test_song("B")]);
+        assert!(h.state.lock().unwrap().fresh_enqueue_anchor.is_some(), "enqueue armed the anchor");
+        h.state.lock().unwrap().single = true;
+        // A plays: the play-time current-commit clears the anchor.
+        h.handle(MpdCommand::Play(Some(0))).await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current, Some(0), "A is current");
+            assert!(st.fresh_enqueue_anchor.is_none(), "play cleared the anchor");
+        }
+        // A finishes single: deck stops, current None, both lingering, last_finished A.
+        h.advance_on_eof().await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current, None, "single stops after A");
+            assert_eq!(st.queue.len(), 2, "both lingering (consume off)");
+            assert_eq!(
+                st.last_finished.as_ref().map(|s| &s.id),
+                Some(&SongId("A".into())),
+                "A is the recency memory"
+            );
+            assert!(st.fresh_enqueue_anchor.is_none(), "no fresh gesture since the finish");
+        }
+        assert_eq!(h.similar_seed_id(), Some(SongId("A".into())), "recency A wins, NOT B");
+    }
+
+    // The play-time current-commit clears a pending fresh-enqueue anchor: an idle enqueue
+    // arms it, then starting playback (play_index -> play_index_inner) clears it so the
+    // NowPlaying branch owns the seed.
+    #[tokio::test]
+    async fn anchor_cleared_when_track_becomes_current() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        assert!(h.state.lock().unwrap().fresh_enqueue_anchor.is_some(), "idle enqueue armed the anchor");
+        h.play_index(0).await.expect("play the queued song");
+        assert!(
+            h.state.lock().unwrap().fresh_enqueue_anchor.is_none(),
+            "the current-commit cleared the anchor"
+        );
+    }
+
+    // Latest gesture wins: two successive idle enqueues each OVERWRITE the anchor, so only
+    // the newest tail seeds; the older superseded append (D) is intentionally skipped.
+    #[tokio::test]
+    async fn latest_gesture_supersedes_prior() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("E")]);
+        assert_eq!(h.similar_seed_id(), Some(SongId("E".into())), "the newest anchor (E) wins, never D");
+    }
+
+    // A dangling anchor self-heals: build the G-state (A lingering, D appended, anchor at
+    // D), then DELETE the appended D. The anchor's position lookup fails, branch 2 falls
+    // through, and the seed heals back to the recency memory A (just-finished).
+    #[tokio::test]
+    async fn dangling_anchor_self_heals_to_recency() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // A lingering at pos0 after a real EOF.
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.advance_on_eof().await;
+        // Fresh idle enqueue D arms the anchor at D (pos1).
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "sanity: G-state seeds D");
+        // Delete the appended D: the anchor now dangles (its qid is gone).
+        h.delete_for_test(1);
+        assert_eq!(h.similar_seed_id(), Some(SongId("A".into())), "self-heals to recency A");
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "just-finished".to_string()),
+                ("X-hypodj-hint-title", "Song A".to_string()),
+            ],
+            "the hint heals back to just-finished A"
+        );
+    }
+
+    // Consume-on scenario G: at EOF the finished A is EVICTED (queue empty), but a fresh
+    // idle enqueue [D] still arms the anchor and the seed is the appended D. The two
+    // mechanisms are orthogonal - the anchor carries the latest gesture regardless of
+    // whether consume evicted the head.
+    #[tokio::test]
+    async fn consume_on_gesture_seeds_appended() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        {
+            let mut st = h.state.lock().unwrap();
+            st.consume = true;
+            // A finished and was evicted (queue empty); recency memory holds A.
+            st.last_finished = Some(playlist_test_song("A"));
+        }
+        h.enqueue_songs(vec![playlist_test_song("D")]);
+        assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed the appended D");
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "up-next".to_string()),
+                ("X-hypodj-hint-title", "Song D".to_string()),
+            ]
+        );
+    }
+
+    // Consume-on scenario X/R: A finished and was evicted (queue empty), no fresh gesture
+    // after the finish. The recency memory carries A across the eviction, so the seed is
+    // just-finished A.
+    #[tokio::test]
+    async fn consume_on_recency_seeds_finished() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        {
+            let mut st = h.state.lock().unwrap();
+            st.consume = true;
+            st.last_finished = Some(playlist_test_song("A"));
+        }
+        assert_eq!(h.similar_seed_id(), Some(SongId("A".into())), "recency A across eviction");
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "just-finished".to_string()),
+                ("X-hypodj-hint-title", "Song A".to_string()),
+            ]
+        );
+    }
+
+    // The append-only Enqueue action arm skips a lingering finished head: with A lingering
+    // at pos0, driving arm_fresh_enqueue_anchor_on_append(first_qid, n>0) seeds the
+    // appended tail over A; the honest-0 case (n==0) arms nothing and leaves the seed at A.
+    #[tokio::test]
+    async fn append_only_enqueue_action_arms_anchor_over_lingering_head() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // A lingering at pos0 after a real EOF.
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.advance_on_eof().await;
+        // Simulate the append-only action: snapshot the first-appended qid, append the
+        // tail, then arm on append. The tail lands at pos1, behind lingering A.
+        let first = h.enqueue_song_for_test(playlist_test_song("tail")).await;
+        h.arm_fresh_enqueue_anchor_on_append(first, 1);
+        assert_eq!(
+            h.similar_seed_id(),
+            Some(SongId("tail".into())),
+            "the arm skips the lingering A to the appended tail"
+        );
+        // The honest-0 case: n==0 arms no anchor, so the seed stays the finished A.
+        let Some((h2, _events2)) = handler_with_null_player() else { return };
+        h2.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        h2.arm_fresh_enqueue_anchor_on_append(5, 0);
+        assert!(h2.state.lock().unwrap().fresh_enqueue_anchor.is_none(), "honest 0 arms nothing");
+        assert_eq!(h2.similar_seed_id(), Some(SongId("A".into())), "seed stays A on a 0-match");
+    }
+
+    /// LIVE (task ambient-context-hint): the append-only Enqueue ACTION end to end seeds
+    /// the freshly-appended music OVER a lingering finished head on an idle deck.
+    /// Synthesizes a finished track A LINGERING at queue pos0 (consume off) with the
+    /// recency memory set, drives the REAL run_action_outcome(Action::Enqueue {Radio, N})
+    /// against a live backend so N>0 real tracks append WITHOUT autoplaying, then proves
+    /// the seed moved to the FIRST appended track (skipping the lingering A) while the
+    /// recency memory (last_finished) is KEPT - the deeper staleness the hint exists to
+    /// prevent, gone at the DJ NL surface. Also proves the autoplay PlayNow action does
+    /// NOT strand a stale seed: it starts playback so the now-current track wins. Env:
+    /// HYPODJ_LIVE_URL/USER/PASS. Run with
+    /// `cargo test -p hypodj-core -- --ignored live_enqueue_action_seeds_appended`.
+    #[tokio::test]
+    #[ignore = "requires a live backend (HYPODJ_LIVE_URL/USER/PASS)"]
+    async fn live_enqueue_action_seeds_appended_over_lingering() {
+        let (url, user, pass) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw)) => (u, us, pw),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username: user, password: pass, client_name: "hypodj-live-test".into() };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(Arc::clone(&client), player);
+
+        // A finished track A LINGERING at queue pos0 (consume off), stopped, current
+        // None: the recency seed is A and the hint would read "just finished A".
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        assert_eq!(h.similar_seed_id(), Some(SongId("A".into())), "seed starts at finished A");
+
+        // The DJ NL surface: an append-only Enqueue lands N>0 real tracks WITHOUT
+        // autoplaying (current stays None). The fresh gesture outranks the lingering A.
+        let before = h.state.lock().unwrap().queue.len();
+        let out = h.run_action_outcome(&Action::Enqueue { selector: Selector::Radio, count: 3 }).await;
+        let n = match out {
+            PlanOutcome::Added { n, .. } => n,
+            other => panic!("expected Added, got {other:?}"),
+        };
+        assert!(n > 0, "radio must resolve N>0 real tracks");
+        assert_eq!(h.state.lock().unwrap().queue.len() - before, n, "append-only delta");
+        assert!(h.state.lock().unwrap().current.is_none(), "Enqueue never starts playback");
+        assert_eq!(
+            h.state.lock().unwrap().last_finished.as_ref().map(|s| s.id.clone()),
+            Some(SongId("A".into())),
+            "the recency memory is kept (honest across consume eviction), not wiped"
+        );
+        // The seed is the FIRST appended track (the anchored tail), skipping lingering A.
+        let first_appended = match &h.state.lock().unwrap().queue[before].entry {
+            QueueEntry::Song(s) => s.id.clone(),
+            QueueEntry::Stream { .. } => panic!("radio appends library songs, not streams"),
+        };
+        let seed = h.similar_seed_id().expect("a seed from the freshly queued music");
+        assert_eq!(seed, first_appended, "seed is the first appended track, over lingering A");
+        assert_ne!(seed, SongId("A".into()), "seed skips the stale finished A");
+
+        // The autoplay PlayNow action, by contrast, STARTS playback: it must not strand
+        // a cleared seed - the now-current track wins seed_source regardless.
+        let (player2, _events2) = NullPlayer::spawn();
+        let h2 = HypodjHandler::new(Arc::clone(&client), player2);
+        h2.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
+        let out2 = h2.run_action_outcome(&Action::PlayNow { selector: Selector::Radio, count: 1 }).await;
+        assert!(matches!(out2, PlanOutcome::Played { .. }), "PlayNow reports Played");
+        assert!(h2.state.lock().unwrap().current.is_some(), "PlayNow starts playback");
+        assert!(
+            matches!(h2.seed_source(), Some(SeedSource { kind: SeedKind::NowPlaying, .. })),
+            "the now-current PlayNow track wins the seed"
+        );
+    }
+
+    // Consume mode evicts the finished entry from the queue, but the hint still names
+    // it: the title is captured at finish onto last_finished, not looked up in a queue
+    // that no longer holds it.
+    #[tokio::test]
+    async fn ambient_hint_resolves_finished_title_without_queue_entry() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // last_finished holds the song; the queue is empty (the entry was consumed).
+        h.state.lock().unwrap().last_finished = Some(playlist_test_song("gone"));
+        assert_eq!(
+            h.ambient_hint_pairs(),
+            vec![
+                ("X-hypodj-hint-kind", "just-finished".to_string()),
+                ("X-hypodj-hint-title", "Song gone".to_string()),
+            ]
+        );
+    }
+
+    // A stream can never become the hint: it has no library id. A stream-as-current
+    // falls to the finished real track, and a stream-only queue yields no hint.
+    #[tokio::test]
+    async fn ambient_hint_never_names_a_stream() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_stream_for_test(NTS).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0); // the id-less stream is current
+            st.last_finished = Some(playlist_test_song("real"));
+        }
+        let pairs = h.ambient_hint_pairs();
+        assert_eq!(
+            pairs,
+            vec![
+                ("X-hypodj-hint-kind", "just-finished".to_string()),
+                ("X-hypodj-hint-title", "Song real".to_string()),
+            ]
+        );
+        assert!(!pairs.iter().any(|(_, v)| v.contains("ntslive")), "never the stream url");
+        // A stream-only queue with nothing finished yields no hint at all.
+        let Some((h2, _events2)) = handler_with_null_player() else { return };
+        h2.enqueue_stream_for_test(NTS).await;
+        assert!(h2.ambient_hint_pairs().is_empty());
+    }
+
+    // Defensive: a title carrying a newline would tear the status line, so no hint is
+    // emitted for it (mirrors the client-side skip-on-torn discipline).
+    #[tokio::test]
+    async fn ambient_hint_refuses_title_with_newline() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let mut s = playlist_test_song("x");
+        s.title = "line1\nline2".to_string();
+        h.state.lock().unwrap().last_finished = Some(s);
+        assert!(h.ambient_hint_pairs().is_empty(), "a newline title is refused");
     }
 
     // "queue more like this" with NOTHING to seed from is an HONEST 0 - it never

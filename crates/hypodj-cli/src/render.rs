@@ -14,11 +14,14 @@ pub fn render_card(np: &NowPlaying) -> String {
     let field = render_field(&np.field);
     if stopped || empty {
         // A stopped deck can still hold an armed wake alarm or a held pull - surface
-        // them so the machine's hold stays visible even with nothing playing. Field
-        // is the last, quietest line.
+        // them so the machine's hold stays visible even with nothing playing. Field,
+        // then the ambient hint, are the last, quietest lines.
         let mut lines = vec!["nothing playing".to_string()];
         lines.extend(armed);
         lines.extend(field);
+        if let Some(hint) = &np.hint {
+            lines.push(hint.phrase());
+        }
         return lines.join("\n");
     }
     let mut lines = Vec::new();
@@ -199,6 +202,59 @@ mod tests {
     fn card_empty_currentsong() {
         let status = p(&[("volume", "50"), ("playlistlength", "0"), ("state", "play")]);
         assert_eq!(render_card(&now_playing(&status, &[])), "nothing playing");
+    }
+
+    #[test]
+    fn card_shows_ambient_hint_when_stopped() {
+        // A stopped deck surfaces the just-finished hint as the quietest last line.
+        let status = p(&[
+            ("state", "stop"),
+            ("X-hypodj-hint-kind", "just-finished"),
+            ("X-hypodj-hint-title", "303 (Ninajirachi Remix)"),
+        ]);
+        let card = render_card(&now_playing(&status, &[]));
+        assert!(card.starts_with("nothing playing"));
+        assert!(card.contains("just finished 303 (Ninajirachi Remix)"));
+        // The hint is the LAST line (quietest voice).
+        assert!(card.ends_with("just finished 303 (Ninajirachi Remix)"));
+    }
+
+    #[test]
+    fn card_up_next_hint_when_empty_deck() {
+        let status = p(&[
+            ("state", "play"),
+            ("playlistlength", "0"),
+            ("X-hypodj-hint-kind", "up-next"),
+            ("X-hypodj-hint-title", "Blue in Green"),
+        ]);
+        let card = render_card(&now_playing(&status, &[]));
+        assert!(card.contains("up next Blue in Green"));
+    }
+
+    #[test]
+    fn card_no_hint_line_when_absent() {
+        // No hint pair -> no extra line, just "nothing playing".
+        let status = p(&[("state", "stop")]);
+        assert_eq!(render_card(&now_playing(&status, &[])), "nothing playing");
+    }
+
+    #[test]
+    fn card_playing_never_renders_hint() {
+        // A hint pair should not exist on the wire while a library track plays (the
+        // daemon suppresses it), but even if one leaked, the playing card never
+        // renders it - the current track is shown by title, never duplicated by a hint.
+        let status = p(&[
+            ("state", "play"),
+            ("song", "0"),
+            ("playlistlength", "1"),
+            ("X-hypodj-hint-kind", "just-finished"),
+            ("X-hypodj-hint-title", "Some Other Track"),
+        ]);
+        let current = p(&[("file", "song/42"), ("Title", "Now Playing Track")]);
+        let card = render_card(&now_playing(&status, &current));
+        assert!(card.contains("Now Playing Track"));
+        assert!(!card.contains("just finished"));
+        assert!(!card.contains("Some Other Track"));
     }
 
     #[test]

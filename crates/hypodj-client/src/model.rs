@@ -32,6 +32,12 @@ pub struct NowPlaying {
     /// an inspectable, decaying magnetism map is what makes the nondeterministic
     /// field trustworthy.
     pub field: FieldState,
+    /// The single most-pertinent ambient context hint - the "btw, DJ knows" surface.
+    /// Present ONLY when the daemon emits a just-finished or up-next hint pair; the
+    /// currently-playing case is suppressed at the daemon (the pane already shows it),
+    /// so `Some` here always names something the pane does NOT, and a lean status
+    /// leaves it `None`.
+    pub hint: Option<AmbientHint>,
 }
 
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
@@ -87,6 +93,49 @@ impl FieldState {
             pulls.push(FieldPull { label, strength, age_mins });
         }
         FieldState { pulls }
+    }
+}
+
+/// Which pertinence branch the daemon's ambient hint resolved to. Mirrors the
+/// daemon-side seed ordering; the currently-playing branch is never on the wire (it
+/// is suppressed at the daemon so the pane is not duplicated). The enum is the future
+/// extension point (a selected / time-of-day / ask variant).
+#[derive(Debug, PartialEq, Clone)]
+pub enum HintKind {
+    /// The track that just finished - the recency seed, the most in-the-face string.
+    JustFinished,
+    /// The first queued song when nothing has played yet.
+    UpNext,
+}
+
+/// The single most-pertinent context string, parsed from the daemon's
+/// `X-hypodj-hint-*` status pairs. Both `kind` and `title` are required - a torn
+/// snapshot missing either yields `None`, never a half-guessed hint.
+#[derive(Debug, PartialEq, Clone)]
+pub struct AmbientHint {
+    pub kind: HintKind,
+    pub title: String,
+}
+
+impl AmbientHint {
+    fn parse(status: &[(String, String)]) -> Option<Self> {
+        let kind = match find(status, "X-hypodj-hint-kind")? {
+            "just-finished" => HintKind::JustFinished,
+            "up-next" => HintKind::UpNext,
+            // An unknown or torn kind token yields nothing, never a guess.
+            _ => return None,
+        };
+        // Both keys required: a snapshot with a kind but no title is torn -> None.
+        Some(AmbientHint { kind, title: find(status, "X-hypodj-hint-title")?.to_string() })
+    }
+
+    /// The bare phrase for the terse card HUD (no "btw" prefix), matching the
+    /// `sleep 12m` / `toward calmer 0.58 3m` register.
+    pub fn phrase(&self) -> String {
+        match self.kind {
+            HintKind::JustFinished => format!("just finished {}", self.title),
+            HintKind::UpNext => format!("up next {}", self.title),
+        }
     }
 }
 
@@ -146,6 +195,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         starred: find(current, "X-Starred").is_some(),
         armed: ArmedFeatures::parse(status),
         field: FieldState::parse(status),
+        hint: AmbientHint::parse(status),
     }
 }
 
@@ -342,6 +392,56 @@ mod tests {
         let np = now_playing(&status, &[]);
         assert_eq!(np.field.pulls.len(), 1);
         assert_eq!(np.field.pulls[0].label, "calmer");
+    }
+
+    #[test]
+    fn nowplaying_parses_just_finished_hint() {
+        let status = p(&[
+            ("state", "stop"),
+            ("X-hypodj-hint-kind", "just-finished"),
+            ("X-hypodj-hint-title", "303 (Ninajirachi Remix)"),
+        ]);
+        let np = now_playing(&status, &[]);
+        let hint = np.hint.expect("a just-finished hint");
+        assert_eq!(hint.kind, HintKind::JustFinished);
+        assert_eq!(hint.title, "303 (Ninajirachi Remix)");
+        assert_eq!(hint.phrase(), "just finished 303 (Ninajirachi Remix)");
+    }
+
+    #[test]
+    fn nowplaying_parses_up_next_hint() {
+        let status = p(&[
+            ("X-hypodj-hint-kind", "up-next"),
+            ("X-hypodj-hint-title", "Blue in Green"),
+        ]);
+        let hint = now_playing(&status, &[]).hint.expect("an up-next hint");
+        assert_eq!(hint.kind, HintKind::UpNext);
+        assert_eq!(hint.phrase(), "up next Blue in Green");
+    }
+
+    #[test]
+    fn hint_absent_when_no_pairs() {
+        // A lean status (no hint pairs) leaves the hint None - the clients draw nothing.
+        let np = now_playing(&p(&[("state", "play")]), &[]);
+        assert_eq!(np.hint, None);
+    }
+
+    #[test]
+    fn hint_skips_torn_snapshot_missing_title() {
+        // A kind pair present but the title pair missing (a torn snapshot): parse
+        // yields None, never a half-guessed hint (mirrors field_skips_torn_index).
+        let status = p(&[("X-hypodj-hint-kind", "just-finished")]);
+        assert_eq!(now_playing(&status, &[]).hint, None);
+    }
+
+    #[test]
+    fn hint_rejects_unknown_kind_token() {
+        // An unknown/future kind token yields nothing rather than a guess.
+        let status = p(&[
+            ("X-hypodj-hint-kind", "time-of-day"),
+            ("X-hypodj-hint-title", "evening"),
+        ]);
+        assert_eq!(now_playing(&status, &[]).hint, None);
     }
 
     #[test]
