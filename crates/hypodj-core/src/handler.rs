@@ -166,6 +166,17 @@ struct State {
     /// plain u64 (not a heavyweight RNG) so it is trivially seedable from tests
     /// via [`State::seed_rng`], keeping `random` advance assertions non-flaky.
     rng_state: u64,
+    /// The library [`SongId`] of the track that most recently reached its natural
+    /// EOF (finished playing), if any. Set ONLY on a real natural track-end (the
+    /// [`Self::advance_on_eof`] path); a live/continuous stream leaves it untouched
+    /// (streams have no library id and must never become a similar seed). It is the
+    /// RECENCY seed for "more like this one" when nothing is currently playing: the
+    /// just-finished track is the most pertinent thing to seed from - the user was
+    /// almost certainly listening to it when they typed the ask. Preferred over the
+    /// first-queued song, but the current playing song still wins over it. A user
+    /// skip does NOT set it (advance_on_eof early-returns on a pending skip), so it
+    /// only ever holds a track that genuinely played through to its end.
+    last_finished: Option<SongId>,
     /// Deterministic RNG state for the volume-glide human-noise DITHER, SEPARATE
     /// from `rng_state` so drawing a dither on every setvol never desyncs the
     /// `random` next-track selection (whose seeded advances tests assert). Seeded
@@ -238,6 +249,8 @@ impl Default for State {
             // A fixed non-zero default seed; production is seeded from the wall
             // clock at handler construction, tests override via `seed_rng`.
             rng_state: 0x243F_6A88_85A3_08D3,
+            // No track has finished yet at construction.
+            last_finished: None,
             // A fixed non-zero default seed for the glide dither; production seeds
             // it from the wall clock at construction, tests pin it directly.
             vol_dither_state: 0x8B7F_A1C2_D3E4_F506,
@@ -2108,23 +2121,36 @@ impl HypodjHandler {
         }
     }
 
-    /// The library [`SongId`] to seed a "more like what is playing" enqueue from:
-    /// the CURRENT playing song, else the FIRST queued song (nothing playing yet).
-    /// Streams have no library id and are skipped. `None` when there is nothing to
-    /// seed from - the caller then yields an honest 0, never a fabricated pick. The
-    /// std `Mutex` is read then dropped here, NEVER held across the later `.await`.
+    /// The library [`SongId`] to seed a "more like what is playing" enqueue from,
+    /// in strict preference order:
+    ///
+    /// 1. the CURRENT playing song (what is playing wins over everything);
+    /// 2. else the RECENTLY-FINISHED song ([`State::last_finished`]) - the track
+    ///    that just ended is the most pertinent recency seed when nothing is
+    ///    playing (the scenario: a track finished, then the user asks "more like
+    ///    this one" - they meant the one that was just playing, not an unrelated
+    ///    queued song). This also covers the stream-as-current edge: a live stream
+    ///    has no library id, so the current-song branch yields `None` and we fall
+    ///    to the last real finished track rather than an unrelated first-queued one;
+    /// 3. else the FIRST queued Song (nothing has played yet - seed from what is up);
+    /// 4. else `None` - the caller then yields an HONEST 0, never a fabricated pick.
+    ///
+    /// Streams have no library id and are skipped at every level. The std `Mutex` is
+    /// read then dropped here, NEVER held across the later `.await`.
     fn similar_seed_id(&self) -> Option<SongId> {
         let st = self.state.lock().unwrap();
         let current_song_id = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
             QueueEntry::Song(s) => Some(s.id.clone()),
             QueueEntry::Stream { .. } => None,
         });
-        current_song_id.or_else(|| {
-            st.queue.iter().find_map(|it| match &it.entry {
-                QueueEntry::Song(s) => Some(s.id.clone()),
-                QueueEntry::Stream { .. } => None,
+        current_song_id
+            .or_else(|| st.last_finished.clone())
+            .or_else(|| {
+                st.queue.iter().find_map(|it| match &it.entry {
+                    QueueEntry::Song(s) => Some(s.id.clone()),
+                    QueueEntry::Stream { .. } => None,
+                })
             })
-        })
     }
 
     /// Apply the active latent-field pulls to a resolved candidate list, biasing the
@@ -3779,8 +3805,21 @@ impl HypodjHandler {
         // collide with the pending Terminal::SkipLoad, which still fires afterward
         // and loads the skip target a second time - a spurious load plus an audible
         // double-load glitch. Leave the advance to the skip terminal.
-        if self.state.lock().unwrap().pending_skip.is_some() {
-            return;
+        {
+            let mut st = self.state.lock().unwrap();
+            if st.pending_skip.is_some() {
+                return;
+            }
+            // Record the finishing track as the recency seed BEFORE the advance
+            // repoints `current`. Only a real library Song counts: a live/continuous
+            // stream has no id and must never become a similar seed, so a stream EOF
+            // leaves `last_finished` at the last real track that ended.
+            if let Some(id) = st.current.and_then(|i| st.queue.get(i)).and_then(|it| match &it.entry {
+                QueueEntry::Song(s) => Some(s.id.clone()),
+                QueueEntry::Stream { .. } => None,
+            }) {
+                st.last_finished = Some(id);
+            }
         }
         let next = self.plan_next(true);
         match next {
@@ -6052,6 +6091,103 @@ mod tests {
         // Start playback on the second song -> the seed follows the CURRENT track.
         h.handle(MpdCommand::Play(Some(2))).await;
         assert_eq!(h.similar_seed_id(), Some(SongId("s-2".into())));
+    }
+
+    // A natural track-end (the advance_on_eof path) records the finishing library
+    // song as the recency seed. A user-typed "more like this one" AFTER the track
+    // finished then seeds from that just-finished track, NOT an unrelated first-queued
+    // song. Task 0ba1lej (the screenshot scenario).
+    #[tokio::test]
+    async fn last_finished_set_on_natural_eof_and_seeds_recency() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // A single real song plays; nothing else queued.
+        h.enqueue_song_for_test(playlist_test_song("finished")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            assert_eq!(st.last_finished, None, "nothing has finished yet");
+        }
+        // The track reaches its natural EOF: end of queue -> current becomes None,
+        // and the finishing track is latched as the recency seed.
+        h.advance_on_eof().await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.current, None, "end of queue stops the deck");
+            assert_eq!(
+                st.last_finished,
+                Some(SongId("finished".into())),
+                "the finishing track is recorded as last_finished"
+            );
+        }
+        // Nothing is playing and nothing is queued, so the seed is the recently
+        // finished track (recency), NOT an honest 0.
+        assert_eq!(h.similar_seed_id(), Some(SongId("finished".into())));
+    }
+
+    // The strict seed preference order: CURRENT playing wins over RECENCY, which wins
+    // over the FIRST-QUEUED song, which beats None (honest 0).
+    #[tokio::test]
+    async fn similar_seed_order_current_beats_recency_beats_queued() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Truly nothing: no current, no finished, no queue -> honest 0.
+        assert_eq!(h.similar_seed_id(), None);
+        // A recently-finished track only (empty queue) -> recency is the seed.
+        h.state.lock().unwrap().last_finished = Some(SongId("recent".into()));
+        assert_eq!(h.similar_seed_id(), Some(SongId("recent".into())));
+        // Add a first-queued song: recency STILL wins over first-queued.
+        h.enqueue_song_for_test(playlist_test_song("queued")).await;
+        assert_eq!(
+            h.similar_seed_id(),
+            Some(SongId("recent".into())),
+            "recency wins over first-queued"
+        );
+        // Start playback: the CURRENT playing song wins over recency.
+        h.handle(MpdCommand::Play(Some(0))).await;
+        assert_eq!(
+            h.similar_seed_id(),
+            Some(SongId("queued".into())),
+            "current playing wins over recency"
+        );
+    }
+
+    // Fix-3 stream-as-current edge: when the current entry is a live stream (no
+    // library id), the seed falls to the recently-finished real track, NOT an
+    // unrelated first-queued song.
+    #[tokio::test]
+    async fn stream_current_falls_to_last_finished() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // A stream is the current entry; a real song sits later in the queue.
+        h.enqueue_stream_for_test(NTS).await;
+        h.enqueue_song_for_test(playlist_test_song("queued")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0); // the id-less stream is current
+            st.last_finished = Some(SongId("recent".into()));
+        }
+        assert_eq!(
+            h.similar_seed_id(),
+            Some(SongId("recent".into())),
+            "stream-as-current falls to last_finished, not the first-queued song"
+        );
+    }
+
+    // A stream reaching EOF must NEVER become the seed: it has no library id, so
+    // advance_on_eof leaves last_finished untouched (it keeps the last real track).
+    #[tokio::test]
+    async fn stream_eof_never_overwrites_last_finished() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_stream_for_test(NTS).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.last_finished = Some(SongId("real".into()));
+        }
+        h.advance_on_eof().await;
+        assert_eq!(
+            h.state.lock().unwrap().last_finished,
+            Some(SongId("real".into())),
+            "a stream EOF does not clobber the last real finished track"
+        );
     }
 
     // "queue more like this" with NOTHING to seed from is an HONEST 0 - it never
@@ -9340,6 +9476,58 @@ mod tests {
         let n = h.plan_enqueue(&Selector::SimilarToCurrent, 5).await.expect("similar enqueue");
         let after = h.state.lock().unwrap().queue.len();
         assert!(n > 0, "similar_to_current must resolve the playing seed to real tracks");
+        assert_eq!(after - before, n, "reported count equals the real queue delta");
+    }
+
+    /// LIVE (task 0ba1lej): "more like this one" after a track FINISHED seeds from
+    /// the RECENTLY-FINISHED track against a REAL backend. Plays a real track, drives
+    /// it to a natural EOF (nothing playing after), then proves the SimilarToCurrent
+    /// selector resolves via the recency seed (last_finished) - N>0 real tracks; and
+    /// that a never-played deck yields an HONEST 0. Env: HYPODJ_LIVE_URL/USER/PASS.
+    /// Run with `cargo test -p hypodj-core -- --ignored live_similar_recency`.
+    #[tokio::test]
+    #[ignore = "requires a live backend (HYPODJ_LIVE_URL/USER/PASS)"]
+    async fn live_similar_recency_seeds_from_finished_track() {
+        let (url, user, pass) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw)) => (u, us, pw),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username: user, password: pass, client_name: "hypodj-live-test".into() };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(Arc::clone(&client), player);
+
+        // (2) truly-empty deck (never played anything) -> honest 0.
+        let n0 = h.plan_enqueue(&Selector::SimilarToCurrent, 5).await.expect("honest 0");
+        assert_eq!(n0, 0, "never-played deck -> honest 0");
+
+        // Play a REAL track, then drive it to a NATURAL EOF so nothing is playing but
+        // last_finished holds that track.
+        let seed = client.random_songs(Some(1)).await.expect("random seed");
+        let seed = seed.into_iter().next().expect("a real track in the library");
+        h.enqueue_song_for_test(seed.clone()).await;
+        h.handle(MpdCommand::Play(Some(0))).await;
+        h.advance_on_eof().await; // natural end-of-queue EOF
+        assert_eq!(h.state.lock().unwrap().current, None, "deck stopped after EOF");
+        assert_eq!(
+            h.similar_seed_id(),
+            Some(seed.id.clone()),
+            "seed source is the recently-finished track, not first-queued"
+        );
+
+        // (1) "queue more like this one" -> resolves via similar(last_finished) and
+        // appends N>0 REAL tracks (append-only delta).
+        let before = h.state.lock().unwrap().queue.len();
+        let n = h.plan_enqueue(&Selector::SimilarToCurrent, 5).await.expect("similar enqueue");
+        let after = h.state.lock().unwrap().queue.len();
+        assert!(n > 0, "recency seed resolves to real tracks");
         assert_eq!(after - before, n, "reported count equals the real queue delta");
     }
 
