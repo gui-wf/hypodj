@@ -1037,6 +1037,104 @@ const AUDIBILITY_DB: f64 = -40.0;
 /// one legal deliberate fade step - no multi-step startle, no sub-JND dithering.
 const KNOB_STEP_DB: f64 = crate::fade::DELIBERATE_STEP_CAP_DB;
 
+/// Per-keyword cap on songs pulled when resolving a free-text mood/multi-word
+/// `Query`. A huge library can return hundreds of hits per common keyword; without
+/// a bound the OR-merge (and the state mutation it feeds) would grow with library
+/// richness. This caps EACH keyword's contribution so resolution cost stays flat.
+const QUERY_KEYWORD_SONG_CAP: usize = 50;
+
+/// Command/filler words that carry no library-search signal. Stripping them keeps
+/// the per-keyword full-text `search3` keyed on content (genre/mood/artist words).
+///
+/// SHARED SHAPE (copied, not linked): this mirrors `hypodj-client`'s grounding
+/// stopword list. The daemon must not depend on the client crate, so the tiny pure
+/// helper is duplicated here rather than coupling the two. Keep the two lists in
+/// rough sync when either grows.
+const QUERY_STOPWORDS: &[&str] = &[
+    "play", "queue", "add", "put", "on", "some", "a", "an", "the", "few", "couple",
+    "bunch", "of", "track", "tracks", "song", "songs", "music", "please", "at", "end",
+    "next", "now", "after", "current", "me", "something", "stuff", "and", "to", "for",
+    "up", "more", "bit", "little", "playing", "start", "with", "but", "super",
+];
+
+/// Words that flip a free-text `Query` into EXCLUSION mode: every content keyword
+/// AFTER one of these is a term the user does NOT want. Kept OUT of
+/// [`QUERY_STOPWORDS`] (a stopword would be silently dropped, turning "not chill"
+/// into a positive "chill" search - the exact wrong-song bug). The latch stays on
+/// for the rest of the phrase (a single mood ask rarely re-includes after a "not").
+const QUERY_NEGATIONS: &[&str] = &["not", "no", "without", "except", "excluding", "minus"];
+
+/// Split content keywords of a free-text `Query` phrase into INCLUDE terms (wanted)
+/// and EXCLUDE terms (explicitly rejected via a [`QUERY_NEGATIONS`] word). Each list
+/// is lowercased, stopword/1-char-filtered, and deduped preserving first-seen order;
+/// a term that lands in `exclude` is never also kept in `include`. Pure + unit-tested.
+#[derive(Debug, Default, PartialEq)]
+struct QueryKeywords {
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+/// Lowercased content keywords from a free-text `Query` phrase, partitioned into
+/// wanted vs rejected terms (see [`QueryKeywords`]). Split on non-alphanumeric, drop
+/// stopwords and 1-char tokens. A [`QUERY_NEGATIONS`] token latches EXCLUSION on for
+/// the remaining tokens so an explicit "not X" pushes X into `exclude` instead of
+/// searching for it. Mirrors `hypodj-client::grounding::content_keywords` (see
+/// [`QUERY_STOPWORDS`]) but keeps the split tokens so the resolver can search per
+/// keyword and filter the rejected ones out.
+fn query_content_keywords(phrase: &str) -> QueryKeywords {
+    let mut kw = QueryKeywords::default();
+    let mut negated = false;
+    for w in phrase.split(|c: char| !c.is_alphanumeric()) {
+        let w = w.to_lowercase();
+        if QUERY_NEGATIONS.contains(&w.as_str()) {
+            negated = true;
+            continue;
+        }
+        if w.len() <= 1 || QUERY_STOPWORDS.contains(&w.as_str()) {
+            continue;
+        }
+        if negated {
+            if !kw.exclude.contains(&w) {
+                kw.include.retain(|k| k != &w);
+                kw.exclude.push(w);
+            }
+        } else if !kw.include.contains(&w) && !kw.exclude.contains(&w) {
+            kw.include.push(w);
+        }
+    }
+    kw
+}
+
+/// OR-merge per-keyword `search3` song-hit lists into ONE relevance-ordered, deduped
+/// list. A song that matched MORE keywords leads (a track hitting both "chill" and
+/// "electronic" outranks one hitting only "electronic"); within an equal match count
+/// the first-seen order (keyword order, then per-keyword result order) is preserved
+/// via a STABLE sort. Deduped by [`SongId`]. Truncated to `want`. Pure + unit-tested:
+/// no network, no clock, no lock.
+fn merge_keyword_hits(per_keyword: Vec<Vec<Song>>, want: usize) -> Vec<Song> {
+    let mut order: Vec<SongId> = Vec::new();
+    let mut counts: HashMap<SongId, usize> = HashMap::new();
+    let mut songs: HashMap<SongId, Song> = HashMap::new();
+    for hits in per_keyword {
+        // A song appearing twice under the SAME keyword must not double-count that
+        // keyword; only distinct keywords raise the relevance score.
+        let mut seen_this_kw: std::collections::HashSet<SongId> = std::collections::HashSet::new();
+        for s in hits {
+            if !seen_this_kw.insert(s.id.clone()) {
+                continue;
+            }
+            *counts.entry(s.id.clone()).or_insert(0) += 1;
+            if !songs.contains_key(&s.id) {
+                order.push(s.id.clone());
+                songs.insert(s.id.clone(), s);
+            }
+        }
+    }
+    // Stable sort by match count DESC; ties keep first-seen order (slice sort is stable).
+    order.sort_by(|a, b| counts[b].cmp(&counts[a]));
+    order.into_iter().take(want).filter_map(|id| songs.remove(&id)).collect()
+}
+
 /// PURE re-rank for the `Calmer` selector. Given a `seed`, a candidate `pool`, and
 /// the desired `want`, sort candidates ASCENDING by energy (via the injected
 /// [`FeatureStore`]), keep those strictly calmer than the seed, and if that leaves
@@ -1759,8 +1857,69 @@ impl HypodjHandler {
         let want = count as usize;
         let songs: Vec<Song> = match selector {
             Selector::Query(q) => {
-                let hits = self.client.search3(q).await.map_err(|e| e.to_string())?;
-                hits.songs.into_iter().take(want).collect()
+                // A free-text mood/multi-word ask ("some chill electronic stuff") is
+                // NOT a literal title/artist; Subsonic search3 is whole-string/token
+                // full-text, so passing the whole phrase almost never matches any
+                // library title/artist/album and resolves 0 songs. Mirror the
+                // client-side grounding shape (see `query_content_keywords`): strip
+                // stopwords/filler, split into content keywords, run search3 PER
+                // keyword, then OR-merge (dedup + relevance-order). This recovers real
+                // tracks ("chill"/"electronic" hits) that the glued phrase never would.
+                let keywords = query_content_keywords(q);
+                if keywords.include.is_empty() {
+                    // No wanted content keywords (e.g. an explicit title that is all
+                    // filler, or an empty ask) - fall back to the literal whole-phrase
+                    // search so an exact title/artist ask still resolves as before.
+                    let hits = self.client.search3(q).await.map_err(|e| e.to_string())?;
+                    hits.songs.into_iter().take(want).collect()
+                } else {
+                    // Per-keyword search, each capped so a huge library cannot blow up.
+                    // Track the FIRST error: a search3 failure must NOT be silently
+                    // swallowed into a fake "no matches" zero (an infra outage would
+                    // read as an honest empty library). We only surface real matches,
+                    // but if the merge comes back empty AND a search errored we cannot
+                    // honestly claim zero - we propagate the error instead.
+                    let mut per_keyword: Vec<Vec<Song>> = Vec::with_capacity(keywords.include.len());
+                    let mut first_err: Option<String> = None;
+                    for kw in &keywords.include {
+                        match self.client.search3(kw).await {
+                            Ok(hits) => per_keyword
+                                .push(hits.songs.into_iter().take(QUERY_KEYWORD_SONG_CAP).collect()),
+                            Err(e) => {
+                                if first_err.is_none() {
+                                    first_err = Some(e.to_string());
+                                }
+                            }
+                        }
+                    }
+                    // Collect the song ids of every EXCLUDED term so a "not chill" ask
+                    // never enqueues the very tracks the user rejected. A failed exclude
+                    // search must ABORT (propagate) - filtering silently on partial data
+                    // could still slip a rejected song through, so we refuse to guess.
+                    let mut excluded_ids: std::collections::HashSet<SongId> =
+                        std::collections::HashSet::new();
+                    for kw in &keywords.exclude {
+                        let hits = self.client.search3(kw).await.map_err(|e| e.to_string())?;
+                        for s in hits.songs.into_iter().take(QUERY_KEYWORD_SONG_CAP) {
+                            excluded_ids.insert(s.id);
+                        }
+                    }
+                    // OR-merge everything, drop rejected songs, THEN take the requested
+                    // count (filtering before truncation so exclusions do not starve the
+                    // result). A GENUINE 0 stays 0 honestly - the fix-1 result line
+                    // surfaces "added 0 - no matches"; NEVER fabricate random songs.
+                    let mut merged = merge_keyword_hits(per_keyword, usize::MAX);
+                    merged.retain(|s| !excluded_ids.contains(&s.id));
+                    merged.truncate(want);
+                    // An empty merge with an in-flight search error is NOT an honest zero
+                    // - report the failure rather than fabricating a false no-match.
+                    if merged.is_empty() {
+                        if let Some(e) = first_err {
+                            return Err(e);
+                        }
+                    }
+                    merged
+                }
             }
             Selector::Genre(g) => self
                 .client
@@ -7858,6 +8017,74 @@ mod tests {
         }
     }
 
+    // ── free-text Query keyword-split + OR-merge resolution (PURE) ─────────────
+
+    // Owned-String vec from string literals, for QueryKeywords assertions.
+    fn svec(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn query_keywords_strip_filler_and_dedup() {
+        // A multi-word mood phrase reduces to its wanted content keywords (filler
+        // stripped, nothing excluded).
+        assert_eq!(
+            query_content_keywords("queue some chill electronic stuff"),
+            QueryKeywords { include: svec(&["chill", "electronic"]), exclude: vec![] }
+        );
+        // A negation ("not") pushes the terms AFTER it into `exclude` so the resolver
+        // never searches for the rejected mood - the wrong-song bug.
+        assert_eq!(
+            query_content_keywords("active but not super head bumping"),
+            QueryKeywords { include: svec(&["active"]), exclude: svec(&["head", "bumping"]) }
+        );
+        assert_eq!(
+            query_content_keywords("active but not chill electronic"),
+            QueryKeywords { include: svec(&["active"]), exclude: svec(&["chill", "electronic"]) }
+        );
+        // An all-filler ask yields NO include keywords -> the resolver falls back to a
+        // literal whole-phrase search3 (an exact title path stays intact).
+        assert!(query_content_keywords("play some music").include.is_empty());
+        // Repeated content words collapse (search that keyword once).
+        assert_eq!(
+            query_content_keywords("funk funk funk"),
+            QueryKeywords { include: svec(&["funk"]), exclude: vec![] }
+        );
+    }
+
+    #[test]
+    fn merge_keyword_hits_or_merges_relevance_ordered_and_deduped() {
+        // Two keyword result lists: song "b" matches BOTH keywords, so it must lead
+        // the OR-merge even though it is not first in either list.
+        let chill = vec![mk_song("a"), mk_song("b")];
+        let electronic = vec![mk_song("b"), mk_song("c")];
+        let merged = merge_keyword_hits(vec![chill, electronic], 10);
+        let ids: Vec<&str> = merged.iter().map(|s| s.id.0.as_str()).collect();
+        // "b" (2 keywords) leads; "a" and "c" (1 each) follow in first-seen order.
+        assert_eq!(ids, vec!["b", "a", "c"]);
+    }
+
+    #[test]
+    fn merge_keyword_hits_dedups_within_and_across_keywords() {
+        // A duplicate id within ONE keyword's hits must not double-count relevance
+        // nor appear twice; across keywords the song is deduped to a single entry.
+        let kw1 = vec![mk_song("x"), mk_song("x"), mk_song("y")];
+        let kw2 = vec![mk_song("x")];
+        let merged = merge_keyword_hits(vec![kw1, kw2], 10);
+        let ids: Vec<&str> = merged.iter().map(|s| s.id.0.as_str()).collect();
+        // "x" appears once (matched 2 distinct keywords -> leads), "y" once.
+        assert_eq!(ids, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn merge_keyword_hits_honest_zero_and_bounded_take() {
+        // NO keyword matched anything -> honest empty (no fabrication).
+        assert!(merge_keyword_hits(vec![vec![], vec![]], 5).is_empty());
+        // The requested count bounds the merged output.
+        let hits = vec![mk_song("1"), mk_song("2"), mk_song("3")];
+        assert_eq!(merge_keyword_hits(vec![hits], 2).len(), 2);
+    }
+
     // A fake FeatureStore that reads a per-song energy off a lookup table (keyed by
     // song id), so calmer_rerank can be exercised with NO network/model/metadata.
     struct FakeStore(std::collections::HashMap<String, f32>);
@@ -8907,6 +9134,77 @@ mod tests {
             .expect("arm");
         let line = outcome.expect("outcome").render();
         assert!(line.starts_with("played "), "expected played line, got: {line}");
+    }
+
+    /// LIVE proof of the Query keyword-split + OR-merge fix against a REAL backend
+    /// (throwaway queue, never touches live 6600, no secrets, NullPlayer = silent).
+    ///
+    /// Picks a REAL genre token from the library (`list genre` via the client), wraps
+    /// it in a natural multi-word phrase that would fail whole-string full-text, and
+    /// proves: (a) the OLD whole-phrase `search3` returns 0 songs (so the split is
+    /// what fixes it), (b) the NEW keyword-split enqueue resolves N>0 REAL tracks,
+    /// (c) a pure-nonsense mood resolves to an HONEST 0 (no fabrication).
+    ///
+    /// Env: `HYPODJ_LIVE_URL`, `HYPODJ_LIVE_USER`, `HYPODJ_LIVE_PASS`. Run with
+    /// `cargo test -p hypodj-core -- --ignored live_query_keyword_split_resolves`.
+    #[tokio::test]
+    #[ignore = "requires a live backend (HYPODJ_LIVE_URL/USER/PASS)"]
+    async fn live_query_keyword_split_resolves_multiword_mood() {
+        let (url, user, pass) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw)) => (u, us, pw),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username: user, password: pass, client_name: "hypodj-live-test".into() };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+
+        // A REAL single-word genre token from the library (never hardcoded), so the
+        // per-keyword search3 is guaranteed to have something to match.
+        let genres = client.genres().await.expect("list genres");
+        let token = genres
+            .iter()
+            .map(|g| g.name.clone())
+            .find(|n| !n.trim().is_empty() && !n.contains(' ') && n.chars().all(|c| c.is_alphanumeric()))
+            .expect("a single-word alphanumeric genre token in the library");
+
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(Arc::clone(&client), player);
+
+        // A natural multi-word phrase embedding the real token. Whole-string search3
+        // of this phrase almost never matches a title/artist/album, but the split
+        // recovers the token's tracks.
+        let phrase = format!("queue some {token} stuff for now");
+
+        // (a) OLD behaviour: the whole-phrase search3 finds 0 songs (the bug).
+        let old = client.search3(&phrase).await.expect("search3 whole phrase");
+        assert_eq!(
+            old.songs.len(),
+            0,
+            "whole-string search3 of the multi-word phrase should find 0 (that is the bug we fixed)"
+        );
+
+        // (b) NEW behaviour: the keyword-split enqueue resolves N>0 REAL tracks.
+        let before = h.state.lock().unwrap().queue.len();
+        let n = h.plan_enqueue(&Selector::Query(phrase.clone()), 5).await.expect("enqueue");
+        let after = h.state.lock().unwrap().queue.len();
+        assert!(n > 0, "keyword-split should resolve the token '{token}' to real tracks, got 0");
+        assert_eq!(after - before, n, "the reported count equals the real queue delta");
+
+        // (c) Pure nonsense -> honest 0 (no fabrication, queue unchanged).
+        let q2 = h.state.lock().unwrap().queue.len();
+        let n0 = h
+            .plan_enqueue(&Selector::Query("zzq flibber wompus".into()), 5)
+            .await
+            .expect("enqueue nonsense");
+        let q3 = h.state.lock().unwrap().queue.len();
+        assert_eq!(n0, 0, "pure nonsense must resolve to an honest 0 (no fabrication)");
+        assert_eq!(q2, q3, "a 0-match ask leaves the queue unchanged");
     }
 
     #[tokio::test]
