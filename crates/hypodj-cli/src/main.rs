@@ -327,9 +327,17 @@ fn cc_nl_handshake(conn: &mut MpdConn, phrase: &str) -> Result<bool, MpdError> {
     if confirm("confirm?") {
         match conn.command(&format!("plan add {dsl}")) {
             Ok(plan_pairs) => {
-                for (k, v) in &plan_pairs {
-                    if k == "plan_id" {
-                        println!("{}", nl::armed_line(v));
+                // Prefer the REAL execute-time outcome ("added N", "added 0 - no
+                // matches for X", "played X") the daemon returns for an immediate
+                // plan; fall back to the plan-time armed line for a deferred plan.
+                match nl::result_line_from_pairs(&plan_pairs) {
+                    Some(line) => println!("{line}"),
+                    None => {
+                        for (k, v) in &plan_pairs {
+                            if k == "plan_id" {
+                                println!("{}", nl::armed_line(v));
+                            }
+                        }
                     }
                 }
                 print_card(conn)?;

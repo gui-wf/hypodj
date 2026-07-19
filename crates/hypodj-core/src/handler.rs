@@ -525,6 +525,83 @@ pub enum FadeIntent {
     ToFloor,
 }
 
+/// The REAL, execute-time outcome of a `plan add`'s immediate action, threaded back
+/// to the client so the DJ pane / `dj` CLI can report what ACTUALLY happened (the
+/// true resolved count/effect) instead of the plan-ASKED count. This is the fix for
+/// the silent no-op: an "add 5 tracks matching X" that resolves to 0 real songs must
+/// say "added 0 - no matches for X", never echo the asked 5 as if it happened.
+/// Rendered to a single human line by [`PlanOutcome::render`]; the daemon returns
+/// that line as the `result` pair on the `plan add` response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PlanOutcome {
+    /// An `enqueue`: `n` tracks were APPENDED (0 = the selector matched nothing).
+    /// `selector` is the human phrase used in the 0-match message.
+    Added { n: usize, selector: String },
+    /// A `playnow`: `n` tracks enqueued + started. When `n > 0`, `title` names the
+    /// track playback jumped to; when `n == 0` it is a no-match no-op.
+    Played { n: usize, title: Option<String>, selector: String },
+    /// A queue REMOVE: `n` entries removed (0 = clean no-op, no match).
+    Removed(usize),
+    /// A queue MOVE: `n` entries moved.
+    Moved(usize),
+    /// A queue CLEAR: `n` entries cleared.
+    Cleared(usize),
+    /// A queue PLAY (jump to an in-queue match): 1 = jumped, 0 = no match.
+    Jumped(usize),
+    /// A non-selecting immediate effect (fade / stop / pause / setvol / wake): a
+    /// short verb the client shows verbatim.
+    Effect(String),
+    /// The action errored (log-and-continue); the message for the client.
+    Failed(String),
+}
+
+impl PlanOutcome {
+    /// The single human line the client shows after `y`/confirm. Speaks the REAL
+    /// count/effect (0 when the selector resolved to nothing), NEVER the asked count.
+    pub fn render(&self) -> String {
+        match self {
+            PlanOutcome::Added { n: 0, selector } => {
+                format!("added 0 - no matches for {selector}")
+            }
+            PlanOutcome::Added { n, .. } => format!("added {n} {}", tracks_word(*n)),
+            PlanOutcome::Played { n: 0, selector, .. } => {
+                format!("added 0 - no matches for {selector}")
+            }
+            PlanOutcome::Played { title: Some(t), .. } => format!("played {t}"),
+            PlanOutcome::Played { n, .. } => format!("played {n} {}", tracks_word(*n)),
+            PlanOutcome::Removed(n) => format!("removed {n} {}", tracks_word(*n)),
+            PlanOutcome::Moved(n) => format!("moved {n} {}", tracks_word(*n)),
+            PlanOutcome::Cleared(n) => format!("cleared {n} {}", tracks_word(*n)),
+            PlanOutcome::Jumped(0) => "no matching track to play".to_string(),
+            PlanOutcome::Jumped(_) => "jumped to the matching track".to_string(),
+            PlanOutcome::Effect(s) => s.clone(),
+            PlanOutcome::Failed(e) => format!("could not do that: {e}"),
+        }
+    }
+}
+
+/// "track" vs "tracks" for a count.
+fn tracks_word(n: usize) -> &'static str {
+    if n == 1 {
+        "track"
+    } else {
+        "tracks"
+    }
+}
+
+/// The human phrase for a library [`Selector`], used in the 0-match "no matches for
+/// X" outcome: a quoted query/genre, or a short label for the non-literal pools.
+fn selector_phrase(sel: &Selector) -> String {
+    match sel {
+        Selector::Query(q) => format!("\"{q}\""),
+        Selector::Genre(g) => format!("\"{g}\""),
+        Selector::Radio => "random tracks".to_string(),
+        Selector::Similar(_) => "similar tracks".to_string(),
+        Selector::Calmer(_) => "calmer tracks".to_string(),
+        Selector::Exact(_) => "those tracks".to_string(),
+    }
+}
+
 impl FadeIntent {
     /// Resolve into `(target, sub_jnd, terminal, clamp_dur_up)` against the live
     /// `from_db`, the configured comfort `ceiling`, and the wind-down `floor_db`.
@@ -1108,6 +1185,117 @@ impl HypodjHandler {
         self.plan_pending.lock().unwrap().extend(pendings);
         self.nudge_immediates(immediates);
         Ok(ids)
+    }
+
+    /// Arm a single `plan add` and, when it is Immediate, EXECUTE its action inline
+    /// (awaited) so the response can carry the REAL execute-time outcome (the true
+    /// resolved count/effect), not the plan-ASKED count. The y/n + arm SEMANTICS are
+    /// unchanged: the plan is still clamped, validated, and minted exactly as
+    /// [`Self::plan_add`]; the only difference is that an Immediate action runs HERE
+    /// (an inline await) instead of via the executor's on_immediate nudge, so the
+    /// count is known synchronously and reported. The pending is NOT enrolled in the
+    /// registry and NOT nudged, so there is exactly ONE execution and no zombie.
+    /// Non-immediate plans arm identically to [`Self::plan_add`] and carry no outcome.
+    pub async fn plan_add_reporting(
+        &self,
+        raw: RawPlan,
+    ) -> Result<(PlanId, Option<PlanOutcome>), PlanError> {
+        let (mut pendings, mut ids, immediates) = self.prepare_batch(vec![raw])?;
+        // Single-plan batch: exactly one id + one pending.
+        let id = ids.remove(0);
+        if immediates.contains(&id) {
+            // Immediate: run inline for the true outcome. An Immediate plan holds no
+            // timer guard, so dropping the (un-enrolled) pending disarms nothing.
+            let action = pendings.remove(0).armed.raw.action;
+            let outcome = self.run_action_outcome(&action).await;
+            Ok((id, Some(outcome)))
+        } else {
+            self.plan_pending.lock().unwrap().extend(pendings);
+            Ok((id, None))
+        }
+    }
+
+    /// Execute one immediate plan [`Action`] against the existing primitives,
+    /// returning its REAL [`PlanOutcome`]. The SINGLE dispatch used by BOTH the
+    /// executor (arm-and-forget plans, which ignore the outcome and only log a
+    /// failure) and the `plan add` reporting path (which threads it back to the
+    /// client). No `.await` is held across a std Mutex; each primitive owns its own
+    /// locking discipline.
+    ///
+    /// Returns an explicitly BOXED (`Pin<Box<dyn Future + Send>>`) future rather than
+    /// an `async fn`'s opaque one. This action dispatch can reach `self.handle` (for
+    /// Stop/Pause/SetVol/Clear), and `handle` reaches back here via the `plan add`
+    /// path (`handle` -> `handle_plan` -> `plan_add_reporting` -> here) - an opaque
+    /// self-referential future cycle whose `Send`-ness the compiler cannot infer. A
+    /// nameable boxed return type cuts the cycle: `handle`'s hidden type sees a
+    /// concrete `Send` future here, never this body's opaque one.
+    pub fn run_action_outcome<'a>(
+        &'a self,
+        action: &'a Action,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PlanOutcome> + Send + 'a>> {
+        Box::pin(async move {
+        match action {
+            // Fade precedence: start_fade_spec IS the single FadeSlot (validates
+            // before aborting; logs an autonomous takeover).
+            Action::Fade(ir) => match self.start_fade_spec(crate::executor::map_fade(ir)).await {
+                Ok(_) => PlanOutcome::Effect("fading".into()),
+                Err(e) => PlanOutcome::Failed(e.to_string()),
+            },
+            Action::Stop => {
+                self.handle(MpdCommand::Stop).await;
+                PlanOutcome::Effect("stopped".into())
+            }
+            Action::Pause => {
+                self.handle(MpdCommand::Pause(Some(true))).await;
+                PlanOutcome::Effect("paused".into())
+            }
+            Action::SetVolume(v) => {
+                self.handle(MpdCommand::SetVol(*v)).await;
+                PlanOutcome::Effect(format!("set volume to {v}"))
+            }
+            // Strictly append-only (adds to the END, never starts/jumps).
+            Action::Enqueue { selector, count } => match self.plan_enqueue(selector, *count).await {
+                Ok(n) => PlanOutcome::Added { n, selector: selector_phrase(selector) },
+                Err(e) => PlanOutcome::Failed(e),
+            },
+            // Play a library song NOW: enqueue-then-start; name the started track.
+            Action::PlayNow { selector, count } => {
+                match self.plan_play_now(selector, *count).await {
+                    Ok(0) => {
+                        PlanOutcome::Played { n: 0, title: None, selector: selector_phrase(selector) }
+                    }
+                    Ok(n) => {
+                        let title = self.current_song().map(|s| format!("\"{}\"", s.title));
+                        PlanOutcome::Played { n, title, selector: selector_phrase(selector) }
+                    }
+                    Err(e) => PlanOutcome::Failed(e),
+                }
+            }
+            Action::Wake { selector, count } => match self.wake_now(selector.clone(), *count).await {
+                Ok(_) => PlanOutcome::Effect("waking".into()),
+                Err(e) => PlanOutcome::Failed(e),
+            },
+            // DETERMINISTIC queue edits: the selector resolves against the LIVE queue;
+            // a no-match is a clean no-op (count 0), never a wrong-target edit.
+            Action::Remove { .. } => match self.plan_queue_edit(action).await {
+                Ok(n) => PlanOutcome::Removed(n),
+                Err(e) => PlanOutcome::Failed(e),
+            },
+            Action::Move { .. } => match self.plan_queue_edit(action).await {
+                Ok(n) => PlanOutcome::Moved(n),
+                Err(e) => PlanOutcome::Failed(e),
+            },
+            Action::Clear { .. } => match self.plan_queue_edit(action).await {
+                Ok(n) => PlanOutcome::Cleared(n),
+                Err(e) => PlanOutcome::Failed(e),
+            },
+            Action::Play { .. } => match self.plan_queue_edit(action).await {
+                Ok(n) => PlanOutcome::Jumped(n),
+                Err(e) => PlanOutcome::Failed(e),
+            },
+            Action::Noop => PlanOutcome::Effect("nothing to do".into()),
+        }
+        })
     }
 
     /// Validate + arm (mint ids, arm deadline timers) a batch of raw plans WITHOUT
@@ -1983,10 +2171,20 @@ impl HypodjHandler {
 
     /// Dispatch a parsed `plan` MPD command to the registry, mapping a
     /// [`PlanError`] 1:1 to a fail-loud ACK. Sync (registry ops never `.await`).
-    fn handle_plan(&self, cmd: PlanCmd) -> MpdResponse {
+    async fn handle_plan(&self, cmd: PlanCmd) -> MpdResponse {
         match cmd {
-            PlanCmd::Add(raw) => match self.plan_add(raw) {
-                Ok(id) => MpdResponse::pairs().pair("plan_id", id.0.to_string()).build(),
+            // An Immediate `plan add` executes inline and reports the REAL outcome as
+            // a `result` pair (the client shows exactly what happened - "added 0 - no
+            // matches for X" on a mood that resolves to nothing, "added N" / "played
+            // X" otherwise). A deferred (armed) plan carries no outcome yet.
+            PlanCmd::Add(raw) => match self.plan_add_reporting(raw).await {
+                Ok((id, outcome)) => {
+                    let mut b = MpdResponse::pairs().pair("plan_id", id.0.to_string());
+                    if let Some(o) = outcome {
+                        b = b.pair("result", o.render());
+                    }
+                    b.build()
+                }
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "plan", &e.to_string()),
             },
             PlanCmd::List => {
@@ -4065,7 +4263,7 @@ impl MpdHandler for HypodjHandler {
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "fade", &e.to_string()),
                 }
             }
-            MpdCommand::Plan(cmd) => self.handle_plan(cmd),
+            MpdCommand::Plan(cmd) => self.handle_plan(cmd).await,
             MpdCommand::Nl(cmd) => self.handle_nl(cmd).await,
             MpdCommand::Sleep(cmd) => self.handle_sleep(cmd),
             MpdCommand::Winddown(cmd) => self.handle_winddown(cmd),
@@ -8559,6 +8757,158 @@ mod tests {
     /// backend.
     ///
     /// Env: `HYPODJ_LIVE_URL`, `HYPODJ_LIVE_USER`, `HYPODJ_LIVE_PASS`.
+    // The execute-outcome fix: PlanOutcome::render speaks the REAL count/effect. The
+    // silent no-op bug was a plan-time "add 5" shown when 0 resolved; render never
+    // does that - 0 says "added 0 - no matches for X", not the asked count.
+    #[test]
+    fn plan_outcome_render_speaks_real_count() {
+        // Zero resolved -> the honest no-match line (NOT "added 5").
+        assert_eq!(
+            PlanOutcome::Added { n: 0, selector: "\"active but not head bumping\"".into() }.render(),
+            "added 0 - no matches for \"active but not head bumping\""
+        );
+        // N>0 -> the real count, pluralized.
+        assert_eq!(
+            PlanOutcome::Added { n: 3, selector: "\"jazz\"".into() }.render(),
+            "added 3 tracks"
+        );
+        assert_eq!(
+            PlanOutcome::Added { n: 1, selector: "\"jazz\"".into() }.render(),
+            "added 1 track"
+        );
+        // playnow with a resolved track -> "played <title>".
+        assert_eq!(
+            PlanOutcome::Played {
+                n: 1,
+                title: Some("\"So What\"".into()),
+                selector: "\"so what\"".into(),
+            }
+            .render(),
+            "played \"So What\""
+        );
+        // playnow that resolved to nothing -> the same honest no-match line.
+        assert_eq!(
+            PlanOutcome::Played { n: 0, title: None, selector: "\"nope\"".into() }.render(),
+            "added 0 - no matches for \"nope\""
+        );
+        // Queue edits report their real affected count.
+        assert_eq!(PlanOutcome::Removed(2).render(), "removed 2 tracks");
+        assert_eq!(PlanOutcome::Jumped(1).render(), "jumped to the matching track");
+        assert_eq!(PlanOutcome::Jumped(0).render(), "no matching track to play");
+    }
+
+    // run_action_outcome for the DETERMINISTIC queue-edit actions (no network): a
+    // matching Play jumps (Jumped(1)); a no-match Play is a clean no-op (Jumped(0),
+    // "no matching track"); a Remove reports the real removed count; Noop is inert.
+    #[tokio::test]
+    async fn run_action_outcome_queue_edits_report_real_counts() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s-1")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-2")).await;
+        h.enqueue_song_for_test(playlist_test_song("s-3")).await;
+        h.play_for_test(0).await;
+
+        // A Play matching "Song s-2" jumps to it.
+        let out = h
+            .run_action_outcome(&Action::Play {
+                sel: crate::plan::QueueSelector::QueryMatch("s-2".into()),
+            })
+            .await;
+        assert_eq!(out, PlanOutcome::Jumped(1));
+        assert_eq!(out.render(), "jumped to the matching track");
+
+        // A Play matching nothing is a clean no-op - never a wrong-target jump.
+        let out = h
+            .run_action_outcome(&Action::Play {
+                sel: crate::plan::QueueSelector::QueryMatch("no-such-track".into()),
+            })
+            .await;
+        assert_eq!(out, PlanOutcome::Jumped(0));
+        assert_eq!(out.render(), "no matching track to play");
+
+        // A Remove of the last entry reports the real removed count.
+        let out = h
+            .run_action_outcome(&Action::Remove { sel: crate::plan::QueueSelector::Last(1) })
+            .await;
+        assert_eq!(out, PlanOutcome::Removed(1));
+
+        // Noop is inert.
+        assert_eq!(
+            h.run_action_outcome(&Action::Noop).await,
+            PlanOutcome::Effect("nothing to do".into())
+        );
+    }
+
+    // LIVE execute-outcome proof (real server): a mood ask that resolves to 0 real
+    // songs reports "added 0 - no matches for X" (NOT the asked count), a real ask
+    // reports "added N" with N = the true resolved count, and a playnow reports
+    // "played <title>". Run with HYPODJ_LIVE_URL/USER/PASS + HYPODJ_LIVE_GENRE set.
+    #[tokio::test]
+    #[ignore]
+    async fn live_plan_add_reports_real_execute_outcome() {
+        let (url, user, pass) = match (
+            std::env::var("HYPODJ_LIVE_URL"),
+            std::env::var("HYPODJ_LIVE_USER"),
+            std::env::var("HYPODJ_LIVE_PASS"),
+        ) {
+            (Ok(u), Ok(us), Ok(pw)) => (u, us, pw),
+            _ => {
+                eprintln!("skipping: set HYPODJ_LIVE_URL/USER/PASS to run");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username: user, password: pass, client_name: "hypodj-live-test".into() };
+        let client = Arc::new(SubsonicClient::connect(&cfg).expect("connect"));
+        let (player, _events) = NullPlayer::spawn();
+        let h = HypodjHandler::new(client, player);
+
+        // (1) A mood query that literal search will not match -> added 0, honest.
+        let nonsense = "zzq no such mood xxq";
+        let (_id, outcome) = h
+            .plan_add_reporting(RawPlan {
+                version: 1,
+                trigger: RawTrigger::Immediate,
+                action: Action::Enqueue { selector: Selector::Query(nonsense.into()), count: 5 },
+                once: false,
+                origin: "mpd".into(),
+            })
+            .await
+            .expect("arm");
+        let line = outcome.expect("immediate outcome").render();
+        assert!(line.starts_with("added 0 - no matches for"), "expected 0-match line, got: {line}");
+
+        // (2) A radio ask resolves to real songs -> added N (N>0), the true count.
+        let before = h.state.lock().unwrap().queue.len();
+        let (_id, outcome) = h
+            .plan_add_reporting(RawPlan {
+                version: 1,
+                trigger: RawTrigger::Immediate,
+                action: Action::Enqueue { selector: Selector::Radio, count: 3 },
+                once: false,
+                origin: "mpd".into(),
+            })
+            .await
+            .expect("arm");
+        let after = h.state.lock().unwrap().queue.len();
+        let delta = after - before;
+        assert_eq!(outcome.expect("outcome").render(), format!("added {delta} {}", tracks_word(delta)));
+        assert!(delta > 0, "radio should resolve to real songs");
+
+        // (3) A playnow resolves to a real track -> "played <title>".
+        let (_id, outcome) = h
+            .plan_add_reporting(RawPlan {
+                version: 1,
+                trigger: RawTrigger::Immediate,
+                action: Action::PlayNow { selector: Selector::Radio, count: 1 },
+                once: false,
+                origin: "mpd".into(),
+            })
+            .await
+            .expect("arm");
+        let line = outcome.expect("outcome").render();
+        assert!(line.starts_with("played "), "expected played line, got: {line}");
+    }
+
     #[tokio::test]
     #[ignore]
     async fn live_mood_pull_biases_radio_enqueue_and_genre_sets_none() {

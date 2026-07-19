@@ -30,7 +30,8 @@ use hypodj_client::mpd::{MpdConn, MpdError};
 use hypodj_client::viz::{VizConn, VizSample};
 use hypodj_client::model::{now_playing, parse_queue, NowPlaying, QueueItem};
 use hypodj_client::nl::{
-    armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, split_echo, token_from_pairs,
+    armed_line, echo_from_pairs, map_ack_reason, nl_request, quote_arg, result_line_from_pairs,
+    split_echo, token_from_pairs,
 };
 
 use crate::art::AlbumArt;
@@ -436,14 +437,18 @@ fn handle_req(conn: &mut MpdConn, tx: &Sender<Inbound>, epoch: u64, req: Req) ->
         }
         Req::Arm(pending) => {
             let result = match (&pending.command, &pending.token) {
-                // DIRECT-COMMAND arm (the cc/DJ `plan add <dsl>` path): the command
-                // socket returns a bare OK with no plan_id to echo, so synthesize a
-                // human armed line from the plan summary. Without this the DJ chat got
-                // ZERO acknowledgment after `y` (the token path below already echoes an
-                // armed_line) - the bug this fixes.
-                (Some(cmd), _) => {
-                    conn.command(cmd).map(|_| Some(command_armed_line(&pending.steps)))
-                }
+                // DIRECT-COMMAND arm (the cc/DJ `plan add <dsl>` path): the daemon
+                // now returns the REAL execute-time outcome as a `result` pair for an
+                // immediate plan ("added N", "added 0 - no matches for X", "played X"),
+                // so the pane shows what ACTUALLY happened rather than the plan-asked
+                // count. Fall back to the plan-time armed line only for a deferred plan
+                // (no `result`), where nothing has executed yet.
+                (Some(cmd), _) => conn.command(cmd).map(|pairs| {
+                    Some(
+                        result_line_from_pairs(&pairs)
+                            .unwrap_or_else(|| command_armed_line(&pending.steps)),
+                    )
+                }),
                 (None, Some(token)) => {
                     conn.command(&format!("nl confirm {token}")).map(|pairs| {
                         pairs.iter().find(|(k, _)| k == "plan_id").map(|(_, v)| armed_line(v))

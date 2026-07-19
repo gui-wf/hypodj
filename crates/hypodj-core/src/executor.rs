@@ -32,8 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::clock::Clock;
 use crate::event::{DjEvent, DjEventKind, QueueId};
-use crate::handler::{FadeIntent, FadeRequest, HypodjHandler};
-use crate::mpd::{MpdCommand, MpdHandler};
+use crate::handler::{FadeIntent, FadeRequest, HypodjHandler, PlanOutcome};
 use crate::plan::{fires, Action, ArmedPlan, FadeIntentIr, Fire, PlanId, Resolved};
 use crate::player::PlayState;
 use crate::timer::{TimerGuard, TimerHandle};
@@ -348,8 +347,10 @@ async fn recv_mpsc(rx: &mut Option<mpsc::UnboundedReceiver<PlanId>>) -> Option<P
     }
 }
 
-/// Map a plan fade intent onto the handler's fade-native [`FadeRequest`].
-fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
+/// Map a plan fade intent onto the handler's fade-native [`FadeRequest`]. Shared
+/// with [`HypodjHandler::run_action_outcome`] (the `plan add` reporting path), which
+/// runs the SAME action dispatch inline.
+pub(crate) fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
     let dur = |s: f64| std::time::Duration::try_from_secs_f64(s).unwrap_or(std::time::Duration::from_millis(250));
     match ir {
         FadeIntentIr::Out { secs } => FadeRequest { intent: FadeIntent::Out, dur: dur(*secs), commit_logical: None },
@@ -374,54 +375,12 @@ fn map_fade(ir: &FadeIntentIr) -> FadeRequest {
     }
 }
 
-/// Execute one action against the existing primitives. Log-and-continue on error.
+/// Execute one action against the existing primitives via the SHARED dispatch
+/// ([`HypodjHandler::run_action_outcome`]). An arm-and-forget plan ignores the
+/// outcome except to log a failure (log-and-continue); the `plan add` reporting path
+/// threads the same outcome back to the client.
 async fn run_action(handler: Arc<HypodjHandler>, id: PlanId, action: Action) {
-    let r: Result<(), String> = match &action {
-        // Fade precedence: start_fade_spec IS the single FadeSlot. It validates
-        // before aborting and logs an autonomous takeover; an in-flight fade
-        // continues across a TrackStart (the executor never cancels/re-fires it).
-        Action::Fade(ir) => handler
-            .start_fade_spec(map_fade(ir))
-            .await
-            .map_err(|e| e.to_string()),
-        Action::Stop => {
-            handler.handle(MpdCommand::Stop).await;
-            Ok(())
-        }
-        Action::Pause => {
-            handler.handle(MpdCommand::Pause(Some(true))).await;
-            Ok(())
-        }
-        Action::SetVolume(v) => {
-            handler.handle(MpdCommand::SetVol(*v)).await;
-            Ok(())
-        }
-        // Strictly append-only: adds to the END of the queue and NEVER starts or
-        // jumps playback, matching the confirm/prompt contract ("append-only",
-        // "never starts/jumps"). Use Action::PlayNow to enqueue-then-start.
-        Action::Enqueue { selector, count } => {
-            handler.plan_enqueue(selector, *count).await.map(|_| ())
-        }
-        // Play a specific LIBRARY song NOW: enqueue-then-start (append + jump to the
-        // just-enqueued track). Non-destructive.
-        Action::PlayNow { selector, count } => {
-            handler.plan_play_now(selector, *count).await.map(|_| ())
-        }
-        // ONE atomic effect: enqueue? -> start-from-silence -> play -> WakeTo ramp.
-        // A single Action (not three timers) is what guarantees this order.
-        Action::Wake { selector, count } => {
-            handler.wake_now(selector.clone(), *count).await
-        }
-        // DETERMINISTIC queue edits: the selector resolves against the LIVE queue
-        // inside plan_queue_edit; a no-match is a clean no-op (count 0), never a
-        // wrong-target delete. Destructive ops reach here only past the confirm gate.
-        Action::Remove { .. }
-        | Action::Move { .. }
-        | Action::Clear { .. }
-        | Action::Play { .. }
-        | Action::Noop => handler.plan_queue_edit(&action).await.map(|_| ()),
-    };
-    if let Err(e) = r {
+    if let PlanOutcome::Failed(e) = handler.run_action_outcome(&action).await {
         tracing::error!(plan = id.0, error = %e, "plan action failed (log-and-continue)");
     }
 }

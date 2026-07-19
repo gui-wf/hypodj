@@ -68,6 +68,14 @@ pub fn split_echo(echo: &str) -> EchoParts {
     EchoParts { trust, steps, note }
 }
 
+/// Extract the `result` pair (the REAL execute-time outcome of a `plan add`'s
+/// immediate action - "added N", "added 0 - no matches for X", "played X", ...) from
+/// a `plan add` response, if the daemon supplied one. Preferred over [`armed_line`]:
+/// it reports what ACTUALLY happened, not the plan-asked count.
+pub fn result_line_from_pairs(pairs: &[(String, String)]) -> Option<String> {
+    pairs.iter().find(|(k, _)| k == "result").map(|(_, v)| v.clone())
+}
+
 /// Map a plan_id value to a short human "armed" line (never a raw "plan_id: 3").
 pub fn armed_line(plan_id: &str) -> String {
     format!("armed (plan {plan_id})")
@@ -178,6 +186,22 @@ mod tests {
     #[test]
     fn confirm_plan_id_map() {
         assert_eq!(armed_line("3"), "armed (plan 3)");
+    }
+
+    #[test]
+    fn result_line_extracted_when_present() {
+        // A `plan add` immediate response carries the REAL outcome as `result`.
+        let pairs = vec![
+            ("plan_id".to_string(), "7".to_string()),
+            ("result".to_string(), "added 0 - no matches for \"active but not head bumping\"".to_string()),
+        ];
+        assert_eq!(
+            result_line_from_pairs(&pairs).as_deref(),
+            Some("added 0 - no matches for \"active but not head bumping\"")
+        );
+        // A deferred (armed) plan has no result pair.
+        let armed_only = vec![("plan_id".to_string(), "8".to_string())];
+        assert_eq!(result_line_from_pairs(&armed_only), None);
     }
 
     #[test]
