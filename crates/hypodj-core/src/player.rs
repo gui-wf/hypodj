@@ -103,6 +103,33 @@ pub enum PlayerEvent {
         gain_db: f32,
         playing: bool,
     },
+    /// Live ICY/Icecast now-playing metadata for the current RAW STREAM entry,
+    /// scraped from mpv's `metadata` property map (keys `icy-name` / `icy-title`).
+    /// Fires once when mpv connects to the stream and again on every mid-stream ICY
+    /// title change (a new track on the station), so - unlike the ~20 Hz Viz /
+    /// TimePos taps - it is a LOW-RATE, per-track LABEL and rides the guaranteed
+    /// `blocking_send`, never a droppable `try_send`: a dropped now-playing line
+    /// would leave a stale title. `name` is the station (icy-name), `title` the
+    /// now-playing line (icy-title); either may be `None`. `queue_id` is the LATCHED
+    /// entry identity, so a consumer can only ever decorate the stream entry the
+    /// metadata belongs to. `NullPlayer` never emits it; a non-ICY stream never
+    /// fires it (the URL fallback stays).
+    StreamMetadata {
+        queue_id: Option<QueueId>,
+        name: Option<String>,
+        title: Option<String>,
+    },
+}
+
+/// Live now-playing metadata scraped from an HTTP ICY (Icecast/SHOUTcast) stream's
+/// `metadata` property. `name` is the station identity (icy-name); `title` is the
+/// current now-playing line (icy-title, an "Artist - Track" string). Either may be
+/// absent - a stream can advertise one without the other. Mirrors real MPD, which
+/// puts the station in `Name:` and the now-playing in `Title:`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamMeta {
+    pub name: Option<String>,
+    pub title: Option<String>,
 }
 
 /// Commands sent INTO the player actor. Each carries a `oneshot` for its reply,
@@ -725,6 +752,12 @@ fn mpv_actor(
     // read `lavfi.astats.Overall.RMS_level` / `Peak_level` off it. Do NOT observe the
     // sub-key path `af-metadata/viz/lavfi.astats...` - it fires no events (mpv regr).
     let _ = ectx.observe_property("af-metadata/viz", Format::Node, 2);
+    // Observe the whole `metadata` property map (reply-userdata id 3). For an HTTP
+    // ICY stream mpv surfaces the station under `icy-name` and the now-playing line
+    // under `icy-title` here, firing on connect and on every mid-stream title change.
+    // Read as a Node map exactly like af-metadata/viz above; a non-ICY source simply
+    // carries no icy-* keys and decodes to nothing.
+    let _ = ectx.observe_property("metadata", Format::Node, 3);
 
     let mut current: Option<SongId> = None;
     let mut current_qid: Option<QueueId> = None;
@@ -784,6 +817,27 @@ fn mpv_actor(
                             peak_db,
                             gain_db,
                             playing,
+                        });
+                    }
+                }
+            }
+            Some(Ok(Event::PropertyChange { name: "metadata", change, .. })) => {
+                // The `metadata` map fired. For an HTTP ICY stream it carries the
+                // now-playing under `icy-title` and the station under `icy-name`;
+                // decode both (case-insensitively) and push a LOSSLESS StreamMetadata.
+                // Unlike the cosmetic Viz / TimePos taps this is a low-rate, per-track
+                // LABEL - a dropped now-playing line would leave a stale title - so it
+                // rides blocking_send, never try_send. A node with neither icy key
+                // decodes to None and is a no-op: a plain, tagless stream (or a library
+                // track, whose tags are not icy-*) keeps the URL fallback untouched.
+                // Stamped with the latched `current_qid` so the handler can only ever
+                // decorate the entry the metadata belongs to.
+                if let libmpv2::events::PropertyData::Node(node) = change {
+                    if let Some(meta) = parse_icy_metadata(node) {
+                        let _ = evt_tx.blocking_send(PlayerEvent::StreamMetadata {
+                            queue_id: current_qid,
+                            name: meta.name,
+                            title: meta.title,
                         });
                     }
                 }
@@ -1196,6 +1250,54 @@ where
     }
 }
 
+/// Extract the live ICY station / now-playing from mpv's `metadata` node (a string
+/// map). An HTTP ICY stream advertises the station under `icy-name` and the current
+/// now-playing line under `icy-title`; mpv exposes both as lowercase keys in this
+/// map. Returns `None` when NEITHER icy key carries a non-empty value (a plain,
+/// tagless stream or a library track whose tags are not icy-*), so a non-ICY
+/// dispatch is a no-op and the URL fallback stays. The pure key-selection lives in
+/// [`select_icy_metadata`] (an MpvNodeMapIter cannot be built offline), mirroring
+/// [`parse_astats_levels`] / [`select_astats_levels`].
+pub(crate) fn parse_icy_metadata(node: libmpv2::mpv_node::MpvNode) -> Option<StreamMeta> {
+    let map = node.map()?;
+    select_icy_metadata(map.map(|(key, value)| {
+        let s = match value {
+            libmpv2::mpv_node::MpvNode::String(s) => Some(s),
+            _ => None,
+        };
+        (key, s)
+    }))
+}
+
+/// Pure key-selection over decoded `(key, Option<String> value)` pairs: pick the
+/// ICY station (`icy-name` -> `name`) and now-playing (`icy-title` -> `title`),
+/// matching keys case-insensitively and trimming surrounding whitespace. A blank
+/// value is treated as absent. Returns `None` when neither key yields a value, so a
+/// dead / non-ICY node never fires a bogus StreamMetadata.
+fn select_icy_metadata<I>(pairs: I) -> Option<StreamMeta>
+where
+    I: IntoIterator<Item = (String, Option<String>)>,
+{
+    let mut name: Option<String> = None;
+    let mut title: Option<String> = None;
+    for (key, value) in pairs {
+        let Some(value) = value else { continue };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("icy-name") {
+            name = Some(trimmed.to_string());
+        } else if key.eq_ignore_ascii_case("icy-title") {
+            title = Some(trimmed.to_string());
+        }
+    }
+    match (name, title) {
+        (None, None) => None,
+        (name, title) => Some(StreamMeta { name, title }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,6 +1341,51 @@ mod tests {
         // No overall level at all -> None (only per-channel keys present).
         assert!(select_astats_levels(vec![
             ("lavfi.astats.1.RMS_level".to_string(), Some(-3.0f32)),
+        ])
+        .is_none());
+    }
+
+    // The ICY selector reads `icy-name` -> station and `icy-title` -> now-playing
+    // out of a metadata map, case-insensitively, trims blanks, and returns None when
+    // neither icy key is present (a plain / non-ICY node) so a dispatch is a no-op.
+    #[test]
+    fn parse_icy_metadata_picks_station_and_title() {
+        // A realistic mpv `metadata` map for an ICY stream also carries non-icy keys
+        // (codec, etc.); the selector must ignore those and read only the icy-* pair.
+        let pairs = vec![
+            ("icy-br".to_string(), Some("128".to_string())),
+            ("icy-name".to_string(), Some("NTS 1".to_string())),
+            ("icy-title".to_string(), Some("Floating Points - Last Bloom".to_string())),
+        ];
+        let meta = select_icy_metadata(pairs).expect("icy keys present");
+        assert_eq!(meta.name.as_deref(), Some("NTS 1"));
+        assert_eq!(meta.title.as_deref(), Some("Floating Points - Last Bloom"));
+
+        // Case-insensitive key match + whitespace trim (some servers pad values).
+        let mixed = vec![
+            ("ICY-Name".to_string(), Some("  Radio X  ".to_string())),
+            ("Icy-Title".to_string(), Some("Artist - Track".to_string())),
+        ];
+        let meta = select_icy_metadata(mixed).expect("case-insensitive icy keys");
+        assert_eq!(meta.name.as_deref(), Some("Radio X"));
+        assert_eq!(meta.title.as_deref(), Some("Artist - Track"));
+
+        // Only one of the two present -> the other stays None.
+        let title_only = select_icy_metadata(vec![
+            ("icy-title".to_string(), Some("Just A Track".to_string())),
+        ])
+        .expect("lone icy-title still yields metadata");
+        assert_eq!(title_only.name, None);
+        assert_eq!(title_only.title.as_deref(), Some("Just A Track"));
+
+        // Neither icy key (or only blanks) -> None, so a non-ICY node is a no-op.
+        assert!(select_icy_metadata(vec![
+            ("title".to_string(), Some("an id3 title, not icy".to_string())),
+            ("artist".to_string(), Some("an id3 artist".to_string())),
+        ])
+        .is_none());
+        assert!(select_icy_metadata(vec![
+            ("icy-name".to_string(), Some("   ".to_string())),
         ])
         .is_none());
     }
@@ -1458,6 +1605,55 @@ mod tests {
             (hi - lo) > 1.0,
             "the ramped tone must make RMS CHANGE over time (lo={lo}, hi={hi}): {rms_samples:?}"
         );
+    }
+
+    // LIVE empirical proof of the radio ICY metadata tap (task jmrwr99): drive the
+    // REAL MpvPlayer actor at the exact NTS mixtape5 URL Guilherme hit, with audio
+    // forced to Null (the ICY now-playing arrives over the HTTP sidechannel, so
+    // silence still populates it), and assert a PlayerEvent::StreamMetadata carrying a
+    // non-empty station name AND/OR now-playing title arrives once mpv connects. This
+    // pins that `observe_property("metadata")` + parse_icy_metadata actually surface a
+    // live station's icy-name / icy-title end to end. Ignored by default (needs a real
+    // libmpv runtime AND network, both absent in the link-isolated Nix build sandbox);
+    // run with:
+    //   cargo test -p hypodj-core -- --ignored live_mpv_icy_metadata_populates
+    #[test]
+    #[ignore = "needs a real libmpv runtime + network; run manually to confirm the ICY metadata tap"]
+    fn live_mpv_icy_metadata_populates() {
+        let url = "https://stream-mixtape-geo.ntslive.net/mixtape5";
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            player
+                .play_url(None, Some(QueueId(1)), url)
+                .await
+                .expect("play NTS stream");
+
+            // Give mpv time to connect + receive the first ICY metadata dispatch.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut got: Option<StreamMeta> = None;
+            while std::time::Instant::now() < deadline {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await {
+                    Ok(Some(PlayerEvent::StreamMetadata { queue_id, name, title })) => {
+                        assert_eq!(queue_id, Some(QueueId(1)), "metadata is stamped with the latched qid");
+                        if name.is_some() || title.is_some() {
+                            got = Some(StreamMeta { name, title });
+                            break;
+                        }
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            let meta = got.expect("a StreamMetadata with a station name or now-playing title arrives");
+            eprintln!("live NTS ICY metadata: name={:?} title={:?}", meta.name, meta.title);
+            assert!(
+                meta.name.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+                    || meta.title.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
+                "at least one of station name / now-playing title is non-empty"
+            );
+        });
     }
 
     // The warm-skip surface over the headless actor: prefetch_warm is a graceful

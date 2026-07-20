@@ -58,6 +58,7 @@ use crate::mpd::{
 };
 use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
+    StreamMeta,
 };
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
@@ -204,6 +205,15 @@ struct State {
     /// from a fixed non-zero constant in Default and the wall clock in the
     /// constructor; tests pin it directly.
     vol_dither_state: u64,
+    /// LIVE ICY now-playing metadata for the current RAW STREAM entry, keyed by the
+    /// LATCHED [`QueueId`] it belongs to, or `None` at rest / for a library track.
+    /// Set from the lossless `PlayerEvent::StreamMetadata` spine arm (via
+    /// [`HypodjHandler::set_stream_meta`]) and read by `currentsong` to surface the
+    /// station in `Name:` and the now-playing line in `Title:` instead of the raw
+    /// URL. The qid key means it can ONLY decorate the entry it came from - a library
+    /// song never inherits a station's label and a stale slot from a prior stream
+    /// never leaks onto a new entry. EPHEMERAL: never persisted to resume.toml.
+    stream_meta: Option<(QueueId, StreamMeta)>,
 }
 
 /// Which pertinence branch a [`Handler::seed_source`] resolution landed on - the
@@ -312,6 +322,8 @@ impl Default for State {
             // A fixed non-zero default seed for the glide dither; production seeds
             // it from the wall clock at construction, tests pin it directly.
             vol_dither_state: 0x8B7F_A1C2_D3E4_F506,
+            // No live stream metadata until a stream connects and pushes ICY tags.
+            stream_meta: None,
         }
     }
 }
@@ -2895,6 +2907,36 @@ impl HypodjHandler {
         MpdResponse::ok()
     }
 
+    /// Store the LIVE ICY metadata for the raw stream identified by `queue_id`
+    /// (delivered on the lossless `PlayerEvent::StreamMetadata` spine), then wake
+    /// idling clients so ncmpcpp / dj-gui re-read `currentsong` and see the fresh
+    /// station Name / now-playing Title. The `std` state lock is held ONLY for the
+    /// field write and dropped BEFORE `notify_change`, so it is never held across an
+    /// await (the Mutex-never-across-await invariant); State is mutated through
+    /// interior mutability (`&self`), never `&mut self`. Keyed by the latched
+    /// identity so the slot can only ever decorate the entry it came from.
+    pub(crate) fn set_stream_meta(&self, queue_id: QueueId, name: Option<String>, title: Option<String>) {
+        {
+            let mut st = self.state.lock().unwrap();
+            st.stream_meta = Some((queue_id, StreamMeta { name, title }));
+        }
+        self.notify_change();
+    }
+
+    /// Drop any stored live stream metadata that does NOT belong to `keep`, called on
+    /// every play edge / stop so a station's Name/Title can never linger onto the next
+    /// track. Passing `Some(qid)` keeps the slot when it matches (a mid-stream ICY
+    /// title change on the SAME entry survives); passing `None` clears unconditionally
+    /// (stop / end of queue). A pure field write under a brief lock, no await held.
+    pub(crate) fn clear_stream_meta_except(&self, keep: Option<QueueId>) {
+        let mut st = self.state.lock().unwrap();
+        if let Some((qid, _)) = &st.stream_meta {
+            if keep != Some(*qid) {
+                st.stream_meta = None;
+            }
+        }
+    }
+
     fn notify_change(&self) {
         // Republish the level-triggered resync snapshot on EVERY mutation, so a
         // queue change made off the player-event path (add/delete/clear/move) is
@@ -4516,6 +4558,27 @@ fn song_pairs(item: &QueueItem, pos: usize) -> Vec<(String, String)> {
     p
 }
 
+/// Overlay a raw stream's LIVE ICY metadata onto its rendered `currentsong` pairs:
+/// replace the `Title` (the URL fallback from [`song_pairs`]) with the ICY
+/// now-playing line when present, and add a `Name` with the station (icy-name),
+/// matching real MPD's convention (Name: = station, Title: = now-playing). A `None`
+/// field leaves that pair untouched (the URL Title stays), so a stream advertising
+/// only one of the two still surfaces what it has. The caller gates this to a
+/// [`QueueEntry::Stream`] whose id matches the stored slot, so a library song can
+/// never inherit a station's label.
+fn apply_stream_meta(pairs: &mut Vec<(String, String)>, meta: &StreamMeta) {
+    if let Some(title) = &meta.title {
+        if let Some(slot) = pairs.iter_mut().find(|(k, _)| k == "Title") {
+            slot.1 = title.clone();
+        } else {
+            pairs.push(("Title".to_string(), title.clone()));
+        }
+    }
+    if let Some(name) = &meta.name {
+        pairs.push(("Name".to_string(), name.clone()));
+    }
+}
+
 /// Build the join-relevant [`EntrySnapshot`] for one queue item. A raw stream
 /// has no album and no known duration (both `None`, honestly - never `0`). A
 /// duration-less song is `None` too, never `0`-as-unknown.
@@ -4692,7 +4755,22 @@ impl MpdHandler for HypodjHandler {
             MpdCommand::CurrentSong => {
                 let st = self.state.lock().unwrap();
                 match st.reported_current().and_then(|i| st.queue.get(i).map(|it| (i, it))) {
-                    Some((pos, item)) => MpdResponse::Pairs(song_pairs(item, pos)),
+                    Some((pos, item)) => {
+                        let mut pairs = song_pairs(item, pos);
+                        // Decorate a RAW STREAM's current row with its LIVE ICY metadata
+                        // (station -> Name, now-playing -> Title, replacing the URL
+                        // fallback), but ONLY when the stored slot's identity matches this
+                        // exact entry - so a library song never inherits a station label
+                        // and a stale slot from a prior stream never leaks onto a new one.
+                        if matches!(item.entry, QueueEntry::Stream { .. }) {
+                            if let Some((qid, meta)) = &st.stream_meta {
+                                if *qid == QueueId(item.id) {
+                                    apply_stream_meta(&mut pairs, meta);
+                                }
+                            }
+                        }
+                        MpdResponse::Pairs(pairs)
+                    }
                     None => MpdResponse::ok(),
                 }
             }
@@ -7881,6 +7959,107 @@ mod tests {
         // stream item.
         let status = render(h.handle(MpdCommand::Status).await);
         assert!(status.iter().any(|(k, v)| k == "state" && v == "play"));
+    }
+
+    // A raw stream's LIVE ICY metadata surfaces in currentsong: the station lands in
+    // Name: and the now-playing line REPLACES the URL in Title:, while file: stays the
+    // raw URL and there is still no Time/duration. Matches real MPD's convention.
+    #[tokio::test]
+    async fn currentsong_stream_applies_live_name_and_title() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        // The lossless PlayerEvent::StreamMetadata equivalent: mpv connected and read
+        // the station (icy-name) + now-playing (icy-title) off the stream.
+        h.set_stream_meta(
+            QueueId(qid),
+            Some("NTS 1".to_string()),
+            Some("Floating Points - Track".to_string()),
+        );
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Title" && v == "Floating Points - Track"),
+            "Title is the live now-playing (icy-title), not the URL: {cur:?}"
+        );
+        assert!(
+            cur.iter().any(|(k, v)| k == "Name" && v == "NTS 1"),
+            "Name is the station (icy-name): {cur:?}"
+        );
+        assert!(cur.iter().any(|(k, v)| k == "file" && v == NTS), "file: stays the raw URL");
+        assert!(!cur.iter().any(|(k, v)| k == "Title" && v == NTS), "the URL no longer shows as Title");
+        assert!(!cur.iter().any(|(k, _)| k == "Time"), "a live stream still has no Time/duration");
+    }
+
+    // The qid gate + library-untouched: metadata stored for the STREAM's qid never
+    // decorates a DIFFERENT current entry - here a library song. It keeps its own
+    // title and carries no station Name.
+    #[tokio::test]
+    async fn stream_meta_ignored_for_wrong_qid_and_library_song() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid_stream = h.enqueue_stream_for_test(NTS).await; // qid A (a Stream)
+        h.enqueue_song_for_test(playlist_test_song("lib")).await; // qid B (a Song)
+        // Store live metadata for the STREAM's qid, but play the LIBRARY song.
+        h.set_stream_meta(QueueId(qid_stream), Some("NTS 1".to_string()), Some("Live A".to_string()));
+        h.play_for_test(1).await;
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Title" && v == "Song lib"),
+            "the library song keeps its OWN title: {cur:?}"
+        );
+        assert!(cur.iter().any(|(k, v)| k == "file" && v == "song/lib"));
+        assert!(!cur.iter().any(|(k, _)| k == "Name"), "a library song never inherits a station Name");
+    }
+
+    // Stale-clear: a play edge to a DIFFERENT entry drops the stored slot (mirroring
+    // the director's clear_stream_meta_except on StateChanged(Playing) with a new
+    // qid), so the station label never lingers onto the next stream; a same-qid clear
+    // (a mid-stream ICY title change) KEEPS the slot.
+    #[tokio::test]
+    async fn stream_meta_cleared_on_track_change() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let other = "https://example.com/other-stream.mp3";
+        let qid_a = h.enqueue_stream_for_test(NTS).await;
+        let qid_b = h.enqueue_stream_for_test(other).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid_a), Some("NTS 1".to_string()), Some("Live A".to_string()));
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        // Sanity: A is decorated with its live line.
+        let cur_a = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(cur_a.iter().any(|(k, v)| k == "Title" && v == "Live A"));
+
+        // A same-qid clear (mid-stream title change on A) must KEEP the slot.
+        h.clear_stream_meta_except(Some(QueueId(qid_a)));
+        let cur_still = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur_still.iter().any(|(k, v)| k == "Name" && v == "NTS 1"),
+            "a same-qid clear keeps the slot: {cur_still:?}"
+        );
+
+        // A play edge to a DIFFERENT entry clears the stale slot; B then falls back to
+        // its URL Title with no leaked station Name.
+        h.clear_stream_meta_except(Some(QueueId(qid_b)));
+        h.play_for_test(1).await;
+        let cur_b = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(cur_b.iter().any(|(k, v)| k == "file" && v == other));
+        assert!(
+            cur_b.iter().any(|(k, v)| k == "Title" && v == other),
+            "B falls back to its own URL Title: {cur_b:?}"
+        );
+        assert!(!cur_b.iter().any(|(k, _)| k == "Name"), "no stale station Name leaks onto B");
     }
 
     // Idle guard: a running daemon with an empty queue and no current song MUST

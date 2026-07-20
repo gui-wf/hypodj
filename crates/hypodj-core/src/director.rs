@@ -418,6 +418,10 @@ async fn spine<C: Clock>(
                         if let Some(qid) = qid {
                             pubr.on_playing(qid, song);
                         }
+                        // Drop any prior stream's live ICY label unless this is the SAME
+                        // entry (a mid-stream title change re-lands on the same qid): a
+                        // new track must not inherit the outgoing stream's Name/Title.
+                        handler.clear_stream_meta_except(qid);
                     }
                     PlayerEvent::TimePos { pos, queue_id } => {
                         // Attribute on IDENTITY: a frame whose queue_id does not
@@ -469,6 +473,9 @@ async fn spine<C: Clock>(
                     }
                     PlayerEvent::StateChanged(PlayState::Stopped, _, _) => {
                         pubr.on_stopped();
+                        // Nothing is playing: clear any lingering stream label so a later
+                        // currentsong on a re-queued entry never shows a stale now-playing.
+                        handler.clear_stream_meta_except(None);
                     }
                     PlayerEvent::Viz { rms_db, peak_db, gain_db, playing } => {
                         // Cosmetic level sample: republish on the DEDICATED viz
@@ -482,6 +489,16 @@ async fn spine<C: Clock>(
                         // populate the TrackRef so the Paused DjEvent identifies its
                         // track. (The scrobbler already saw it.)
                         pubr.on_paused(qid, song);
+                    }
+                    PlayerEvent::StreamMetadata { queue_id, name, title } => {
+                        // LIVE ICY now-playing for the current raw stream: store it on the
+                        // handler keyed by the latched identity so `currentsong` surfaces
+                        // the station Name / now-playing Title instead of the raw URL.
+                        // set_stream_meta calls notify_change, waking an idling client to
+                        // re-read. A None queue_id is unattributable and dropped.
+                        if let Some(qid) = queue_id {
+                            handler.set_stream_meta(qid, name, title);
+                        }
                     }
                 }
             }
