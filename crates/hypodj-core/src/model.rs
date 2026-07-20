@@ -186,6 +186,24 @@ pub struct Playlist {
     pub songs: Vec<Song>,
 }
 
+/// A saved internet radio station id (Subsonic station id). Distinct newtype from
+/// [`SongId`]/[`PlaylistId`] so a station id can never cross into a media or
+/// playlist call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StationId(pub String);
+
+/// A saved internet radio station (Subsonic getInternetRadioStations row): a raw
+/// stream URL played verbatim, plus its display name and an optional homepage.
+/// Distinct from the synthetic algorithmic `Radio` browse dir (random/similar/top);
+/// this is a persisted station the user can save, browse, and play by URL or name.
+#[derive(Debug, Clone)]
+pub struct Station {
+    pub id: StationId,
+    pub name: String,
+    pub stream_url: String,
+    pub home_page_url: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

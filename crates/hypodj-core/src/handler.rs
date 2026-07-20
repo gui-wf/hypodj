@@ -44,7 +44,7 @@ use crate::intelligence::{
     lexicon_pull, pull_reweight, FeatureStore, MetadataStore, Pull, PullField, TrackFeatures,
     LEXICON_PULL_STRENGTH,
 };
-use crate::model::{AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId};
+use crate::model::{AlbumId, ArtistId, Favorite, Genre, Playlist, QueueEntry, Song, SongId, Station};
 use crate::plan::{
     clamp_raw, validate, Action, ArmedPlan, FadeIntentIr, PlanBounds, PlanError, PlanId, RawPlan,
     RawTrigger, Resolved, Selector, ORIGIN_SLEEP, ORIGIN_WAKE, ORIGIN_WINDDOWN,
@@ -2962,6 +2962,19 @@ impl HypodjHandler {
             .collect()
     }
 
+    /// The default label for saving `url` as an internet radio station: the LIVE
+    /// icy-name of the currently-playing stream when it is THIS url, else the url
+    /// itself (the NTS-mixtape no-ICY case). Reads State ONCE under the std lock and
+    /// resolves into an OWNED String before returning, so the caller never holds the
+    /// lock across the create await (Mutex-never-across-await). The qid-gated pure
+    /// [`resolve_station_name`] owns the fallback chain so it is unit-testable
+    /// without a lock or a network.
+    fn default_station_name(&self, url: &str) -> String {
+        let st = self.state.lock().unwrap();
+        let current = st.reported_current().and_then(|idx| st.queue.get(idx));
+        resolve_station_name(url, current, st.stream_meta.as_ref())
+    }
+
     /// Append one song to a REAL named Navidrome playlist, create-or-append: if a
     /// playlist with `name` already exists, `updatePlaylist` adds the song to it;
     /// otherwise `createPlaylist` mints a new one seeded with the song. Backs the
@@ -4482,6 +4495,26 @@ impl HypodjHandler {
             self.arm_fresh_enqueue_anchor(first);
             return Ok(first);
         }
+        // A `station/<name>` uri enqueues a SAVED internet radio station BY NAME:
+        // resolve the name to its raw stream URL (case-insensitive) via the live
+        // station set, then fall through to the raw-stream push below. The list
+        // fetch is an await, so it happens BEFORE the std lock is ever taken (never
+        // across it). The URL is the station's identity; the name is recovered live
+        // from ICY (stream_meta) or falls back to the URL Title, exactly like any
+        // raw stream - so `add station/<name>` then `play` plays it by name.
+        let resolved_station_url;
+        let uri = if let Some(name) = uri.strip_prefix("station/") {
+            let stations = self
+                .client
+                .get_internet_radio_stations()
+                .await
+                .map_err(|e| e.to_string())?;
+            resolved_station_url = station_url_for_name(&stations, name)
+                .ok_or_else(|| format!("no such station: {name}"))?;
+            resolved_station_url.as_str()
+        } else {
+            uri
+        };
         let entry = if is_stream_uri(uri) {
             // Title is the URL (a stream's icy-name is only known once mpv
             // connects; the URL is a sensible, always-available label).
@@ -5132,6 +5165,33 @@ impl MpdHandler for HypodjHandler {
                     None => ack(ACK_ERROR_NO_EXIST, "playlistadd", "unsupported uri"),
                 }
             }
+            MpdCommand::PlaylistAdd(name, uri) if name == "Stations" => {
+                // `playlistadd Stations <streamUrl>` saves <streamUrl> as a NEW
+                // Navidrome internet radio station (task cchte88), mirroring the
+                // `Starred` sentinel the codebase already blesses. The default label
+                // reuses the LIVE icy-name of the currently-playing stream when it is
+                // THIS url (stream_meta from jmrwr99), else falls back to the raw URL
+                // (the NTS-mixtape no-ICY case). A non-http uri fails LOUD rather than
+                // creating a garbage station.
+                let uri = uri.trim();
+                if !is_stream_uri(uri) {
+                    return ack(ACK_ERROR_NO_EXIST, "playlistadd", "not a stream url");
+                }
+                // Compute the default name under the std lock, dropping it BEFORE the
+                // network await (Mutex-never-across-await), exactly like `save`.
+                let station_name = self.default_station_name(uri);
+                match self
+                    .client
+                    .create_internet_radio_station(uri, &station_name, None)
+                    .await
+                {
+                    Ok(()) => {
+                        self.notify_change();
+                        MpdResponse::ok()
+                    }
+                    Err(e) => ack(ACK_ERROR_UNKNOWN, "playlistadd", &e.to_string()),
+                }
+            }
             MpdCommand::PlaylistAdd(name, uri) => {
                 // Non-`Starred`: append the resolved song to a REAL Navidrome
                 // playlist, create-or-append by name (GAP cusq3zaw). Map the MPD
@@ -5531,8 +5591,8 @@ impl HypodjHandler {
     }
 
     /// Back `lsinfo` / `listallinfo`. The root lists the artist directories PLUS
-    /// the synthetic top-level browse dirs (Genres/Lists/Radio/Starred). Drilling
-    /// into each dispatches to the feature that backs it.
+    /// the synthetic top-level browse dirs (Genres/Lists/Radio/Starred/Stations).
+    /// Drilling into each dispatches to the feature that backs it.
     async fn lsinfo(&self, path: Option<&str>) -> MpdResponse {
         match path {
             None | Some("") | Some("/") => self.lsinfo_root().await,
@@ -5739,6 +5799,20 @@ impl HypodjHandler {
                 Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
             },
 
+            // ── Stations: saved internet radio (task cchte88) - NEVER cached ─
+            // Each station renders as a `file:` row whose value IS the raw stream
+            // URL, plus Title + Name = the station name (real MPD radio convention,
+            // matching apply_stream_meta). Because the `file:` value is the http(s)
+            // stream URL, ncmpcpp add/play of the row sends `add <url>` / `addid
+            // <url>`, which funnels straight through enqueue_uri -> QueueEntry::Stream
+            // with zero new play plumbing; live ICY then overrides the label. An
+            // empty set is a well-formed empty Pairs, never an ACK (same as an empty
+            // Starred).
+            Some("Stations") => match self.client.get_internet_radio_stations().await {
+                Ok(stations) => station_rows(&stations),
+                Err(e) => ack(ACK_ERROR_UNKNOWN, "lsinfo", &e.to_string()),
+            },
+
             Some(_) => MpdResponse::ok(),
         }
     }
@@ -5747,7 +5821,7 @@ impl HypodjHandler {
     async fn lsinfo_root(&self) -> MpdResponse {
         let mut pairs = Vec::new();
         // Synthetic feature dirs first so they sit at the top of ncmpcpp Browse.
-        for d in ["Genres", "Lists", "Radio", "Starred"] {
+        for d in ["Genres", "Lists", "Radio", "Starred", "Stations"] {
             pairs.push(("directory".to_string(), d.to_string()));
         }
         match self.cached_artists().await {
@@ -6243,6 +6317,71 @@ fn song_rows(songs: &[Song]) -> MpdResponse {
     MpdResponse::Pairs(pairs)
 }
 
+/// Serialize saved internet radio stations as MPD browse rows (task cchte88). An
+/// empty slice yields an empty-but-well-formed `Pairs` response, never an ACK.
+fn station_rows(stations: &[Station]) -> MpdResponse {
+    let mut pairs = Vec::new();
+    for s in stations {
+        pairs.extend(station_browse_pairs(s));
+    }
+    MpdResponse::Pairs(pairs)
+}
+
+/// Browse pairs for one station: `file:` is the RAW STREAM URL (so add/play of the
+/// row funnels through the stream path with no new plumbing), and both `Title:` and
+/// `Name:` carry the station name (real MPD radio convention, matching
+/// [`apply_stream_meta`]). No Time/duration - a live stream has none.
+fn station_browse_pairs(s: &Station) -> Vec<(String, String)> {
+    vec![
+        ("file".to_string(), s.stream_url.clone()),
+        ("Title".to_string(), s.name.clone()),
+        ("Name".to_string(), s.name.clone()),
+    ]
+}
+
+/// Resolve a saved station's raw stream URL by NAME, matching case-insensitively
+/// (ASCII), or `None` when no station carries that name. Pure (no network, no lock)
+/// so the by-name resolution is unit-testable; the caller does the
+/// getInternetRadioStations fetch. Backs `add station/<name>` (and thus `play` of a
+/// station by name) via [`enqueue_uri`](HypodjHandler::enqueue_uri).
+fn station_url_for_name(stations: &[Station], name: &str) -> Option<String> {
+    stations
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(name))
+        .map(|s| s.stream_url.clone())
+}
+
+/// The default label for saving `url` as an internet radio station, given the
+/// currently-reported queue item and the stored live stream-metadata slot. The
+/// fallback chain: the LIVE icy-name (only when `current` is a [`QueueEntry::Stream`]
+/// whose url equals `url` AND the `stream_meta` slot is keyed to THAT entry's qid and
+/// carries a non-empty name) -> else the raw `url`. The qid gate mirrors the
+/// `currentsong` decoration so a stale slot from a prior stream never mislabels the
+/// save; a library-song current or a url mismatch also falls back to the url. Pure
+/// (no lock, no network) so the save-default logic is unit-testable directly.
+fn resolve_station_name(
+    url: &str,
+    current: Option<&QueueItem>,
+    stream_meta: Option<&(QueueId, StreamMeta)>,
+) -> String {
+    if let Some(item) = current {
+        if let QueueEntry::Stream { url: cur_url, .. } = &item.entry {
+            if cur_url == url {
+                if let Some((qid, meta)) = stream_meta {
+                    if *qid == QueueId(item.id) {
+                        if let Some(name) = &meta.name {
+                            if !name.trim().is_empty() {
+                                return name.clone();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    url.to_string()
+}
+
 /// Serialize a `Song` as a browse `file:` entry (no queue Pos/Id), including the
 /// richer metadata tags (feature 7) when present. ncmpcpp reads these directly.
 fn browse_song_pairs(s: &Song) -> Vec<(String, String)> {
@@ -6308,6 +6447,7 @@ fn push_song_tags(p: &mut Vec<(String, String)>, s: &Song) {
 mod tests {
     use super::*;
     use crate::config::ServerConfig;
+    use crate::model::StationId;
     use crate::player::{NullPlayer, PlayState, PlayerEvent, SYNTH_FLOOR_DB};
     use crate::scrobble::Scrobbler;
 
@@ -8018,6 +8158,118 @@ mod tests {
         );
         assert!(cur.iter().any(|(k, v)| k == "file" && v == "song/lib"));
         assert!(!cur.iter().any(|(k, _)| k == "Name"), "a library song never inherits a station Name");
+    }
+
+    // ── saved internet radio stations (task cchte88) ───────────────────────
+
+    #[test]
+    fn save_station_defaults_name_to_icy_when_present() {
+        // A currently-playing stream whose stream_meta (keyed to its qid) carries an
+        // icy-name: saving THAT url defaults the label to the live station name.
+        let item = QueueItem {
+            id: 7,
+            entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        };
+        let meta = (
+            QueueId(7),
+            StreamMeta { name: Some("NTS 1".to_string()), title: Some("Floating Points".to_string()) },
+        );
+        assert_eq!(resolve_station_name(NTS, Some(&item), Some(&meta)), "NTS 1");
+    }
+
+    #[test]
+    fn save_station_falls_back_to_url_when_no_icy() {
+        // The NTS-mixtape case: the stream carries no ICY name, so the default label
+        // falls back to the raw URL - both when the slot exists with name None and
+        // when there is no stored slot at all.
+        let item = QueueItem {
+            id: 7,
+            entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        };
+        let no_name = (QueueId(7), StreamMeta { name: None, title: None });
+        assert_eq!(resolve_station_name(NTS, Some(&item), Some(&no_name)), NTS);
+        assert_eq!(resolve_station_name(NTS, Some(&item), None), NTS);
+        // An empty/whitespace icy-name must not become the label either.
+        let blank = (QueueId(7), StreamMeta { name: Some("   ".to_string()), title: None });
+        assert_eq!(resolve_station_name(NTS, Some(&item), Some(&blank)), NTS);
+    }
+
+    #[test]
+    fn save_station_name_ignores_wrong_qid_stream_meta() {
+        // stream_meta keyed to a DIFFERENT qid must not label this save (mirrors the
+        // currentsong qid gate); a library-song current or a url mismatch also falls
+        // back to the raw URL.
+        let stream = QueueItem {
+            id: 7,
+            entry: QueueEntry::Stream { url: NTS.to_string(), title: NTS.to_string() },
+        };
+        let wrong_qid = (QueueId(99), StreamMeta { name: Some("Wrong".to_string()), title: None });
+        assert_eq!(resolve_station_name(NTS, Some(&stream), Some(&wrong_qid)), NTS);
+
+        // A library-song current never yields a station name.
+        let song = QueueItem { id: 7, entry: QueueEntry::Song(playlist_test_song("lib")) };
+        let meta = (QueueId(7), StreamMeta { name: Some("X".to_string()), title: None });
+        assert_eq!(resolve_station_name(NTS, Some(&song), Some(&meta)), NTS);
+
+        // A stream playing a DIFFERENT url than the one being saved falls back.
+        let other = QueueItem {
+            id: 7,
+            entry: QueueEntry::Stream {
+                url: "https://example.com/other".to_string(),
+                title: "x".to_string(),
+            },
+        };
+        assert_eq!(resolve_station_name(NTS, Some(&other), Some(&meta)), NTS);
+
+        // Nothing playing at all -> the url.
+        assert_eq!(resolve_station_name(NTS, None, None), NTS);
+    }
+
+    #[test]
+    fn lsinfo_stations_renders_file_rows() {
+        // Each station is a `file:` row = stream url, plus Title + Name = the station
+        // name, and the response is a well-formed Pairs (never an ACK). Name -> URL
+        // resolution (case-insensitive) for play-by-name is asserted here too.
+        let stations = vec![
+            Station {
+                id: StationId("ir-1".into()),
+                name: "NTS 1".into(),
+                stream_url: "https://n/1".into(),
+                home_page_url: None,
+            },
+            Station {
+                id: StationId("ir-2".into()),
+                name: "NTS 2".into(),
+                stream_url: "https://n/2".into(),
+                home_page_url: Some("https://nts.live".into()),
+            },
+        ];
+        let pairs = match station_rows(&stations) {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        assert!(pairs.iter().any(|(k, v)| k == "file" && v == "https://n/1"));
+        assert!(pairs.iter().any(|(k, v)| k == "Title" && v == "NTS 1"));
+        assert!(pairs.iter().any(|(k, v)| k == "Name" && v == "NTS 1"));
+        assert!(pairs.iter().any(|(k, v)| k == "file" && v == "https://n/2"));
+        assert!(pairs.iter().any(|(k, v)| k == "Name" && v == "NTS 2"));
+        // A stream row must carry no Time/duration.
+        assert!(!pairs.iter().any(|(k, _)| k == "Time"));
+
+        // Name -> URL resolution is case-insensitive.
+        assert_eq!(station_url_for_name(&stations, "nts 1").as_deref(), Some("https://n/1"));
+        assert_eq!(station_url_for_name(&stations, "NTS 2").as_deref(), Some("https://n/2"));
+        assert_eq!(station_url_for_name(&stations, "nope"), None);
+    }
+
+    #[test]
+    fn lsinfo_stations_empty_is_well_formed_pairs_not_ack() {
+        // An empty station set surfaces as an empty-but-well-formed Pairs, never an
+        // ACK (same as an empty Starred), so ncmpcpp's blocking lsinfo never breaks.
+        match station_rows(&[]) {
+            MpdResponse::Pairs(p) => assert!(p.is_empty()),
+            other => panic!("expected empty Pairs, got {other:?}"),
+        }
     }
 
     // Stale-clear: a play edge to a DIFFERENT entry drops the stored slot (mirroring

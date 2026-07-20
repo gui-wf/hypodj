@@ -22,7 +22,8 @@ use std::collections::HashSet;
 
 use crate::config::ServerConfig;
 use crate::model::{
-    Album, AlbumId, Artist, ArtistId, Favorite, Genre, Playlist, PlaylistId, Song, SongId,
+    Album, AlbumId, Artist, ArtistId, Favorite, Genre, Playlist, PlaylistId, Song, SongId, Station,
+    StationId,
 };
 use opensubsonic::{AlbumListType, data};
 use url::Url;
@@ -603,6 +604,74 @@ impl SubsonicClient {
             .await
             .map_err(|e| SubsonicError::Request(e.to_string()))
     }
+
+    // ── internet radio stations (task cchte88: save + surface stations) ─────
+    //
+    // The CORE Subsonic Internet Radio endpoints (getInternetRadioStations /
+    // createInternetRadioStation / updateInternetRadioStation /
+    // deleteInternetRadioStation), NOT the synthetic algorithmic `Radio` browse
+    // dir the handler keeps for random/similar/top. `SubsonicClient` stays the one
+    // file that touches the opensubsonic wire types; each wire
+    // `data::InternetRadioStation` is decomposed to our `Station` at this boundary.
+
+    /// All of the user's saved internet radio stations (Subsonic
+    /// `getInternetRadioStations`). NEVER cached here - the handler owns any
+    /// caching, and the Stations browse dir wants the freshest set right after a
+    /// create/delete. Each wire row maps through the shared [`map_station`].
+    pub async fn get_internet_radio_stations(&self) -> Result<Vec<Station>, SubsonicError> {
+        let stations = self
+            .inner
+            .get_internet_radio_stations()
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))?;
+        Ok(stations.into_iter().map(map_station).collect())
+    }
+
+    /// Create a NEW internet radio station from a raw stream URL, a display name,
+    /// and an optional homepage (Subsonic `createInternetRadioStation`). NOTE the
+    /// upstream returns `()`, NOT the created station or its id, so a caller that
+    /// needs the fresh id must re-list via [`get_internet_radio_stations`](Self::get_internet_radio_stations)
+    /// and match by name/url. The save flow does not need the id, so it does not
+    /// re-list on the happy path.
+    pub async fn create_internet_radio_station(
+        &self,
+        stream_url: &str,
+        name: &str,
+        home_page_url: Option<&str>,
+    ) -> Result<(), SubsonicError> {
+        self.inner
+            .create_internet_radio_station(stream_url, name, home_page_url)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// Update an existing station's stream URL, name, and optional homepage
+    /// (Subsonic `updateInternetRadioStation`). The station id selects which row
+    /// to rewrite.
+    pub async fn update_internet_radio_station(
+        &self,
+        id: &StationId,
+        stream_url: &str,
+        name: &str,
+        home_page_url: Option<&str>,
+    ) -> Result<(), SubsonicError> {
+        self.inner
+            .update_internet_radio_station(&id.0, stream_url, name, home_page_url)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
+
+    /// Delete a saved station (Subsonic `deleteInternetRadioStation`). Backs the
+    /// live round-trip cleanup so a self-test leaves no station litter behind.
+    pub async fn delete_internet_radio_station(
+        &self,
+        id: &StationId,
+    ) -> Result<(), SubsonicError> {
+        self.inner
+            .delete_internet_radio_station(&id.0)
+            .await
+            .map_err(|e| SubsonicError::Request(e.to_string()))
+    }
 }
 
 /// Tag-classed search3 hits, decomposed from the wire `SearchResult3` aggregate
@@ -675,6 +744,17 @@ fn map_playlist(p: data::Playlist) -> Playlist {
         name: p.name,
         song_count: i64_to_u32(p.song_count.unwrap_or(0)),
         songs: Vec::new(),
+    }
+}
+
+/// Map a wire `InternetRadioStation` into our model. Every field is String /
+/// Option<String>, so this is a straight field copy with no lossy cast.
+fn map_station(s: data::InternetRadioStation) -> Station {
+    Station {
+        id: StationId(s.id),
+        name: s.name,
+        stream_url: s.stream_url,
+        home_page_url: s.home_page_url,
     }
 }
 
@@ -1161,6 +1241,39 @@ mod tests {
     }
 
     #[test]
+    fn map_station_from_camelcase_wire() {
+        // The EXACT getInternetRadioStations row shape (camelCase streamUrl /
+        // homepageUrl) deserialized through the real InternetRadioStation, then
+        // mapped. A future crate field rename breaks deserialization HERE, not
+        // silently in production.
+        let wire: data::InternetRadioStation = serde_json::from_str(
+            r#"{ "id": "ir-1", "name": "NTS 1",
+                 "streamUrl": "https://stream-relay-geo.ntslive.net/stream",
+                 "homePageUrl": "https://nts.live" }"#,
+        )
+        .unwrap();
+        let s = map_station(wire);
+        assert_eq!(s.id, StationId("ir-1".into()));
+        assert_eq!(s.name, "NTS 1");
+        assert_eq!(s.stream_url, "https://stream-relay-geo.ntslive.net/stream");
+        assert_eq!(s.home_page_url.as_deref(), Some("https://nts.live"));
+    }
+
+    #[test]
+    fn map_station_tolerates_missing_homepage() {
+        // homepageUrl is optional on the wire (serde default None); a station
+        // without one maps cleanly to `home_page_url == None`.
+        let wire: data::InternetRadioStation = serde_json::from_str(
+            r#"{ "id": "ir-2", "name": "NTS 2", "streamUrl": "https://n/2" }"#,
+        )
+        .unwrap();
+        let s = map_station(wire);
+        assert_eq!(s.id, StationId("ir-2".into()));
+        assert_eq!(s.stream_url, "https://n/2");
+        assert_eq!(s.home_page_url, None);
+    }
+
+    #[test]
     fn map_playlist_with_songs_materializes_entries_and_recomputes_count() {
         // A getPlaylist row carries `entry: [Child]`; songs map through map_song
         // and song_count is derived from the true entry count.
@@ -1304,5 +1417,71 @@ mod tests {
         client.delete_playlist(&pid).await.expect("delete_playlist");
         let after = client.get_playlists().await.expect("get_playlists after delete");
         assert!(!after.iter().any(|p| p.id == pid), "cleared playlist must be gone");
+    }
+
+    // ── LIVE Navidrome internet-radio round-trip (task cchte88 proof) ──────
+    //
+    // The sanctioned proof per CLAUDE.md: a REAL create -> read-back -> delete of
+    // a CLEARLY test-named throwaway station against the live server, leaving no
+    // litter in the user's real Navidrome. `#[ignore]` so the default/sandboxed
+    // run skips it (certless, no network); run with `cargo test -p hypodj-core --
+    // --ignored live_internet_radio_station_round_trip`. Reads config from env,
+    // NEVER printing the password.
+    #[tokio::test]
+    #[ignore = "requires a live Navidrome (HYPODJ_TEST_URL/USER/PASS)"]
+    async fn live_internet_radio_station_round_trip() {
+        let (url, username, password) = match (
+            std::env::var("HYPODJ_TEST_URL"),
+            std::env::var("HYPODJ_TEST_USER"),
+            std::env::var("HYPODJ_TEST_PASS"),
+        ) {
+            (Ok(u), Ok(n), Ok(p)) => (u, n, p),
+            _ => {
+                eprintln!("skipping live radio round-trip: HYPODJ_TEST_URL/USER/PASS not set");
+                return;
+            }
+        };
+        let cfg = ServerConfig { url, username, password, client_name: "hypodj-selftest".into() };
+        let client = SubsonicClient::connect(&cfg).expect("connect");
+        client.ping().await.expect("ping live server");
+
+        // A uniquely-named throwaway so a crashed prior run never clashes with the
+        // user's real stations. The NTS mixtape carries no ICY - the exact
+        // save-default fallback case the task flags.
+        let stream = "https://stream-mixtape-geo.ntslive.net/mixtape5";
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("hypodj-selftest-radio-{nonce}");
+
+        // (a) create
+        client
+            .create_internet_radio_station(stream, &name, None)
+            .await
+            .expect("create_internet_radio_station");
+
+        // (b) read back: exactly our nonce station surfaces with the expected url.
+        let listed = client
+            .get_internet_radio_stations()
+            .await
+            .expect("get_internet_radio_stations");
+        let found = listed
+            .iter()
+            .find(|s| s.name == name)
+            .expect("created station must appear in getInternetRadioStations");
+        assert_eq!(found.stream_url, stream);
+        let id = found.id.clone();
+
+        // (d) delete: clean up the side effect - leave no litter.
+        client
+            .delete_internet_radio_station(&id)
+            .await
+            .expect("delete_internet_radio_station");
+        let after = client
+            .get_internet_radio_stations()
+            .await
+            .expect("get_internet_radio_stations after delete");
+        assert!(!after.iter().any(|s| s.id == id), "deleted station must be gone");
     }
 }
