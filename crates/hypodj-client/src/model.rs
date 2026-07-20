@@ -38,6 +38,12 @@ pub struct NowPlaying {
     /// so `Some` here always names something the pane does NOT, and a lean status
     /// leaves it `None`.
     pub hint: Option<AmbientHint>,
+    /// The end-of-queue CONTINUATION station, present ONLY when continuation is ARMED
+    /// (the daemon emits `X-hypodj-continuation: on` + `X-hypodj-continuation-station`).
+    /// `Some(station)` warrants a standing "then: <station>" queue-tail hint - the
+    /// future made visible BEFORE the drain handoff; `None` (disarmed / unconfigured)
+    /// renders nothing, keeping a lean status silent exactly like the armed/hint HUD.
+    pub continuation: Option<String>,
 }
 
 /// One active pull, reconstructed from the daemon's `X-hypodj-field-{i}-*` pairs.
@@ -177,6 +183,20 @@ impl ArmedFeatures {
     }
 }
 
+/// The armed continuation station, parsed from the daemon's `X-hypodj-continuation`
+/// pairs. `Some(station)` ONLY when the toggle pair reads `on` AND a non-empty station
+/// accompanies it - a torn/half snapshot (toggle without a station, or vice versa)
+/// yields `None`, never a guessed station.
+fn parse_continuation(status: &[(String, String)]) -> Option<String> {
+    if find(status, "X-hypodj-continuation") != Some("on") {
+        return None;
+    }
+    match find(status, "X-hypodj-continuation-station") {
+        Some(s) if !s.trim().is_empty() => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 fn find<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
 }
@@ -196,6 +216,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         armed: ArmedFeatures::parse(status),
         field: FieldState::parse(status),
         hint: AmbientHint::parse(status),
+        continuation: parse_continuation(status),
     }
 }
 
@@ -324,6 +345,27 @@ mod tests {
         let np2 = now_playing(&status, &p(&[("file", "song/7"), ("Title", "X")]));
         assert!(!np2.starred);
         assert!(np2.armed.any());
+    }
+
+    #[test]
+    fn nowplaying_parses_continuation_only_when_armed() {
+        // Armed: on + a station name -> Some(station).
+        let status = p(&[
+            ("state", "stop"),
+            ("X-hypodj-continuation", "on"),
+            ("X-hypodj-continuation-station", "NTS 1"),
+        ]);
+        let np = now_playing(&status, &[]);
+        assert_eq!(np.continuation.as_deref(), Some("NTS 1"));
+        // No continuation pairs -> None (lean status, render nothing).
+        let np = now_playing(&p(&[("state", "stop")]), &[]);
+        assert_eq!(np.continuation, None);
+        // Torn snapshot (toggle without a station) -> None, never a guess.
+        let np = now_playing(&p(&[("X-hypodj-continuation", "on")]), &[]);
+        assert_eq!(np.continuation, None);
+        // A station name without an `on` toggle -> None.
+        let np = now_playing(&p(&[("X-hypodj-continuation-station", "NTS 1")]), &[]);
+        assert_eq!(np.continuation, None);
     }
 
     #[test]

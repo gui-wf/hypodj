@@ -22,6 +22,11 @@ pub fn render_card(np: &NowPlaying) -> String {
         if let Some(hint) = &np.hint {
             lines.push(hint.phrase());
         }
+        // The standing continuation-radio hint is the quietest last line: when armed
+        // the deck will flow into this station at end-of-queue instead of stopping.
+        if let Some(station) = &np.continuation {
+            lines.push(format!("then: {station}"));
+        }
         return lines.join("\n");
     }
     let mut lines = Vec::new();
@@ -72,6 +77,11 @@ pub fn render_card(np: &NowPlaying) -> String {
     // The field is the last, faintest line of the card - the quietest voice.
     if let Some(fl) = field {
         lines.push(fl);
+    }
+    // The standing continuation-radio hint rides below the field: what the deck will
+    // flow into when the queue drains. Present only when continuation is armed.
+    if let Some(station) = &np.continuation {
+        lines.push(format!("then: {station}"));
     }
     lines.join("\n")
 }
@@ -229,6 +239,22 @@ mod tests {
         ]);
         let card = render_card(&now_playing(&status, &[]));
         assert!(card.contains("up next Blue in Green"));
+    }
+
+    #[test]
+    fn card_shows_continuation_hint_when_armed() {
+        // A stopped deck armed for continuation surfaces the station as the quietest
+        // last line: what it will flow into when the queue drains.
+        let status = p(&[
+            ("state", "stop"),
+            ("X-hypodj-continuation", "on"),
+            ("X-hypodj-continuation-station", "NTS 1"),
+        ]);
+        let out = render_card(&now_playing(&status, &[]));
+        assert!(out.contains("then: NTS 1"), "continuation hint line present:\n{out}");
+        // Disarmed -> no line.
+        let np = now_playing(&p(&[("state", "stop")]), &[]);
+        assert!(!render_card(&np).contains("then:"));
     }
 
     #[test]

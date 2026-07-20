@@ -238,9 +238,27 @@ pub enum MpdCommand {
     /// [`crate::handler::HypodjHandler::identify`].
     Identify,
 
+    /// `continuation on|off` / `continuation [status]` - the startle-safe opt-in for
+    /// end-of-queue CONTINUATION radio: when the play queue drains, flow into a
+    /// configured online radio station instead of stopping silent. Default OFF,
+    /// PERSISTED, and NEVER default-on. NOT a standard MPD command; a hypodj
+    /// extension. See [`ContinuationCmd`] and [`parse_continuation`].
+    Continuation(ContinuationCmd),
+
     /// A command we do not model yet. Dispatch decides ACK vs empty-OK; note
     /// that the ncmpcpp-blocking commands above are deliberately NOT here.
     Unsupported(String),
+}
+
+/// A parsed `continuation` subcommand (the end-of-queue continuation-radio arm/report).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationCmd {
+    /// `continuation on` / `continuation 1` - ARM the continuation (persisted).
+    On,
+    /// `continuation off` / `continuation 0` - disarm the continuation (persisted).
+    Off,
+    /// `continuation` / `continuation status` - report the live toggle + station.
+    Status,
 }
 
 /// A parsed `field` subcommand (the latent-field first-slice surface).
@@ -263,6 +281,19 @@ pub enum FieldNudge {
     Less,
     /// `more` - strengthen the most-recent pull.
     More,
+}
+
+/// Parse a `continuation` request. `continuation` alone (or `continuation status`)
+/// REPORTS the live toggle + configured station; `on`/`1` ARMS, `off`/`0` disarms.
+/// Anything else is a loud (no-op-safe) [`MpdCommand::Unsupported`] ACK rather than a
+/// silent wrong toggle (mirrors the random/repeat/consume arg discipline).
+fn parse_continuation(args: &[String], line: &str) -> MpdCommand {
+    match args.first().map(|s| s.as_str()) {
+        None | Some("status") => MpdCommand::Continuation(ContinuationCmd::Status),
+        Some("on") | Some("1") => MpdCommand::Continuation(ContinuationCmd::On),
+        Some("off") | Some("0") => MpdCommand::Continuation(ContinuationCmd::Off),
+        _ => MpdCommand::Unsupported(line.to_string()),
+    }
 }
 
 /// Parse a `field` request. `field` alone reads the field; the reserved keywords
@@ -1113,6 +1144,7 @@ pub fn parse(line: &str) -> MpdCommand {
         "wake" => parse_wake(&args, line),
         "field" => parse_field(&args, line),
         "identify" => MpdCommand::Identify,
+        "continuation" => parse_continuation(&args, line),
         "sticker" => MpdCommand::Sticker(parse_sticker(&args)),
         "albumart" => MpdCommand::AlbumArt(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
         "readpicture" => MpdCommand::ReadPicture(arg(0).unwrap_or_default(), arg(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
@@ -1153,6 +1185,19 @@ mod parse_tests {
         // A missing/garbage arg is an Unsupported ACK, never a silent wrong toggle.
         assert!(matches!(parse("random"), MpdCommand::Unsupported(_)));
         assert!(matches!(parse("repeat blah"), MpdCommand::Unsupported(_)));
+    }
+
+    #[test]
+    fn parses_continuation_toggle_and_status() {
+        // Bare / explicit status -> Status; on|1 -> On; off|0 -> Off.
+        assert!(matches!(parse("continuation"), MpdCommand::Continuation(ContinuationCmd::Status)));
+        assert!(matches!(parse("continuation status"), MpdCommand::Continuation(ContinuationCmd::Status)));
+        assert!(matches!(parse("continuation on"), MpdCommand::Continuation(ContinuationCmd::On)));
+        assert!(matches!(parse("continuation 1"), MpdCommand::Continuation(ContinuationCmd::On)));
+        assert!(matches!(parse("continuation off"), MpdCommand::Continuation(ContinuationCmd::Off)));
+        assert!(matches!(parse("continuation 0"), MpdCommand::Continuation(ContinuationCmd::Off)));
+        // A garbage arg is an Unsupported ACK, never a silent wrong toggle.
+        assert!(matches!(parse("continuation maybe"), MpdCommand::Unsupported(_)));
     }
 
     #[test]

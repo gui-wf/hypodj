@@ -105,6 +105,10 @@ async fn main() -> anyhow::Result<()> {
         player.clone(),
         cfg.fade.clone(),
     ));
+    // End-of-queue continuation radio: register the configured station (a Navidrome
+    // station name or an http(s) URL), or None to leave the feature off. The runtime
+    // `continuation on|off` toggle (default OFF, persisted) still gates whether it fires.
+    handler.set_continuation_station(cfg.continuation.station.clone());
 
     // The background scrobbler (feature 1) shares the SAME client. The director
     // spine feeds it every player event alongside the inline queue-advance.

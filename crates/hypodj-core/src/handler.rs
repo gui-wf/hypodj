@@ -53,8 +53,8 @@ use crate::subsonic::SubsonicError;
 use crate::echo::describe_batch;
 use crate::nl::{NlContext, NlError, NlSource, Translator};
 use crate::mpd::{
-    FadeArgs, FadeKind, FieldCmd, FieldNudge, KnobDir, MpdCommand, MpdHandler, MpdResponse, NlCmd,
-    PlanCmd, SleepCmd, StickerCmd, WakeCmd, WakeWhen, WinddownCmd,
+    ContinuationCmd, FadeArgs, FadeKind, FieldCmd, FieldNudge, KnobDir, MpdCommand, MpdHandler,
+    MpdResponse, NlCmd, PlanCmd, SleepCmd, StickerCmd, WakeCmd, WakeWhen, WinddownCmd,
 };
 use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
@@ -223,6 +223,31 @@ struct State {
     /// type. EPHEMERAL: never persisted to resume.toml; cleared on every play edge
     /// alongside `stream_meta` so a stale cover can never leak onto a new track.
     recognized_cover: Option<(QueueId, String)>,
+    /// End-of-queue CONTINUATION-radio arming toggle (`continuation on|off`). When
+    /// ON and a station is configured, the [`Self::advance_on_eof`] drain edge flows
+    /// into the continuation station instead of stopping silent. Default OFF and
+    /// startle-safe (never default-on): a configured station does nothing until this
+    /// is explicitly armed. PERSISTED to resume.toml (unlike random/repeat), so the
+    /// arming survives a restart - the one runtime toggle whose intent outlives the
+    /// session.
+    continuation: bool,
+    /// RE-ENTRANCY guard for end-of-queue continuation: the stable MPD id of the
+    /// currently-active continuation stream (the raw [`QueueEntry::Stream`] that
+    /// [`Self::try_continuation`] cold-loaded), or `None` when no continuation
+    /// stream is live. This is the linchpin that makes continuation ONE-SHOT: mpv's
+    /// `loadfile` returns Ok the instant the load is QUEUED (not when the stream
+    /// CONNECTS), so a dead/unreachable/404 continuation URL surfaces LATER as an
+    /// `EndFile(Error)` -> [`PlayerEvent::Eof`] on the SAME spine that feeds
+    /// [`Self::advance_on_eof`]. Without this guard that Eof would re-enter the
+    /// drain edge, fire `try_continuation` AGAIN, and loop unbounded (queue grows,
+    /// deck Playing over silence). When the finishing entry's id matches this, the
+    /// drain edge knows the just-ended entry was itself a continuation stream and
+    /// stops HONESTLY and LOUDLY instead of re-firing - a good station plays
+    /// indefinitely, a drop is an honest stop, never a retry loop. EPHEMERAL: never
+    /// persisted (a restart rebuilds it as a plain queued stream); ids are
+    /// monotonic within a session, so a stale value can never false-match a later
+    /// entry. Set on a successful cold-start; cleared on the honest stop.
+    continuation_active: Option<u64>,
 }
 
 /// Which pertinence branch a [`Handler::seed_source`] resolution landed on - the
@@ -335,6 +360,10 @@ impl Default for State {
             stream_meta: None,
             // No recognized cover until an on-demand `identify` matches.
             recognized_cover: None,
+            // Continuation radio starts DISARMED - never a surprise on first run.
+            continuation: false,
+            // No continuation stream is live until one is cold-started.
+            continuation_active: None,
         }
     }
 }
@@ -389,6 +418,40 @@ impl State {
     /// real `current`. Mirrors [`Self::reported_play_state`]'s pending-pause layer.
     fn reported_current(&self) -> Option<usize> {
         self.pending_skip.or(self.current)
+    }
+
+    /// Whether the queue is GENUINELY exhausted at an EOF edge - the TRUE-DRAIN
+    /// signal that gates end-of-queue continuation so it can only fire when there is
+    /// genuinely nothing left to play. It asks "IGNORING the `single`
+    /// stop-after-current mode, would a normal advance still have somewhere to go?".
+    /// This is what separates a real end-of-queue None from a `single`-mode None:
+    /// with `single on` and tracks STILL queued, [`Self::plan_next`] returns None by
+    /// design (stop after the current track), but those remaining tracks must still
+    /// play - continuation must NOT hijack them with radio. `repeat` and `random`
+    /// keep a non-empty queue cycling / drawing forever (never a genuine end); a
+    /// plain sequential queue drains only when the current entry is the last one;
+    /// `consume` drains only when removing the current would empty the queue (the
+    /// same last-entry test here, evaluated BEFORE plan_next mutates the queue).
+    /// Does NOT consume any `random` walk state (it never calls the mutating
+    /// `random_next_index` - random simply never drains while entries remain).
+    fn is_true_drain(&self) -> bool {
+        let Some(cur) = self.reported_current() else {
+            // No current entry to advance from: only an already-empty queue reads as
+            // drained (a stopped/empty deck is not a live EOF edge).
+            return self.queue.is_empty();
+        };
+        let len = self.queue.len();
+        if len == 0 {
+            return true;
+        }
+        // repeat cycles the queue; random keeps drawing from a non-empty queue:
+        // neither reaches a genuine end while entries remain.
+        if self.repeat || self.random {
+            return false;
+        }
+        // Sequential (and consume, which removes the current): drained iff the
+        // current entry is the last one.
+        cur + 1 >= len
     }
 }
 
@@ -1090,6 +1153,14 @@ pub struct HypodjHandler {
     /// debounced to ONE at a time and the Shazam endpoint is never hammered.
     /// Reset by an RAII guard on every exit path (including a panic/timeout).
     recognizing: AtomicBool,
+    /// The configured end-of-queue CONTINUATION station (a Navidrome station NAME or
+    /// an absolute `http(s)://` stream URL), or `None` when the `[continuation]`
+    /// section is unset (feature off). Set once by the daemon via
+    /// [`Self::set_continuation_station`]. Read under a SHORT std-`Mutex` scope, the
+    /// station-URL resolution network call happening only AFTER the lock is released
+    /// (see [`Self::resolve_continuation_url`]). Mutex (not OnceLock) mirrors
+    /// [`Self::state_path`]: an unset feature is a valid state.
+    continuation_station: Mutex<Option<String>>,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -1328,6 +1399,7 @@ impl HypodjHandler {
             store: Arc::new(MetadataStore),
             pulls: Mutex::new(PullField::new()),
             recognizing: AtomicBool::new(false),
+            continuation_station: Mutex::new(None),
         }
     }
 
@@ -3733,6 +3805,67 @@ impl HypodjHandler {
         *self.state_path.lock().unwrap() = Some(p);
     }
 
+    /// Register the configured end-of-queue CONTINUATION station (a Navidrome station
+    /// NAME or an absolute `http(s)://` stream URL). Called once by the daemon from
+    /// `[continuation].station`; `None` (or an unset section) leaves the feature off.
+    /// The runtime toggle (`continuation on|off`) still gates whether it ever fires.
+    pub fn set_continuation_station(&self, station: Option<String>) {
+        *self.continuation_station.lock().unwrap() = station;
+    }
+
+    /// The end-of-queue continuation status as X- extension pairs for `status`,
+    /// present ONLY when the feature is ARMED (the runtime toggle is ON AND a
+    /// non-empty station is configured) so a disarmed/unconfigured deck stays lean -
+    /// mirroring the armed-feature / ambient-hint HUD discipline. `X-hypodj-
+    /// continuation` is `on` and `X-hypodj-continuation-station` names the configured
+    /// station, so a client renders the standing "then: <station>" queue-tail hint
+    /// BEFORE the handoff (the future is visible before it happens - anti-surprise).
+    fn continuation_status_pairs(&self) -> Vec<(&'static str, String)> {
+        if !self.state.lock().unwrap().continuation {
+            return Vec::new();
+        }
+        match self.continuation_station.lock().unwrap().clone() {
+            Some(station) if !station.trim().is_empty() => vec![
+                ("X-hypodj-continuation", "on".to_string()),
+                ("X-hypodj-continuation-station", station),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The `continuation on|off` runtime toggle + `continuation [status]` report - the
+    /// startle-safe opt-in for end-of-queue continuation radio. Default OFF and NEVER
+    /// default-on: a configured station does nothing until this is armed. The flip is
+    /// PERSISTED (a resume checkpoint right after) so the arming survives a restart;
+    /// `status` reports the live toggle + configured station honestly.
+    async fn handle_continuation(&self, cmd: ContinuationCmd) -> MpdResponse {
+        match cmd {
+            ContinuationCmd::On | ContinuationCmd::Off => {
+                let on = matches!(cmd, ContinuationCmd::On);
+                self.state.lock().unwrap().continuation = on;
+                self.notify_change();
+                // Persist the flip immediately so the arming survives a restart (the
+                // resume checkpoint carries the toggle). Best-effort: a missing state
+                // path is a silent no-op and a write error is logged, never fatal. An
+                // empty-stopped deck is skipped by the checkpoint guard, but there is
+                // nothing to continue from there anyway - it persists on the next real
+                // checkpoint once a queue exists.
+                self.checkpoint(self.last_elapsed_secs()).await;
+                MpdResponse::ok()
+            }
+            ContinuationCmd::Status => {
+                let on = self.state.lock().unwrap().continuation;
+                let station = self.continuation_station.lock().unwrap().clone();
+                let mut b = MpdResponse::pairs()
+                    .pair("continuation", if on { "on" } else { "off" });
+                if let Some(s) = station {
+                    b = b.pair("continuation_station", s);
+                }
+                b.build()
+            }
+        }
+    }
+
     /// Record the live media position (from a P1 `Tick.time_pos`), locklessly.
     pub fn note_elapsed_ms(&self, ms: u64) {
         self.last_elapsed_ms.store(ms, Ordering::Relaxed);
@@ -3783,6 +3916,7 @@ impl HypodjHandler {
             volume: st.target_volume,
             play_state,
             playlist_version: st.playlist_version,
+            continuation: st.continuation,
             saved_at_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -3934,6 +4068,9 @@ impl HypodjHandler {
             st.current = new_current;
             st.playlist_version = s.playlist_version;
             st.target_volume = s.volume.min(100);
+            // Rehydrate the persisted continuation arming (default false for a
+            // pre-continuation resume.toml) so the toggle survives a restart.
+            st.continuation = s.continuation;
             if playing {
                 // Start SILENT so the first buffer is inaudible; the wake ramp then
                 // rises from the synth floor to the saved level.
@@ -4226,7 +4363,12 @@ impl HypodjHandler {
         // collide with the pending Terminal::SkipLoad, which still fires afterward
         // and loads the skip target a second time - a spurious load plus an audible
         // double-load glitch. Leave the advance to the skip terminal.
-        {
+        // Captured under ONE short lock scope, BEFORE plan_next mutates the queue
+        // (consume removes the current entry): (a) whether the entry that just ended
+        // was itself the active continuation stream - the ONE-SHOT re-entrancy guard
+        // - and (b) whether the queue is GENUINELY exhausted (true drain) vs a
+        // `single`-mode stop that left tracks queued.
+        let (finishing_is_continuation, true_drain) = {
             let mut st = self.state.lock().unwrap();
             if st.pending_skip.is_some() {
                 return;
@@ -4243,7 +4385,17 @@ impl HypodjHandler {
             }) {
                 st.last_finished = Some(song);
             }
-        }
+            // Does the finishing entry's stable id match the active continuation
+            // stream? mpv's loadfile Ok is premature (it fires the moment the load is
+            // QUEUED, not when the stream CONNECTS), so a dead/unreachable/404
+            // continuation URL surfaces HERE later as an EndFile(Error) -> Eof; a
+            // finite/dropped stream likewise re-enters. Either way, if THIS is that
+            // stream, we must NOT re-fire continuation.
+            let finishing_is_continuation = st.continuation_active.is_some()
+                && st.current.and_then(|i| st.queue.get(i)).map(|it| it.id)
+                    == st.continuation_active;
+            (finishing_is_continuation, st.is_true_drain())
+        };
         let next = self.plan_next(true);
         match next {
             Some(idx) => {
@@ -4255,15 +4407,133 @@ impl HypodjHandler {
                 let _ = self.play_index_inner(idx, false).await;
             }
             None => {
+                // Continuation is a ONE-SHOT flow into radio at a GENUINE end-of-queue
+                // drain. Two guards keep it from becoming the old silent-drain bug in a
+                // new hat:
+                //   - finishing_is_continuation: if the entry that JUST ended was
+                //     itself the continuation stream (a dropped/finite stream, or a
+                //     dead/unreachable/404 URL whose failure arrived late as
+                //     EndFile(Error) after loadfile's premature Ok), do NOT re-fire.
+                //     Stop HONESTLY and LOUDLY - a good station plays indefinitely; a
+                //     drop is an honest stop, never a retry loop that grows the queue
+                //     without bound.
+                //   - true_drain: fire ONLY when the queue is genuinely exhausted,
+                //     never on a `single`-mode None that left tracks queued (those must
+                //     play, not be hijacked by radio).
+                // Every disarmed / no-station / unresolvable / cold-load-failure case
+                // ALSO falls through to the SAME honest stop - never a silent
+                // playing-state, never a retry loop.
+                if finishing_is_continuation {
+                    tracing::warn!(
+                        "continuation stream ended (dropped / finite / unreachable); stopping honestly - one-shot, no re-fire"
+                    );
+                } else if true_drain && self.try_continuation().await {
+                    return;
+                }
                 let mut st = self.state.lock().unwrap();
                 st.current = None;
                 // End of queue: no pending pause / skip can survive a stopped deck.
                 st.pending_pause = false;
                 st.pending_skip = None;
+                // No continuation stream is live once the deck stops honestly.
+                st.continuation_active = None;
                 drop(st);
                 self.notify_change();
             }
         }
+    }
+
+    /// Resolve the configured continuation station to a raw stream URL. An absolute
+    /// `http(s)://` station value is used verbatim; any other value is treated as a
+    /// saved Navidrome internet-radio station NAME and resolved via a live
+    /// `getInternetRadioStations` fetch (case-insensitive, [`station_url_for_name`]).
+    /// Returns `None` for an unresolvable station (network error, or no station by
+    /// that name) - the caller then ends stopped, never guessing a random station.
+    /// The fetch is an `.await`, so this is ALWAYS called with NO std lock held.
+    async fn resolve_continuation_url(&self, station: &str) -> Option<String> {
+        if is_stream_uri(station) {
+            return Some(station.to_string());
+        }
+        let stations = self.client.get_internet_radio_stations().await.ok()?;
+        station_url_for_name(&stations, station)
+    }
+
+    /// End-of-queue CONTINUATION cold-start. Fired ONLY from the
+    /// [`Self::advance_on_eof`] None-branch (the drain edge, after single/repeat/
+    /// consume were honored). When the runtime toggle is ARMED and a station is
+    /// configured, resolve it to a stream URL, append it as a first-class
+    /// [`QueueEntry::Stream`], point `current` at it, and cold-load it - publishing
+    /// the normal TrackStart/StateChanged (via [`Self::play_index_inner`]) so clients
+    /// update. Returns `true` when a continuation stream started playing, `false` in
+    /// EVERY inert/failure case (disarmed, no station, unresolvable, or a cold-load
+    /// error) so the caller performs the honest stop.
+    ///
+    /// Invariants preserved: the appended entry is a RAW stream (no song id), so it
+    /// never scrobbles, and advance_on_eof already refused to record a stream as
+    /// `last_finished` - the continuation stream can never become a similar seed. The
+    /// std `Mutex<State>` is released BEFORE the station-resolution await and before
+    /// the player load await (the append is a pure mutation under one short lock
+    /// scope). A cold-load failure REMOVES the just-appended entry and returns `false`
+    /// (honest stop), never a retry loop into a playing-state-with-silence.
+    async fn try_continuation(&self) -> bool {
+        // 1. Armed? The runtime toggle must be ON (default OFF - never a surprise).
+        if !self.state.lock().unwrap().continuation {
+            return false;
+        }
+        // 2. A station configured? (None = feature off.) Cloned out; lock released.
+        let Some(station) = self.continuation_station.lock().unwrap().clone() else {
+            return false;
+        };
+        if station.trim().is_empty() {
+            return false;
+        }
+        // 3. Resolve the station to a stream URL - a network call for a Navidrome
+        //    station NAME - with NO std lock held. Unresolvable => inert (stop).
+        let Some(url) = self.resolve_continuation_url(&station).await else {
+            tracing::info!(station = %station, "continuation station unresolvable; ending stopped");
+            return false;
+        };
+        // 4. Append the continuation stream as a first-class queue entry and point
+        //    `current` at its index, as ONE pure mutation under a single short lock
+        //    scope (never across an await). The title is the configured station label;
+        //    the live ICY name (if any) decorates currentsong later via stream_meta.
+        let (idx, id) = {
+            let mut st = self.state.lock().unwrap();
+            let id = st.next_id;
+            st.next_id += 1;
+            st.queue.push(QueueItem {
+                id,
+                entry: QueueEntry::Stream { url: url.clone(), title: station.clone() },
+            });
+            st.playlist_version += 1;
+            (st.queue.len() - 1, id)
+        };
+        self.notify_change();
+        // 5. Cold loadfile from the drained deck. Match the natural-advance sibling
+        //    (no volume resync) so an in-flight winddown/sleep ramp survives the
+        //    handoff. play_index_inner sets `current` + publishes on success.
+        if self.play_index_inner(idx, false).await.is_ok() {
+            // Latch this stream's id as the ACTIVE continuation stream. loadfile's Ok
+            // is premature (the stream may still fail to connect), so this is what lets
+            // the NEXT advance_on_eof recognize an EndFile(Error)/Eof on THIS entry as
+            // a continuation-stream end and stop honestly instead of re-firing. Set
+            // AFTER the load so a cold-load failure (removed below) never leaves it set.
+            self.state.lock().unwrap().continuation_active = Some(id);
+            return true;
+        }
+        // Cold-load FAILED: stop LOUDLY. Remove the entry we appended (by stable id, so
+        // a concurrent queue edit cannot make us drop the wrong row) and return false;
+        // the caller performs the single honest stop (current=None + notify). Never a
+        // retry into a silent playing-state - do NOT reintroduce the drain bug.
+        tracing::warn!(station = %station, url = %url, "continuation cold-load failed; ending stopped");
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(pos) = st.queue.iter().position(|it| it.id == id) {
+                st.queue.remove(pos);
+                st.playlist_version += 1;
+            }
+        }
+        false
     }
 
     // ── startle-safe USER skip (skip-fade) ──────────────────────────────────
@@ -4949,6 +5219,12 @@ impl MpdHandler for HypodjHandler {
                 for (k, v) in self.ambient_hint_pairs() {
                     b = b.pair(k, v);
                 }
+                // Surface the end-of-queue continuation arming (toggle ON + a
+                // configured station) so a client renders the standing "then:
+                // <station>" queue-tail hint. Present ONLY when armed (lean at rest).
+                for (k, v) in self.continuation_status_pairs() {
+                    b = b.pair(k, v);
+                }
                 b.build()
             }
 
@@ -5160,6 +5436,7 @@ impl MpdHandler for HypodjHandler {
                 self.notify_change();
                 MpdResponse::ok()
             }
+            MpdCommand::Continuation(cmd) => self.handle_continuation(cmd).await,
 
             // ── queue ─────────────────────────────────────────────────────
             MpdCommand::Add(uri) => match self.enqueue_uri(&uri).await {
@@ -6842,6 +7119,273 @@ mod tests {
             Some(&SongId("real".into())),
             "a stream EOF does not clobber the last real finished track"
         );
+    }
+
+    // ── end-of-queue CONTINUATION radio (slice 1) ────────────────────────────
+
+    // ARMED + a configured http(s) station: the drain-edge None-branch does NOT stop.
+    // It appends the station as a first-class raw Stream, points current at it, and
+    // cold-loads it (playing). The finishing library song is still latched as the
+    // recency seed - the continuation stream never displaces it.
+    #[tokio::test]
+    async fn continuation_armed_appends_and_plays_station_on_drain() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // One real song plays to its natural EOF into an empty tail.
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        // Arm continuation with an absolute stream URL (resolves with NO network).
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+
+        h.advance_on_eof().await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 2, "the continuation stream is appended after the drained song");
+        assert!(
+            matches!(&st.queue[1].entry, QueueEntry::Stream { url, .. } if url == NTS),
+            "the appended tail entry is the configured raw stream"
+        );
+        assert_eq!(st.current, Some(1), "current points at the continuation stream (playing, not stopped)");
+        // The just-finished library song is the recency seed; the stream never became one.
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| &s.id),
+            Some(&SongId("seed".into())),
+            "the finished library song stays the recency seed"
+        );
+    }
+
+    // REGRESSION (the whole point vs the old silent-drain): continuation OFF (default)
+    // ends the deck STOPPED at end-of-queue exactly as before, even with a station
+    // configured. A configured station does NOTHING until the toggle is armed.
+    #[tokio::test]
+    async fn continuation_off_ends_stopped_regression() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        // Station configured but the toggle is OFF (default).
+        h.set_continuation_station(Some(NTS.to_string()));
+        assert!(!h.state.lock().unwrap().continuation, "continuation defaults OFF");
+
+        h.advance_on_eof().await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "disarmed => the deck ends stopped as today");
+        assert_eq!(st.queue.len(), 1, "no continuation stream appended when disarmed");
+    }
+
+    // Armed but no station configured (feature effectively off): inert - the deck ends
+    // stopped exactly as today, never a guessed station.
+    #[tokio::test]
+    async fn continuation_armed_but_no_station_stays_inert() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().continuation = true;
+        // No station set (None). Also an empty/whitespace station must be inert.
+        h.set_continuation_station(None);
+
+        h.advance_on_eof().await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "no station => inert, deck ends stopped");
+        assert_eq!(st.queue.len(), 1, "nothing appended");
+    }
+
+    // Armed with a station NAME that does not resolve (the offline never-called client
+    // yields no stations): inert - the deck ends stopped, the queue is untouched, and
+    // NO retry-loop into a playing-state-with-silence. Never guess a random station.
+    #[tokio::test]
+    async fn continuation_unresolvable_station_stays_inert() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().continuation = true;
+        // A NAME (not a URL) => a getInternetRadioStations fetch, which fails against
+        // the never-called client, so resolution yields None.
+        h.set_continuation_station(Some("No Such Station".to_string()));
+
+        h.advance_on_eof().await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "unresolvable station => inert, deck ends stopped");
+        assert_eq!(st.queue.len(), 1, "unresolvable station appends nothing");
+    }
+
+    // A continuation stream must never poison the recency seed nor become a scrobble
+    // seed: it is a raw Stream with no library id, so last_finished keeps the real
+    // finished song and queue_song_ids (the scrobble/seed id source) excludes it.
+    #[tokio::test]
+    async fn continuation_stream_does_not_poison_last_finished_or_scrobble() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+
+        h.advance_on_eof().await; // drains -> continuation stream now current+playing
+
+        // The continuation stream carries no library id, so the id sources that back
+        // scrobbling / similar-seeding see ONLY the real song, never the stream.
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![SongId("seed".into())],
+            "the continuation stream contributes no song id (never scrobbles / seeds)"
+        );
+        assert_eq!(
+            h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
+            Some(&SongId("seed".into())),
+            "the continuation stream never displaces the real recency seed"
+        );
+        // A SECOND drain (the stream 'ends') must still not latch the id-less stream -
+        // and, still ARMED, the one-shot guard must stop it honestly WITHOUT re-firing.
+        h.advance_on_eof().await;
+        assert_eq!(
+            h.state.lock().unwrap().last_finished.as_ref().map(|s| &s.id),
+            Some(&SongId("seed".into())),
+            "a stream EOF never overwrites last_finished, even under continuation"
+        );
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "the continuation stream ends the deck stopped, not re-fired");
+        assert_eq!(st.queue.len(), 2, "no SECOND continuation stream appended (one-shot)");
+        assert_eq!(st.continuation_active, None, "the active-continuation latch clears on the honest stop");
+    }
+
+    // CASE 4 (the held merge): a dead / unreachable / 404 continuation URL. mpv's
+    // loadfile Ok is PREMATURE (fires when the load is queued, not when the stream
+    // connects), so the cold-start "succeeds" and the deck goes Playing, then the
+    // open failure arrives LATER. This test covers the HANDLER half of CASE 4: given
+    // that the just-ended entry re-enters advance_on_eof, the one-shot re-entrancy
+    // guard must catch that it WAS the continuation stream and stop HONESTLY - never
+    // re-fire into an unbounded queue-growing retry loop over silence (the forbidden
+    // silent-drain bug in a new hat).
+    //
+    // WHAT NullPlayer CAN simulate: the premature-Ok cold-start (it accepts any URL,
+    // so the stream is appended + becomes current + latches continuation_active) and
+    // an Eof-style re-entry into advance_on_eof (driven here by a second call). That
+    // is enough to exercise the finishing_is_continuation guard end to end.
+    //
+    // WHAT NullPlayer CANNOT simulate: the REAL mpv failure surface. A dead URL does
+    // NOT fail as EndFile(Error)/Eof; on real libmpv the open failure arrives as a
+    // TOP-LEVEL wait_event error (Raw(LoadingFailed) / Raw(NothingToPlay) / ...),
+    // which the mpv actor classifies (is_active_load_failure) and routes into the
+    // honest-stop path so the Eof that reaches advance_on_eof is SYNTHESIZED there.
+    // NullPlayer emits no such error, so this test does NOT prove the actor-side
+    // classification / latch-clear / Stopped-publish - that half is covered by the
+    // #[ignore] live-libmpv test player::tests::live_mpv_dead_url_stops_honestly (and
+    // by the isolated-daemon live proof against a real dead URL). This test asserts
+    // only the guard given the Eof, not that a dead URL actually produces one.
+    #[tokio::test]
+    async fn continuation_dead_url_stops_honestly_no_refire() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        h.state.lock().unwrap().continuation = true;
+        // An absolute URL resolves with NO network; the NullPlayer's premature Ok
+        // models mpv accepting the load before the (here, notionally dead) connect.
+        h.set_continuation_station(Some(NTS.to_string()));
+
+        // Drain -> continuation cold-starts: the stream is appended + becomes current.
+        h.advance_on_eof().await;
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 2, "the continuation stream is appended once");
+            assert_eq!(st.current, Some(1), "and becomes current (loadfile Ok is premature)");
+            assert_eq!(
+                st.continuation_active,
+                Some(st.queue[1].id),
+                "the active-continuation latch records the cold-started stream id"
+            );
+        }
+        // Re-enter advance_on_eof to model the finishing stream's Eof reaching the
+        // spine (on real mpv this Eof is synthesized by the actor from the top-level
+        // load-failure error; NullPlayer cannot raise that, so we drive the re-entry
+        // directly). STILL ARMED, the guard must stop honestly, NOT re-fire.
+        h.advance_on_eof().await;
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "a dead continuation stream ends the deck STOPPED (honest)");
+        assert_eq!(
+            st.queue.len(),
+            2,
+            "NO second continuation stream appended - the queue does not grow without bound"
+        );
+        assert_eq!(st.continuation_active, None, "the active-continuation latch clears on the honest stop");
+        assert!(st.continuation, "the arming toggle itself is untouched (one-shot is per-stream, not a disarm)");
+    }
+
+    // MEDIUM: a `single`-mode stop is NOT a genuine drain. With `single on` and a track
+    // still queued, plan_next returns None by design (stop after the current track),
+    // but continuation must NOT treat that as exhaustion and hijack the pending track
+    // with radio. The true-drain gate distinguishes the two, so the remaining song is
+    // preserved and no continuation stream is appended.
+    #[tokio::test]
+    async fn continuation_single_stop_with_tracks_queued_does_not_fire() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(playlist_test_song("s0")).await;
+        h.enqueue_song_for_test(playlist_test_song("s1")).await;
+        h.state.lock().unwrap().current = Some(0);
+        // Arm continuation AND turn single on: s0 ends, single stops the deck, but s1
+        // is still pending - a mode-stop None, not a true drain.
+        h.state.lock().unwrap().continuation = true;
+        h.state.lock().unwrap().single = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+
+        h.advance_on_eof().await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "single stops the deck after the current track (its semantics)");
+        assert_eq!(st.queue.len(), 2, "no continuation stream appended - the pending track is preserved");
+        assert!(
+            st.queue.iter().all(|it| matches!(it.entry, QueueEntry::Song(_))),
+            "the queue still holds ONLY the two library songs (radio never hijacked it)"
+        );
+        assert_eq!(st.continuation_active, None, "no continuation stream was ever cold-started");
+    }
+
+    // The continuation INDICATOR pairs ride `status` ONLY when armed (toggle ON AND a
+    // station configured), so a client can render the standing "then: <station>" hint.
+    // Disarmed or unconfigured => no pairs (a lean status), like the armed/hint HUD.
+    #[tokio::test]
+    async fn continuation_status_pairs_present_only_when_armed() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        // Disarmed, no station -> no pairs.
+        assert!(h.continuation_status_pairs().is_empty(), "disarmed => lean status");
+        // Toggle on but still no station -> still no pairs.
+        h.state.lock().unwrap().continuation = true;
+        assert!(h.continuation_status_pairs().is_empty(), "armed toggle without a station => lean");
+        // Toggle on + a configured station -> the two indicator pairs, end to end on status.
+        h.set_continuation_station(Some("NTS 1".to_string()));
+        assert_eq!(
+            h.continuation_status_pairs(),
+            vec![
+                ("X-hypodj-continuation", "on".to_string()),
+                ("X-hypodj-continuation-station", "NTS 1".to_string()),
+            ]
+        );
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "X-hypodj-continuation"), Some("on"));
+        assert_eq!(pair(&status, "X-hypodj-continuation-station"), Some("NTS 1"));
+        // Disarm again -> the pairs disappear from status.
+        h.handle(MpdCommand::Continuation(ContinuationCmd::Off)).await;
+        assert!(!h.state.lock().unwrap().continuation, "off toggles the arming");
+        let status = h.handle(MpdCommand::Status).await;
+        assert_eq!(pair(&status, "X-hypodj-continuation"), None, "disarmed status is lean again");
+    }
+
+    // The `continuation on|off` verb flips the persisted runtime toggle; `status`
+    // reports the live toggle + configured station honestly.
+    #[tokio::test]
+    async fn continuation_verb_toggles_and_reports() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.set_continuation_station(Some("NTS 1".to_string()));
+        // Default off; the report says so.
+        let rep = h.handle(MpdCommand::Continuation(ContinuationCmd::Status)).await;
+        assert_eq!(pair(&rep, "continuation"), Some("off"));
+        assert_eq!(pair(&rep, "continuation_station"), Some("NTS 1"));
+        // Arm it.
+        h.handle(MpdCommand::Continuation(ContinuationCmd::On)).await;
+        assert!(h.state.lock().unwrap().continuation, "on arms the toggle");
+        let rep = h.handle(MpdCommand::Continuation(ContinuationCmd::Status)).await;
+        assert_eq!(pair(&rep, "continuation"), Some("on"));
     }
 
     // Helper: the ambient hint's title (if any) names the SAME song the enqueue seed
@@ -10034,6 +10578,7 @@ mod tests {
             play_state: ResumePlayState::Playing,
             playlist_version: 7,
             saved_at_unix: 1,
+            continuation: false,
         };
         h.restore(&s).await.unwrap();
         assert_eq!(h.player.state(), PlayState::Playing);
@@ -10059,6 +10604,7 @@ mod tests {
             play_state: ResumePlayState::Paused,
             playlist_version: 3,
             saved_at_unix: 1,
+            continuation: false,
         };
         h.restore(&s).await.unwrap();
         assert_eq!(h.player.state(), PlayState::Stopped, "no autoplay on a paused resume");
@@ -10125,6 +10671,7 @@ mod tests {
             play_state: ResumePlayState::Playing,
             playlist_version: 9,
             saved_at_unix: 1,
+            continuation: false,
         };
         // (a) restore aborts and leaves State untouched (no drain to empty, no
         // partial install).
@@ -10153,6 +10700,7 @@ mod tests {
             play_state: ResumePlayState::Playing,
             playlist_version: 9,
             saved_at_unix: 1,
+            continuation: false,
         };
         crate::resume::store_atomic(&path, &good).expect("seed the good file");
         h.set_state_path(path.clone());

@@ -47,6 +47,12 @@ pub struct ResumeState {
     pub play_state: ResumePlayState,
     pub playlist_version: u64,
     pub saved_at_unix: u64,
+    /// The persisted end-of-queue continuation-radio arming toggle (`continuation
+    /// on|off`). `#[serde(default)]` so a pre-continuation resume.toml (which lacks
+    /// the key) loads cleanly with the toggle OFF - no schema bump, no cold-start
+    /// on upgrade, and startle-safe (default false = today's silent-stop behavior).
+    #[serde(default)]
+    pub continuation: bool,
 }
 
 /// One persisted queue entry. Internally tagged (`kind = "song" | "stream"`) so
@@ -208,6 +214,7 @@ mod tests {
             play_state: ResumePlayState::Playing,
             playlist_version: 9,
             saved_at_unix: 1_700_000_000,
+            continuation: true,
         }
     }
 
@@ -239,6 +246,16 @@ mod tests {
         // Valid TOML missing a required field (drop `volume`).
         let missing = "schema_version = 1\nelapsed_secs = 0.0\nplaylist_version = 0\nsaved_at_unix = 0\nplay_state = \"stopped\"\nqueue = []\n";
         assert!(from_toml(missing).is_none());
+    }
+
+    #[test]
+    fn pre_continuation_file_loads_with_toggle_off() {
+        // A resume.toml written before the continuation feature has no `continuation`
+        // key. It must still load (schema unchanged) with the toggle defaulting OFF -
+        // an upgrade never loses the saved queue and never silently arms continuation.
+        let raw = "schema_version = 1\nelapsed_secs = 0.0\nvolume = 50\nplaylist_version = 0\nsaved_at_unix = 0\nplay_state = \"stopped\"\ncurrent = 0\nqueue = []\n";
+        let s = from_toml(raw).expect("pre-continuation file still parses");
+        assert!(!s.continuation, "the missing toggle defaults OFF");
     }
 
     #[test]

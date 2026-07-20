@@ -1160,6 +1160,28 @@ mod tests {
     }
 
     #[test]
+    fn queue_shows_continuation_tail_hint_only_when_armed() {
+        // ARMED: the daemon names the station, so the Queue draws a faint
+        // "then: <station>" row after the last real entry.
+        let mut s = TuiState::new();
+        s.screen = crate::state::Screen::Queue;
+        s.queue = vec![hypodj_client::model::QueueItem {
+            pos: 0,
+            title: "Track Zed".into(),
+            artist: None,
+            uri: Some("song/9".into()),
+            album_uri: None,
+        }];
+        s.now.continuation = Some("NTS 1".into());
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(out.contains("then: NTS 1"), "armed continuation draws the tail hint:\n{out}");
+        // DISARMED / unconfigured: no continuation, no tail hint (lean render).
+        s.now.continuation = None;
+        let out = render_to_lines_sized(&s, 100, 40).join("\n");
+        assert!(!out.contains("then:"), "no tail hint when continuation is disarmed:\n{out}");
+    }
+
+    #[test]
     fn dj_pane_suppresses_up_next_hint() {
         // On Screen::Dj the "btw, DJ knows" line is reserved for a hint that earns a
         // line; an up-next hint (already shown by the Up Next pane) draws nothing and
@@ -1333,7 +1355,7 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
     let block = Block::default().borders(Borders::ALL).title("Queue");
     let current = state.now.song;
     let query = state.highlight_query();
-    let items: Vec<ListItem> = state
+    let mut items: Vec<ListItem> = state
         .queue
         .iter()
         .map(|it| {
@@ -1349,6 +1371,16 @@ fn render_queue(f: &mut Frame, area: ratatui::layout::Rect, state: &TuiState) {
             ListItem::new(Line::from(spans))
         })
         .collect();
+    // Standing CONTINUATION-radio queue-tail hint: when continuation is ARMED the
+    // daemon names the station, so draw a faint "then: <station>" row AFTER the last
+    // real queue entry - the future made visible BEFORE the drain handoff
+    // (anti-surprise). Mirrors the faint, unobtrusive register of the ambient line.
+    if let Some(station) = &state.now.continuation {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("   then: {station}"),
+            Style::default().add_modifier(Modifier::DIM),
+        ))));
+    }
     let list = List::new(items).block(block).highlight_style(
         Style::default().add_modifier(Modifier::REVERSED),
     );

@@ -724,6 +724,65 @@ fn end_reason(raw: u32) -> EndReason {
     }
 }
 
+/// Does this top-level mpv event error mean the CURRENTLY loading/active entry
+/// failed to OPEN or PLAY? mpv's `loadfile` returns Ok the moment the load is
+/// QUEUED (premature), not when the source connects, so a cold-loaded
+/// dead/unreachable/404 URL never reaches us as an `EndFile(Error)`; its open
+/// failure instead surfaces as a TOP-LEVEL error out of `wait_event` -
+/// `Raw(LoadingFailed)` (connection refused / unreachable host),
+/// `Raw(NothingToPlay)` / `Raw(UnknownFormat)` / `Raw(Unsupported)` (404, empty or
+/// undecodable body), or a wrapping `Loadfile { .. }`. Those all mean the active
+/// entry died and must drive the SAME honest stop / advance as an
+/// `EndFile(Error)`. EVERY other event error - a transient property/command reply
+/// failure (`Generic`, `PropertyError`, ...), `InvalidUtf8`, `Null` - is unrelated
+/// to the active entry's playability and is only logged, never a stop.
+fn is_active_load_failure(e: &libmpv2::Error) -> bool {
+    use libmpv2::{Error, mpv_error};
+    match e {
+        Error::Loadfile { .. } => true,
+        Error::Raw(code) => matches!(
+            *code,
+            mpv_error::LoadingFailed
+                | mpv_error::NothingToPlay
+                | mpv_error::UnknownFormat
+                | mpv_error::Unsupported
+        ),
+        _ => false,
+    }
+}
+
+/// Publish the LOSSLESS honest-stop signal for the currently latched entry and
+/// clear the actor's play latches. Shared by the `EndFile(Eof|Error)` arm and the
+/// top-level load-failure arm so a track that fails to OPEN converges on the exact
+/// same drain path as a natural end: the latched entry's `Eof` flows to the
+/// director + `advance_on_eof` (queue advance, scrobble, or the continuation
+/// one-shot stop), and the cleared latch + `StateChanged(Stopped)` make MPD report
+/// stop instead of a phantom Playing over silence. `Eof` is emitted only when
+/// something was actually latched (`queue_id` present), mirroring the EndFile arm.
+fn emit_honest_stop(
+    state_tx: &watch::Sender<PlayState>,
+    evt_tx: &mpsc::Sender<PlayerEvent>,
+    current: &mut Option<SongId>,
+    current_qid: &mut Option<QueueId>,
+    playing: &mut bool,
+    cur_vol: f64,
+) {
+    // A library track carries a SongId (drives scrobble); a raw stream carries
+    // `song: None` but still `queue_id: Some`, so a mid-queue stream end advances
+    // and yields a real TrackEnd instead of silently halting.
+    let song = current.take();
+    let qid = current_qid.take();
+    *playing = false;
+    // Trailing resting frame: the decode stopped, so the last live Viz would
+    // otherwise stay lit at the pre-stop loudness forever.
+    let _ = evt_tx.try_send(resting_viz(cur_vol));
+    let _ = state_tx.send(PlayState::Stopped);
+    if qid.is_some() {
+        let _ = evt_tx.blocking_send(PlayerEvent::Eof { song, queue_id: qid });
+    }
+    let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(PlayState::Stopped, None, None));
+}
+
 /// The mpv actor body, running on its own OS thread. Owns the `Mpv` handle and
 /// drives it from the command channel, draining mpv events on every wakeup.
 fn mpv_actor(
@@ -885,28 +944,18 @@ fn mpv_actor(
                 } else {
                 match end_reason(reason) {
                     EndReason::Eof | EndReason::Error => {
-                        // Emit Eof for the LATCHED entry so the queue advances.
-                        // A library track carries a SongId (drives scrobble); a raw
-                        // stream carries `song: None` but still `queue_id: Some`, so
-                        // a mid-queue stream end advances and yields a real TrackEnd
-                        // instead of silently halting. Eof is only emitted when
-                        // something was actually latched (queue_id present).
-                        let song = current.take();
-                        let qid = current_qid.take();
-                        playing = false;
-                        // Trailing resting frame: EOF stops decode, so the last live
-                        // Viz would otherwise stay lit at the pre-stop loudness forever.
-                        let _ = evt_tx.try_send(resting_viz(cur_vol));
-                        let _ = state_tx.send(PlayState::Stopped);
-                        if qid.is_some() {
-                            let _ = evt_tx
-                                .blocking_send(PlayerEvent::Eof { song, queue_id: qid });
-                        }
-                        let _ = evt_tx.blocking_send(PlayerEvent::StateChanged(
-                            PlayState::Stopped,
-                            None,
-                            None,
-                        ));
+                        // Emit Eof for the LATCHED entry so the queue advances, then
+                        // clear the play latch and publish Stopped. The top-level
+                        // load-failure arm below routes a cold-load open failure onto
+                        // this exact same path (one honest stop, one drain edge).
+                        emit_honest_stop(
+                            &state_tx,
+                            &evt_tx,
+                            &mut current,
+                            &mut current_qid,
+                            &mut playing,
+                            cur_vol,
+                        );
                     }
                     // Stop/Quit/Redirect/Other: do NOTHING. Critically do NOT take
                     // `current` (handle_cmd already repointed it), which preserves
@@ -917,7 +966,33 @@ fn mpv_actor(
             }
             Some(Ok(_)) => {}
             Some(Err(e)) => {
-                tracing::warn!(error = %e, "mpv event error");
+                // A top-level mpv event error. mpv's loadfile Ok is PREMATURE (it
+                // fires when the load is queued, not when the source connects), so a
+                // cold-loaded DEAD/unreachable/404 URL never reaches us as an
+                // EndFile(Error); its open failure surfaces HERE instead. When the
+                // error means the currently latched/loading entry failed to open or
+                // play (is_active_load_failure), route it onto the SAME honest-stop
+                // path as EndFile(Error): emit the latched entry's Eof (director ->
+                // advance_on_eof: queue advance, or the continuation one-shot stop)
+                // and clear the play latch + publish Stopped so MPD reports stop, never
+                // a phantom Playing over silence. Guard on a latched entry
+                // (current_qid present) and NOT mid warm-skip (the SwitchWarmed
+                // machinery owns that transition, exactly like the EndFile arm above,
+                // and a warm-target open failure must not stop the audible current
+                // track). Any OTHER event error is unrelated / transient - only logged.
+                if !warmed && current_qid.is_some() && is_active_load_failure(&e) {
+                    tracing::warn!(error = %e, "mpv load/open failed for the active entry; stopping honestly");
+                    emit_honest_stop(
+                        &state_tx,
+                        &evt_tx,
+                        &mut current,
+                        &mut current_qid,
+                        &mut playing,
+                        cur_vol,
+                    );
+                } else {
+                    tracing::warn!(error = %e, "mpv event error");
+                }
             }
             None => {}
         }
@@ -1652,6 +1727,65 @@ mod tests {
                 meta.name.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
                     || meta.title.as_deref().map(|s| !s.is_empty()).unwrap_or(false),
                 "at least one of station name / now-playing title is non-empty"
+            );
+        });
+    }
+
+    // LIVE empirical proof of the cold-load DEAD-URL honest stop (CASE 4, the actor
+    // half the NullPlayer unit test cannot reach): drive the REAL MpvPlayer actor at
+    // an unreachable URL with audio forced to Null, and assert the actor STOPS the
+    // deck honestly instead of wedging in Playing over silence. The point mpv makes
+    // real here: loadfile returns Ok immediately (premature), the open then fails NOT
+    // as an EndFile(Error) but as a TOP-LEVEL wait_event error (Raw(LoadingFailed) for
+    // a refused connection, Raw(NothingToPlay)/Raw(UnknownFormat) for a 404), which
+    // the actor classifies (is_active_load_failure) and routes into emit_honest_stop.
+    // We assert BOTH lossless surfaces of that stop arrive: an Eof for the latched
+    // entry (drives director -> advance_on_eof, hence the continuation one-shot guard)
+    // and a StateChanged(Stopped), and that the watch state settles to Stopped (so MPD
+    // reports stop, not a phantom play). Uses port 1 (privileged, never bound) so the
+    // connection is refused fast without any network round-trip. Ignored by default
+    // (needs a real libmpv runtime, absent in the link-isolated Nix build sandbox);
+    // run with:
+    //   cargo test -p hypodj-core -- --ignored live_mpv_dead_url_stops_honestly
+    #[test]
+    #[ignore = "needs a real libmpv runtime; run manually to confirm the dead-url honest stop"]
+    fn live_mpv_dead_url_stops_honestly() {
+        let url = "http://127.0.0.1:1/dead-stream";
+        let rt = tokio::runtime::Runtime::new().expect("tokio rt");
+        rt.block_on(async {
+            let (player, mut events) = MpvPlayer::spawn(AudioOut::Null);
+            // loadfile Ok is premature: the play_url call itself SUCCEEDS even though
+            // the URL is dead (the failure only surfaces later, over events).
+            player
+                .play_url(None, Some(QueueId(1)), url)
+                .await
+                .expect("play_url returns Ok (loadfile is premature) for a dead URL");
+
+            // Within a generous window, the actor must surface the honest stop: an Eof
+            // for the latched entry AND a StateChanged(Stopped). Never a silent wedge.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            let mut saw_eof = false;
+            let mut saw_stopped = false;
+            while std::time::Instant::now() < deadline && !(saw_eof && saw_stopped) {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await {
+                    Ok(Some(PlayerEvent::Eof { queue_id, .. })) => {
+                        assert_eq!(queue_id, Some(QueueId(1)), "Eof carries the latched dead entry id");
+                        saw_eof = true;
+                    }
+                    Ok(Some(PlayerEvent::StateChanged(PlayState::Stopped, ..))) => {
+                        saw_stopped = true;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+            assert!(saw_eof, "a dead cold-loaded URL emits Eof for the latched entry (drives advance)");
+            assert!(saw_stopped, "a dead cold-loaded URL publishes StateChanged(Stopped), not a phantom play");
+            assert_eq!(
+                player.state(),
+                PlayState::Stopped,
+                "the watch state settles to Stopped so MPD reports stop, never silent Playing"
             );
         });
     }

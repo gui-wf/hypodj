@@ -22,6 +22,27 @@ pub struct Config {
     /// resume is disabled and the daemon simply cold-starts.
     #[serde(default)]
     pub restart: RestartConfig,
+    /// End-of-queue continuation-radio config. Optional; with no `[continuation]`
+    /// section (or no `station`) the feature is entirely off and the deck ends
+    /// stopped at the end of the queue exactly as it does today.
+    #[serde(default)]
+    pub continuation: ContinuationConfig,
+}
+
+/// `[continuation]` config for the end-of-queue continuation-radio feature: when
+/// the play queue drains, flow into a configured online radio station instead of
+/// stopping silent. This holds ONLY the station identity; the runtime on/off arming
+/// is a persisted toggle (`continuation on|off`), default OFF, so the feature is
+/// never surprising - a configured station does nothing until it is explicitly
+/// armed and a station is resolvable.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ContinuationConfig {
+    /// The continuation station: either a saved Navidrome internet-radio station
+    /// NAME (resolved to its stream URL via `getInternetRadioStations`) or an
+    /// absolute `http(s)://` stream URL used directly. `None` (unset) means the
+    /// feature is off - the deck ends stopped at end-of-queue as it does today.
+    #[serde(default)]
+    pub station: Option<String>,
 }
 
 /// `[restart]` config for the smooth-restart (sleep-fade-out on SIGTERM + resume
@@ -664,6 +685,35 @@ mod tests {
                 assert!(d >= min_s && d <= f.max_dur_secs, "duration {d} out of range in {extra:?}");
             }
         }
+    }
+
+    #[test]
+    fn continuation_section_defaults_off_and_parses_station() {
+        // No [continuation] section -> the feature is entirely off (station None).
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.continuation.station, None, "no section => feature off");
+
+        // A [continuation] station (name or URL) parses through.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [continuation]
+            station = "NTS 1"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.continuation.station.as_deref(), Some("NTS 1"));
     }
 
     #[test]
