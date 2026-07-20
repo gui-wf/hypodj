@@ -8,25 +8,37 @@
 //! art, station-agnostic and with ZERO interference to the playing libmpv
 //! instance.
 //!
-//! Two honest subprocess steps, both off the async reactor:
+//! Two honest subprocess steps, both async (`tokio::process`, so the child I/O
+//! never blocks the reactor and a timeout can actually KILL the child):
 //! 1. `ffmpeg` captures ~11s of the stream URL to a temp mono 16 kHz wav.
 //! 2. `songrec recognize --json <wav>` fingerprints the wav, queries Shazam, and
 //!    prints ONE line of JSON to stdout (empty stdout + exit 0 = no match).
 //!
 //! Both tools are put on `PATH` by the nix wrapper (see `nix/package.nix`), so the
-//! feature is self-contained. The temp wav is removed in EVERY branch (RAII guard).
+//! feature is self-contained. The temp wav is removed in EVERY branch (RAII guard),
+//! and every child is `kill_on_drop` so a timeout leaves no orphan process.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// Total wall-clock ceiling for one capture + recognition. The `ffmpeg -t 11`
-/// self-terminates the capture; `songrec`'s Shazam round-trip has its own network
-/// timeout. This outer bound guarantees a hung endpoint can never WEDGE the
-/// `identify` trigger: on elapse the blocking join is abandoned (the in-flight
-/// guard is released) and the temp wav is cleaned by the RAII guard, so a later
-/// `identify` still runs.
+/// Total wall-clock ceiling for one capture + recognition. Three nested guards keep
+/// a hung endpoint from ever WEDGING the `identify` trigger: `ffmpeg -t 11`
+/// self-terminates a healthy capture, the `ffmpeg -rw_timeout` (see
+/// [`FFMPEG_RW_TIMEOUT_US`]) self-aborts a STALLED stream read well before this
+/// bound, and this outer `tokio::time::timeout` is the last resort. On elapse the
+/// in-flight child future is dropped, which `kill_on_drop` turns into a real
+/// SIGKILL of the `ffmpeg`/`songrec` child (no orphan survives), and the temp wav is
+/// cleaned by the RAII guard - only THEN does the async call return and release the
+/// caller's in-flight guard, so a later `identify` still runs on a clean slate.
 const RECOGNIZE_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// Per-operation I/O ceiling handed to `ffmpeg` as `-rw_timeout` (microseconds): a
+/// stream whose socket read/connect stalls for this long self-aborts the capture,
+/// so the common "endpoint went silent" case never has to wait for the outer
+/// [`RECOGNIZE_TIMEOUT`]. Well under that bound (15s vs 40s) and comfortably above
+/// the ~11s a healthy realtime capture takes.
+const FFMPEG_RW_TIMEOUT_US: &str = "15000000";
 
 /// A monotonic per-process counter mixed into the temp-file name alongside the pid,
 /// so two captures can never collide on the same path (the in-flight guard already
@@ -58,12 +70,10 @@ pub enum RecognizeError {
     /// tool name and the underlying io error.
     Spawn(&'static str, std::io::Error),
     /// `ffmpeg` ran but exited non-zero (the stream URL was unreachable / not
-    /// capturable).
+    /// capturable, or its `-rw_timeout` fired on a stalled read).
     Capture,
-    /// The blocking capture+recognize task panicked (should never happen; surfaced
-    /// rather than swallowed).
-    Join,
-    /// The whole capture+recognition exceeded [`RECOGNIZE_TIMEOUT`].
+    /// The whole capture+recognition exceeded [`RECOGNIZE_TIMEOUT`]; the child was
+    /// killed on the way out.
     Timeout,
 }
 
@@ -72,7 +82,6 @@ impl std::fmt::Display for RecognizeError {
         match self {
             RecognizeError::Spawn(tool, e) => write!(f, "could not run {tool}: {e}"),
             RecognizeError::Capture => write!(f, "stream capture failed"),
-            RecognizeError::Join => write!(f, "recognition task failed"),
             RecognizeError::Timeout => write!(f, "recognition timed out"),
         }
     }
@@ -98,31 +107,37 @@ fn temp_wav_path() -> PathBuf {
     std::env::temp_dir().join(format!("hypodj-songrec-{}-{}.wav", std::process::id(), n))
 }
 
-/// The BLOCKING half: capture the stream with `ffmpeg`, then fingerprint the wav
-/// with `songrec recognize --json`, returning songrec's raw stdout. Runs inside
-/// `spawn_blocking` (never on the reactor). Every subprocess uses `Stdio::null()`
-/// for stdin so it can never block waiting on input, and the workspace `tokio` does
-/// NOT enable the "process" feature - std `Command` is the deliberate choice.
+/// The subprocess half: capture the stream with `ffmpeg`, then fingerprint the wav
+/// with `songrec recognize --json`, returning songrec's raw stdout. Uses
+/// `tokio::process` so the child I/O rides the reactor (never blocks it) and both
+/// children carry `kill_on_drop(true)` - so if the awaiting future is dropped (the
+/// [`RECOGNIZE_TIMEOUT`] path in [`recognize_stream_url`]) the in-flight child is
+/// SIGKILLed rather than orphaned. Every subprocess uses `Stdio::null()` for stdin
+/// so it can never block waiting on input.
 ///
 /// On a clean no-match, `songrec` exits 0 with EMPTY stdout (it prints "No match"
 /// to stderr), so this returns `Ok("")` and the parser maps empty -> `None`. A
 /// non-zero songrec exit is NOT treated as a hard error here (an empty/garbage
 /// stdout still parses to `None`); only a spawn/exec failure is.
-fn capture_and_recognize(url: &str, wav: &Path) -> Result<String, RecognizeError> {
-    use std::process::{Command, Stdio};
+async fn capture_and_recognize(url: &str, wav: &Path) -> Result<String, RecognizeError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
 
     // 1. SIDE-BAND capture: re-fetch the SAME stream URL to a bounded temp wav. 11s
     // mono 16 kHz is plenty for a Shazam fingerprint and does not touch the playing
-    // libmpv instance. `-nostdin` + null stdin so ffmpeg never waits on the tty.
+    // libmpv instance. `-nostdin` + null stdin so ffmpeg never waits on the tty;
+    // `-rw_timeout` self-aborts a stalled read (see FFMPEG_RW_TIMEOUT_US).
     let capture = Command::new("ffmpeg")
-        .args(["-nostdin", "-loglevel", "error", "-y", "-i"])
+        .args(["-nostdin", "-loglevel", "error", "-rw_timeout", FFMPEG_RW_TIMEOUT_US, "-y", "-i"])
         .arg(url)
         .args(["-t", "11", "-ac", "1", "-ar", "16000", "-f", "wav"])
         .arg(wav)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .status()
+        .await
         .map_err(|e| RecognizeError::Spawn("ffmpeg", e))?;
     if !capture.success() {
         return Err(RecognizeError::Capture);
@@ -136,7 +151,9 @@ fn capture_and_recognize(url: &str, wav: &Path) -> Result<String, RecognizeError
         .arg(wav)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
+        .kill_on_drop(true)
         .output()
+        .await
         .map_err(|e| RecognizeError::Spawn("songrec", e))?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -147,20 +164,31 @@ fn capture_and_recognize(url: &str, wav: &Path) -> Result<String, RecognizeError
 ///
 /// ASYNC/LOCK DISCIPLINE: the caller reads the stream URL under the std state lock
 /// and DROPS the lock before calling this (no lock is held across the await here).
-/// The heavy work is one `spawn_blocking`, bounded by [`RECOGNIZE_TIMEOUT`] so a
-/// hung Shazam call cannot wedge the trigger. The temp wav is cleaned in every
+/// The heavy work is one async subprocess pair bounded by [`RECOGNIZE_TIMEOUT`] so a
+/// hung Shazam call cannot wedge the trigger; on elapse the child future is dropped
+/// and `kill_on_drop` reaps the child (no orphan). The temp wav is cleaned in every
 /// branch by [`TempFileGuard`].
 pub async fn recognize_stream_url(url: String) -> Result<Option<RecognizedTrack>, RecognizeError> {
     let wav = temp_wav_path();
-    // RAII: removes the wav on EVERY exit path below (including the timeout branch,
-    // where the blocking task is abandoned but this guard still unlinks the file).
-    let _guard = TempFileGuard(wav.clone());
+    run_bounded(wav.clone(), RECOGNIZE_TIMEOUT, capture_and_recognize(&url, &wav)).await
+}
 
-    let job = tokio::task::spawn_blocking(move || capture_and_recognize(&url, &wav));
-    let stdout = match tokio::time::timeout(RECOGNIZE_TIMEOUT, job).await {
-        Ok(Ok(Ok(stdout))) => stdout,
-        Ok(Ok(Err(e))) => return Err(e),
-        Ok(Err(_join)) => return Err(RecognizeError::Join),
+/// Bound `work` (the capture+recognize future) by `timeout`, cleaning `wav` on EVERY
+/// exit via [`TempFileGuard`] - including the timeout branch, where dropping `work`
+/// also `kill_on_drop`-reaps the in-flight child. Split out from
+/// [`recognize_stream_url`] so the timeout + cleanup wiring is unit-testable with a
+/// synthetic `work` future (no real hung stream needed).
+async fn run_bounded(
+    wav: PathBuf,
+    timeout: Duration,
+    work: impl std::future::Future<Output = Result<String, RecognizeError>>,
+) -> Result<Option<RecognizedTrack>, RecognizeError> {
+    // RAII: removes the wav on EVERY exit path below (including the timeout branch,
+    // where `work` is dropped - killing its child - but this guard still unlinks it).
+    let _guard = TempFileGuard(wav);
+    let stdout = match tokio::time::timeout(timeout, work).await {
+        Ok(Ok(stdout)) => stdout,
+        Ok(Err(e)) => return Err(e),
         Err(_elapsed) => return Err(RecognizeError::Timeout),
     };
     Ok(parse_recognize_json(&stdout))
@@ -338,6 +366,53 @@ mod tests {
         assert_eq!(t.artist, None);
         assert_eq!(t.cover_url, None);
         assert_eq!(t.album, None);
+    }
+
+    #[test]
+    fn temp_file_guard_unlinks_on_drop() {
+        // The RAII guard must remove its wav on drop, in every branch. Write a real
+        // file, drop the guard, and confirm it is gone.
+        let path = temp_wav_path();
+        std::fs::write(&path, b"wav").unwrap();
+        assert!(path.exists());
+        {
+            let _guard = TempFileGuard(path.clone());
+        }
+        assert!(!path.exists(), "guard must unlink the temp wav on drop");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_bounded_timeout_kills_and_cleans() {
+        // On timeout, run_bounded must (a) surface RecognizeError::Timeout and (b)
+        // still unlink the temp wav via the RAII guard, even though `work` never
+        // resolved. A never-completing `work` stands in for a hung stream; the
+        // paused clock auto-advances past the timeout without real waiting. (The
+        // kill_on_drop of a real child is a tokio guarantee exercised by the live
+        // proof; here we pin the wiring: elapse -> Timeout + temp cleaned.)
+        let path = temp_wav_path();
+        std::fs::write(&path, b"wav").unwrap();
+        assert!(path.exists());
+        let work = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(String::new())
+        };
+        let res = run_bounded(path.clone(), Duration::from_secs(40), work).await;
+        assert!(matches!(res, Err(RecognizeError::Timeout)));
+        assert!(!path.exists(), "temp wav must be cleaned on the timeout path");
+    }
+
+    #[tokio::test]
+    async fn run_bounded_passes_hit_through() {
+        // The success path: a `work` that resolves in time parses into a hit and the
+        // temp wav is still cleaned afterward.
+        let path = temp_wav_path();
+        std::fs::write(&path, b"wav").unwrap();
+        let hit = REAL_HIT.to_string();
+        let work = async move { Ok(hit) };
+        let res = run_bounded(path.clone(), Duration::from_secs(40), work).await;
+        let track = res.expect("no error").expect("a hit");
+        assert_eq!(track.title.as_deref(), Some("Blessings"));
+        assert!(!path.exists(), "temp wav must be cleaned on the success path");
     }
 
     #[test]
