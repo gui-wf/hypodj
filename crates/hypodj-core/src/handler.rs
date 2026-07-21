@@ -2792,6 +2792,13 @@ impl HypodjHandler {
         }
         if removed > 0 {
             self.notify_change();
+            // A removal changes what drains next: re-evaluate the continuation warm (slice
+            // 2) - the SHARED remove choke behind the NL `Remove` / `Clear` (after-current
+            // / range) actions, mirroring the MPD `delete` dispatch. reschedule disarms a
+            // now-stale warm (cancel timer + drop slot + DropWarm) and re-arms cleanly IFF
+            // the current is left as the last draining Song, so no queue-edit path can
+            // leave a warm parked behind a queue that no longer drains into it.
+            self.reschedule_continuation_warm().await;
         }
         removed
     }
@@ -2846,6 +2853,11 @@ impl HypodjHandler {
         };
         if moved > 0 {
             self.notify_change();
+            // A move changes what drains next (the current may no longer be last): the
+            // SHARED move choke behind the NL `Move` action re-evaluates the continuation
+            // warm (slice 2) like the remove path, disarming a now-stale warm and re-arming
+            // only when the current is left draining last.
+            self.reschedule_continuation_warm().await;
         }
         moved
     }
@@ -3368,26 +3380,41 @@ impl HypodjHandler {
     /// autoplay - `load` (a named playlist / `Starred`) and `findadd`/`searchadd` all
     /// funnel through here - so the fresh-enqueue anchor is armed at THIS single seam
     /// and no such path can forget it (see [`Self::arm_fresh_enqueue_anchor`]).
-    fn enqueue_songs(&self, songs: Vec<Song>) {
+    ///
+    /// It is ALSO the single seam where a batch queue-edit disarms a pending
+    /// continuation warm (slice 2): the append pushes a fresh tail behind the current
+    /// track, so a warm parked to auto-advance behind that current is now stale and must
+    /// not surprise-play over the just-queued music. Disarming HERE means no `load` /
+    /// findadd / searchadd path (current or future) can leave a stale warm in flight.
+    async fn enqueue_songs(&self, songs: Vec<Song>) {
         if songs.is_empty() {
             return;
         }
-        let mut st = self.state.lock().unwrap();
         // The id the FIRST appended song will take, so a fresh idle enqueue can anchor
-        // the freshly-appended tail (non-empty is guaranteed by the guard above).
-        let first = st.next_id;
-        for song in songs {
-            let qid = st.next_id;
-            st.next_id += 1;
-            st.queue.push(QueueItem { id: qid, entry: QueueEntry::Song(song) });
-        }
-        st.playlist_version += 1;
-        drop(st);
+        // the freshly-appended tail (non-empty is guaranteed by the guard above). The std
+        // guard is confined to this block so it is NEVER held across the disarm await.
+        let first = {
+            let mut st = self.state.lock().unwrap();
+            let first = st.next_id;
+            for song in songs {
+                let qid = st.next_id;
+                st.next_id += 1;
+                st.queue.push(QueueItem { id: qid, entry: QueueEntry::Song(song) });
+            }
+            st.playlist_version += 1;
+            first
+        };
         self.notify_change();
         // A fresh idle enqueue outranks a prior finish - anchor the just-appended
         // music so the hint/seed names it, skipping any track that finished before this
         // gesture and lingers at the queue head. A no-op while a track is current.
         self.arm_fresh_enqueue_anchor(first);
+        // Disarm any pending continuation warm (cancel its timer + drop the slot +
+        // DropWarm the prefetched station entry): the fresh tail means the current is no
+        // longer the last entry, so the warm can never legitimately auto-advance behind
+        // it now. Nothing to re-arm here (the deck no longer drains next); the next
+        // play_index_inner / reschedule re-arms cleanly when the queue drains down again.
+        self.disarm_continuation_warm().await;
     }
 
     /// THE MPD-facing fade entry point: convert the parsed [`FadeArgs`] DSL into a
@@ -3578,6 +3605,16 @@ impl HypodjHandler {
         // never races a SkipLoad. Intent no longer gates this drop - the install closure
         // still distinguishes the baseline-commit behavior separately above.
         if res.is_ok() {
+            // Also drop a now-stale continuation-warm SLOT (slice 2): the drop_warm below
+            // is one actor playlist-clear that discards ANY parked entry, the superseded
+            // skip target AND a prefetched continuation station alike. A continuation slot
+            // left marked `warmed` here would then claim a warm this drop just cleared, so
+            // take the slot (its held TimerGuard RAII-cancels the armed timer) under a
+            // short lock BEFORE the await, keeping the handler slot honest with the actor.
+            // A resume re-arms via its follow-on reschedule; other fades (setvol / knob /
+            // wake / wind-down) fall back to the slice-1 cold-start on the next drain.
+            let stale = self.state.lock().unwrap().pending_continuation_warm.take();
+            drop(stale);
             let _ = self.player.drop_warm().await;
         }
         res
@@ -5355,16 +5392,27 @@ impl HypodjHandler {
     /// and wins the seed anyway; the idle-arm belongs on the non-autoplay batch path,
     /// [`enqueue_songs`](Self::enqueue_songs), and the append-only action seam).
     async fn enqueue_song(&self, song: Song) -> u64 {
-        let mut st = self.state.lock().unwrap();
-        let id = st.next_id;
-        st.next_id += 1;
-        st.queue.push(QueueItem {
-            id,
-            entry: QueueEntry::Song(song),
-        });
-        st.playlist_version += 1;
-        drop(st);
+        // The std guard is confined to this block so it is NEVER held across the disarm
+        // await below (the Send invariant).
+        let id = {
+            let mut st = self.state.lock().unwrap();
+            let id = st.next_id;
+            st.next_id += 1;
+            st.queue.push(QueueItem {
+                id,
+                entry: QueueEntry::Song(song),
+            });
+            st.playlist_version += 1;
+            id
+        };
         self.notify_change();
+        // This is the shared single-song append primitive behind `plan_enqueue` (the NL
+        // `Enqueue` action) and `plan_play_now` (`PlayNow`): a fresh tail lands behind the
+        // current track, so disarm any pending continuation warm (cancel timer + drop slot
+        // + DropWarm) - it can no longer legitimately auto-advance behind a current that is
+        // no longer last. Idempotent across the `plan_enqueue` loop (only the first push
+        // has a warm to drop). A `PlayNow` re-arms cleanly via its follow-on play_index.
+        self.disarm_continuation_warm().await;
         id
     }
 }
@@ -5980,7 +6028,7 @@ impl MpdHandler for HypodjHandler {
                 // `load` semantics), not just echoes them. Record the order too.
                 match self.starred_songs_recording_order().await {
                     Ok(songs) => {
-                        self.enqueue_songs(songs);
+                        self.enqueue_songs(songs).await;
                         MpdResponse::ok()
                     }
                     Err(e) => ack(ACK_ERROR_UNKNOWN, "load", &e.to_string()),
@@ -6008,7 +6056,7 @@ impl MpdHandler for HypodjHandler {
                 // queue, so a `save`d set round-trips back into the queue.
                 match self.playlist_by_name(&name).await {
                     Ok(Some(pl)) => {
-                        self.enqueue_songs(pl.songs);
+                        self.enqueue_songs(pl.songs).await;
                         MpdResponse::ok()
                     }
                     Ok(None) => ack(ACK_ERROR_NO_EXIST, "load", "No such playlist"),
@@ -7049,12 +7097,11 @@ impl HypodjHandler {
             Ok(m) => m,
             Err(e) => return ack(ACK_ERROR_UNKNOWN, cmd, &e),
         };
-        // Funnel through enqueue_songs (ONE atomic push + the shared fresh-enqueue
-        // anchor arm), so findadd/searchadd cannot forget the fresh-enqueue seed move.
-        self.enqueue_songs(matches);
-        // A queue add changes drain_is_next: re-evaluate the continuation warm so a parked
-        // station never plays over freshly findadd/searchadd-ed tracks. Slice 2.
-        self.reschedule_continuation_warm().await;
+        // Funnel through enqueue_songs (ONE atomic push + the shared fresh-enqueue anchor
+        // arm + the continuation-warm disarm), so findadd/searchadd cannot forget either
+        // the fresh-enqueue seed move or the stale-warm disarm (slice 2). The batch-append
+        // choke owns both, so no explicit reschedule is needed here.
+        self.enqueue_songs(matches).await;
         MpdResponse::ok()
     }
 
@@ -8057,6 +8104,163 @@ mod tests {
         );
     }
 
+    // DISARM by a BATCH enqueue (the shared `enqueue_songs` choke that `load <playlist>` /
+    // `load Starred` / findadd / searchadd all funnel through): a batch append during the
+    // warm window drops the slot AND DropWarms the prefetched station on the actor, so no
+    // stale mpv entry can auto-advance behind the freshly queued music.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_batch_enqueue() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        // The single batch-append seam behind `load` / findadd / searchadd.
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "a batch enqueue (load / findadd) disarms the pending warm"
+        );
+        assert_eq!(
+            probe.drop.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the warmed prefetch is dropped on the actor (no stale mpv entry survives to EOF)"
+        );
+    }
+
+    // DISARM by a single-song plan enqueue (the shared `enqueue_song` primitive the NL
+    // `Enqueue` action's `plan_enqueue` loops over, and `PlayNow` uses): appending a track
+    // drops the slot + DropWarms the prefetch.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_plan_enqueue() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(0);
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        // enqueue_song is the primitive `plan_enqueue` (Action::Enqueue) appends through.
+        h.enqueue_song_for_test(playlist_test_song("D")).await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "a plan enqueue append disarms the pending warm"
+        );
+        assert_eq!(
+            probe.drop.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the warmed prefetch is dropped on the actor"
+        );
+    }
+
+    // DISARM by an NL `Remove` (the shared `remove_indices` choke behind Action::Remove /
+    // Clear-after-current / Clear-range): removing the draining track means the deck no
+    // longer drains into the station, so the warm is dropped (slot gone + DropWarm).
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_plan_remove() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.enqueue_song_for_test(playlist_test_song("B")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(1); // B is the last, draining track the warm sits behind
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        // The NL Remove action funnels through remove_indices.
+        h.plan_queue_edit(&crate::plan::Action::Remove {
+            sel: crate::plan::QueueSelector::Last(1),
+        })
+        .await
+        .unwrap();
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "removing the draining track disarms the pending warm"
+        );
+        assert_eq!(
+            probe.drop.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the warmed prefetch is dropped on the actor"
+        );
+    }
+
+    // DISARM by an NL `Move` (the shared `move_indices` choke behind Action::Move): moving
+    // the draining current so a track now follows it means it no longer drains into the
+    // station, so the warm is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn continuation_warm_disarmed_by_plan_move() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.enqueue_song_for_test(playlist_test_song("B")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(1); // B is last / draining
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        // Move the draining current to the front: A now follows it -> not a drain anymore.
+        h.plan_queue_edit(&crate::plan::Action::Move {
+            sel: crate::plan::QueueSelector::Last(1),
+            dest: crate::plan::MoveDest::Position(1),
+        })
+        .await
+        .unwrap();
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "moving the draining track behind another disarms the pending warm"
+        );
+        assert_eq!(
+            probe.drop.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the warmed prefetch is dropped on the actor"
+        );
+    }
+
+    // RE-ARM after a disarming edit: a Remove that leaves the current as the last draining
+    // Song must disarm the STALE warm (DropWarm) AND re-arm a FRESH one (proving the choke
+    // reschedules cleanly, not merely tears down). The fresh slot is a NEW un-warmed timer,
+    // never the stale landed one.
+    #[tokio::test(start_paused = true)]
+    async fn queue_remove_rearms_when_current_left_draining() {
+        let Some((h, probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("A")).await;
+        h.enqueue_song_for_test(playlist_test_song("B")).await;
+        h.enqueue_song_for_test(playlist_test_song("C")).await;
+        {
+            let mut st = h.state.lock().unwrap();
+            st.current = Some(2); // C is last / draining; the warm sits behind it
+            st.continuation = true;
+        }
+        h.set_continuation_station(Some(NTS.to_string()));
+        install_warmed_slot(&h, 500, NTS);
+        // Remove A (position 1): C stays the last draining Song, so the warm re-arms.
+        h.plan_queue_edit(&crate::plan::Action::Remove {
+            sel: crate::plan::QueueSelector::Position(1),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            probe.drop.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the STALE warmed prefetch is dropped on the actor"
+        );
+        let st = h.state.lock().unwrap();
+        let w = st
+            .pending_continuation_warm
+            .as_ref()
+            .expect("a FRESH warm re-arms behind the still-draining current");
+        assert!(!w.warmed, "the re-armed slot is a fresh un-warmed timer, not the stale landed one");
+        assert_ne!(w.qid, 500, "the re-armed slot is not the stale warm's qid");
+    }
+
     // DISARM by STOP.
     #[tokio::test(start_paused = true)]
     async fn continuation_warm_disarmed_by_stop() {
@@ -8292,7 +8496,7 @@ mod tests {
         assert_hint_matches_seed(&h);
         // UpNext(anchor) - the G-state: a fresh idle enqueue of D arms the anchor, so the
         // hint moves to D even with A still the recency memory. Hint title == seed.
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "G-state seeds the anchored D");
         assert_hint_matches_seed(&h);
         // NowPlaying-suppressed: a library song current emits no hint, and the helper's
@@ -8388,7 +8592,7 @@ mod tests {
         );
         // The user enqueues a fresh selection D while stopped: the fresh gesture arms
         // the anchor, so the seed/hint move to D, skipping the lingering finished A.
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         {
             let st = h.state.lock().unwrap();
             assert_eq!(st.queue.len(), 2, "A still lingering at pos0, D appended at pos1");
@@ -8437,7 +8641,7 @@ mod tests {
         let Some((h, _events)) = handler_with_null_player() else { return };
         h.state.lock().unwrap().last_finished = Some(playlist_test_song("A"));
         // The user loads a fresh selection D while stopped (current None).
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         {
             let st = h.state.lock().unwrap();
             assert!(st.fresh_enqueue_anchor.is_some(), "the batch-append seam arms the anchor");
@@ -8461,7 +8665,7 @@ mod tests {
             st.last_finished = Some(playlist_test_song("A"));
             st.current = Some(0); // a track is playing
         }
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         let st = h.state.lock().unwrap();
         assert_eq!(
             st.last_finished.as_ref().map(|s| s.id.clone()),
@@ -8589,7 +8793,7 @@ mod tests {
             ]
         );
         // A fresh idle enqueue of D arms the anchor; A is still lingering at pos0.
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert_eq!(h.state.lock().unwrap().queue.len(), 2, "A lingering at pos0, D at pos1");
         assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed skips A to D");
         assert_eq!(
@@ -8610,7 +8814,7 @@ mod tests {
     async fn recency_wins_when_no_fresh_gesture_after_eof() {
         let Some((h, _events)) = handler_with_null_player() else { return };
         // [A,B] enqueued while idle -> the anchor arms at A.
-        h.enqueue_songs(vec![playlist_test_song("A"), playlist_test_song("B")]);
+        h.enqueue_songs(vec![playlist_test_song("A"), playlist_test_song("B")]).await;
         assert!(h.state.lock().unwrap().fresh_enqueue_anchor.is_some(), "enqueue armed the anchor");
         h.state.lock().unwrap().single = true;
         // A plays: the play-time current-commit clears the anchor.
@@ -8642,7 +8846,7 @@ mod tests {
     #[tokio::test]
     async fn anchor_cleared_when_track_becomes_current() {
         let Some((h, _events)) = handler_with_null_player() else { return };
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert!(h.state.lock().unwrap().fresh_enqueue_anchor.is_some(), "idle enqueue armed the anchor");
         h.play_index(0).await.expect("play the queued song");
         assert!(
@@ -8656,8 +8860,8 @@ mod tests {
     #[tokio::test]
     async fn latest_gesture_supersedes_prior() {
         let Some((h, _events)) = handler_with_null_player() else { return };
-        h.enqueue_songs(vec![playlist_test_song("D")]);
-        h.enqueue_songs(vec![playlist_test_song("E")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
+        h.enqueue_songs(vec![playlist_test_song("E")]).await;
         assert_eq!(h.similar_seed_id(), Some(SongId("E".into())), "the newest anchor (E) wins, never D");
     }
 
@@ -8672,7 +8876,7 @@ mod tests {
         h.state.lock().unwrap().current = Some(0);
         h.advance_on_eof(false).await;
         // Fresh idle enqueue D arms the anchor at D (pos1).
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "sanity: G-state seeds D");
         // Delete the appended D: the anchor now dangles (its qid is gone).
         h.delete_for_test(1);
@@ -8700,7 +8904,7 @@ mod tests {
             // A finished and was evicted (queue empty); recency memory holds A.
             st.last_finished = Some(playlist_test_song("A"));
         }
-        h.enqueue_songs(vec![playlist_test_song("D")]);
+        h.enqueue_songs(vec![playlist_test_song("D")]).await;
         assert_eq!(h.similar_seed_id(), Some(SongId("D".into())), "seed the appended D");
         assert_eq!(
             h.ambient_hint_pairs(),
