@@ -1106,6 +1106,21 @@ fn fade_task(
                     // Re-assert the real mpv gain to the baseline so the next play
                     // does not start at the faded-down level.
                     let _ = sink.set_volume(restore).await;
+                    // Disarm any continuation warm parked on this now-STOPPED deck (task
+                    // cxvztz4). The install funnel's `installs_stop` branch already disarms
+                    // at INSTALL, but a reschedule-triggering gesture (seek / repeat toggle)
+                    // issued DURING this fade-out sees the deck still raw-Playing (the stop
+                    // only lands here, at the terminal) and re-arms a warm behind it. Without
+                    // this that timer sits INERT - its fire-time play-state gate self-drops
+                    // it (no prefetch / socket / rearm) - but parked up to dur-45s on a dead
+                    // deck. Mirror disarm_continuation_warm: take the slot (its held
+                    // TimerGuard RAII-cancels the armed timer) and, in the unlikely event a
+                    // prefetch already landed, drop it on the actor so no stale station entry
+                    // survives the stop. The player await runs with NO std lock held.
+                    let warm = state.lock().unwrap().pending_continuation_warm.take();
+                    if warm.is_some_and(|w| w.warmed) {
+                        let _ = sink.drop_warm().await;
+                    }
                     state.lock().unwrap().set_manual_volume(restore);
                     changed.notify_waiters();
                 }
@@ -1222,6 +1237,55 @@ fn fade_task(
     }
     outcome
     })
+}
+
+/// Build the bounded remote-cover HTTP client (task kmrhj8m + njvsh8w): a 2s connect /
+/// 2.5s total ceiling with a small redirect budget. HARD-FAILS at construction rather
+/// than degrading to an UNBOUNDED fallback: the bound is a load-bearing invariant (it is
+/// what stops a hung cover host from wedging the art worker), so a fallback that silently
+/// drops it would reintroduce the very hang the bound prevents. reqwest's own
+/// `Client::new()` panics in the identical TLS-backend-init failure this builder would
+/// hit (it is `builder().build().unwrap()` under the hood), so the old
+/// `unwrap_or_else(|_| Client::new())` was not even a graceful degrade - it was an
+/// unbounded client OR a panic. Expect is the honest choice: bounded, or nothing.
+/// The http-loopback exemption for [`HypodjHandler::fetch_remote_cover`] (task njvsh8w):
+/// plain `http://` is allowed ONLY for a genuine loopback host (local test servers / dev),
+/// everything else must be `https://`. PARSES the url and matches the exact host, so a
+/// non-loopback host that merely STARTS WITH a loopback name (e.g.
+/// `http://127.0.0.1.evil.example/` or `http://localhost.attacker.test/`) is NOT exempted,
+/// unlike a raw `starts_with` prefix test. A loopback IPv4 is the whole `127.0.0.0/8`
+/// block, `[::1]` the IPv6 loopback, and `localhost` the reserved name.
+fn is_loopback_http_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Build the bounded remote-cover HTTP client (task kmrhj8m + njvsh8w): a 2s connect /
+/// 2.5s total ceiling with a small redirect budget. HARD-FAILS at construction rather
+/// than degrading to an UNBOUNDED fallback: the bound is a load-bearing invariant (it is
+/// what stops a hung cover host from wedging the art worker), so a fallback that silently
+/// drops it would reintroduce the very hang the bound prevents. reqwest's own
+/// `Client::new()` panics in the identical TLS-backend-init failure this builder would
+/// hit (it is `builder().build().unwrap()` under the hood), so the old
+/// `unwrap_or_else(|_| Client::new())` was not even a graceful degrade - it was an
+/// unbounded client OR a panic. Expect is the honest choice: bounded, or nothing.
+fn build_cover_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_millis(2500))
+        .redirect(reqwest::redirect::Policy::limited(4))
+        .build()
+        .expect("bounded cover_http client must build (TLS backend init)")
 }
 
 pub struct HypodjHandler {
@@ -1615,12 +1679,7 @@ impl HypodjHandler {
             listings: TtlLru::new(256, Duration::from_secs(60)),
             dir_cache: TtlLru::new(256, Duration::from_secs(60)),
             cover_cache: TtlLru::new(64, Duration::from_secs(600)),
-            cover_http: reqwest::Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_millis(2500))
-                .redirect(reqwest::redirect::Policy::limited(4))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+            cover_http: build_cover_http_client(),
             // The station-identity catalogue client: no auth, a 4s total ceiling (a
             // one-shot off-spine resolve, bounded but not as tight as the cover client).
             station_identity_http: reqwest::Client::builder()
@@ -3502,6 +3561,22 @@ impl HypodjHandler {
             Target::Nothing => return IdentifyOutcome::Nothing,
         };
 
+        // Snapshot the ICY/now-playing title latched for THIS qid at capture START (task
+        // why1cp6). The surfacing step compares against it to tell a REAL ICY title that
+        // landed DURING the up-to-40s capture (a foreign title ICY-wins must protect) from
+        // one already present (which the recognized hit legitimately supersedes). Own writes
+        // happen only at completion below, never mid-capture, so any CHANGE to a different
+        // non-blank title during the window is unambiguously fresh ICY. For the auto cadence
+        // the fire gate already guarantees this is blank or our own prior hit.
+        let title_at_capture = {
+            let st = self.state.lock().unwrap();
+            st.stream_meta
+                .as_ref()
+                .and_then(|(q, m)| (*q == qid).then(|| m.title.clone()).flatten())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+        };
+
         // Heavy work off the reactor; no std lock is held across this await.
         let track = match crate::recognize::recognize_stream_url(url).await {
             Ok(Some(track)) => track,
@@ -3521,24 +3596,30 @@ impl HypodjHandler {
 
         let now_playing = crate::recognize::now_playing_title(&track);
 
-        // Re-check the qid + preserve any existing ICY station Name under ONE lock, so
-        // a track that advanced during the capture is NOT clobbered by a stale result.
-        let existing_name = {
+        // Re-check the qid + ICY provenance + preserve any existing ICY station Name under
+        // ONE lock, so neither a track that advanced NOR a real ICY title that landed during
+        // the capture is clobbered by the recognized result. The decision is factored into
+        // the pure [`identify_surface_decision`] so it is unit-testable without songrec.
+        let surface = {
             let st = self.state.lock().unwrap();
-            let still_current = st
-                .reported_current()
-                .and_then(|i| st.queue.get(i))
-                .is_some_and(|it| QueueId(it.id) == qid);
-            if !still_current {
+            identify_surface_decision(&st, qid, title_at_capture.as_deref())
+        };
+        let existing_name = match surface {
+            IdentifySurface::Advanced => {
                 // The stream advanced away from what we captured: report the hit but do
                 // NOT decorate the now-different entry, and do NOT rearm (the slot for
                 // this qid was already disarmed by the track change).
                 return IdentifyOutcome::Hit { track, now_playing };
             }
-            st.stream_meta
-                .as_ref()
-                .and_then(|(q, m)| (*q == qid).then(|| m.name.clone()))
-                .flatten()
+            IdentifySurface::IcyLanded => {
+                // A real ICY title landed during the capture: ICY wins. Do NOT overwrite it
+                // with the recognized title, and disarm the auto slot for this qid (mirrors
+                // the fire gate's ICY-wins Disarm, just detected at the surfacing step). The
+                // recognized hit is still reported honestly to the caller.
+                self.disarm_auto_identify_for_qid(qid);
+                return IdentifyOutcome::Hit { track, now_playing };
+            }
+            IdentifySurface::Decorate(name) => name,
         };
 
         // Surface the recognized cover toward the dj-gui pane (qid-gated slot).
@@ -3624,10 +3705,10 @@ impl HypodjHandler {
             return;
         }
         // Read the reported play state BEFORE the State lock (never nested).
-        let playing = self.reported_play_state() == PlayState::Playing;
+        let play = self.reported_play_state();
         let decision = {
             let st = self.state.lock().unwrap();
-            auto_identify_gate(&st, id, playing)
+            auto_identify_gate(&st, id, play)
         };
         match decision {
             AutoIdentifyGate::Tombstone => {}
@@ -3636,6 +3717,12 @@ impl HypodjHandler {
                 if matches!(&st.pending_auto_identify, Some(a) if a.timer_id == id) {
                     st.pending_auto_identify = None;
                 }
+            }
+            AutoIdentifyGate::RearmPaused => {
+                // Paused but still our stream: re-arm one cadence out KEEPING misses +
+                // last_recognized, so the resume-edge reschedule (idempotent per qid)
+                // preserves the own-hit provenance instead of re-identifying.
+                self.rearm_auto_identify_paused(id);
             }
             AutoIdentifyGate::Proceed => {
                 // Off-spine: a capture is up to 40s, so NEVER inline on the director
@@ -3717,6 +3804,48 @@ impl HypodjHandler {
         slot.timer_id = timer_id;
         slot.guard = guard;
         // misses UNCHANGED: a skip is not a miss.
+    }
+
+    /// Disarm the auto-identify slot for `qid` if it is the one currently armed (task
+    /// why1cp6). Used at the surfacing step when a real ICY title landed mid-capture:
+    /// ICY-wins retires the cadence, mirroring the fire gate's ICY-wins Disarm. No-op if
+    /// the slot is gone or already repointed to a different qid.
+    fn disarm_auto_identify_for_qid(&self, qid: QueueId) {
+        let mut st = self.state.lock().unwrap();
+        if matches!(&st.pending_auto_identify, Some(a) if a.qid == qid) {
+            st.pending_auto_identify = None;
+        }
+    }
+
+    /// Re-arm the auto-identify cadence when a fire landed on a PAUSED deck that is still
+    /// our current stream (task why1cp6). Re-arms the SAME slot at the current backoff
+    /// position (misses unchanged) KEEPING `last_recognized`, keyed on the fired id, so the
+    /// resume-edge `reschedule_auto_identify` (idempotent per qid) preserves the own-hit
+    /// provenance rather than dropping the slot and re-identifying a track we already know.
+    /// A paused fire is neither a hit nor a miss, so nothing about the slot changes but its
+    /// timer. Toggle off / no timer source -> disarm. No-ops if the slot was already
+    /// re-armed under a different id (the clock converged).
+    fn rearm_auto_identify_paused(&self, id: TimerId) {
+        let timers = match (self.recognize_auto.load(Ordering::Relaxed), self.plan_timers.get()) {
+            (true, Some(t)) => t.clone(),
+            _ => {
+                let mut st = self.state.lock().unwrap();
+                if matches!(&st.pending_auto_identify, Some(a) if a.timer_id == id) {
+                    st.pending_auto_identify = None;
+                }
+                return;
+            }
+        };
+        let interval = self.recognize_interval_secs.load(Ordering::Relaxed);
+        let mut st = self.state.lock().unwrap();
+        let Some(slot) = st.pending_auto_identify.as_mut() else { return };
+        if slot.timer_id != id {
+            return;
+        }
+        let (timer_id, guard) = timers.arm(Instant::now() + auto_identify_delay(interval, slot.misses));
+        slot.timer_id = timer_id;
+        slot.guard = guard;
+        // misses + last_recognized UNCHANGED: a paused fire is neither a hit nor a miss.
     }
 
     fn notify_change(&self) {
@@ -6016,17 +6145,24 @@ enum AutoIdentifyGate {
     /// The fired id is not the slot's (a superseded / plan / warm timer): NO-OP, leave
     /// the slot untouched (the live-set tombstone idiom).
     Tombstone,
-    /// Drop the slot: the deck is not playing, the current is no longer this stream, or a
+    /// Drop the slot: the deck is STOPPED, the current is no longer this stream, or a
     /// real ICY title now names it (ICY wins). Resume/next re-arms cleanly.
     Disarm,
+    /// The deck is PAUSED but still our current stream (no foreign ICY): re-arm the SAME
+    /// slot one cadence out KEEPING misses + last_recognized provenance, rather than drop
+    /// it. A capture while paused would grab silence/stale audio, so we must not run
+    /// songrec - but dropping the slot loses the own-hit provenance, so the resume-edge
+    /// re-arm would re-identify a track we already recognized (a redundant Shazam call).
+    /// Task why1cp6.
+    RearmPaused,
     /// Capture: no usable ICY title (or only the title WE wrote), still the current
     /// playing stream - run songrec.
     Proceed,
 }
 
 /// Decide what an auto-identify fire for `id` should do, purely over `st` + the
-/// out-of-lock `playing` flag. See [`AutoIdentifyGate`] for the outcomes.
-fn auto_identify_gate(st: &State, id: TimerId, playing: bool) -> AutoIdentifyGate {
+/// out-of-lock `play` state. See [`AutoIdentifyGate`] for the outcomes.
+fn auto_identify_gate(st: &State, id: TimerId, play: PlayState) -> AutoIdentifyGate {
     // (1) Is this fire ours? A stale id tombstones (a superseded slot has a fresh id).
     let Some(slot) = &st.pending_auto_identify else {
         return AutoIdentifyGate::Tombstone;
@@ -6034,14 +6170,10 @@ fn auto_identify_gate(st: &State, id: TimerId, playing: bool) -> AutoIdentifyGat
     if slot.timer_id != id {
         return AutoIdentifyGate::Tombstone;
     }
-    // (2) The deck must be genuinely PLAYING - a paused/stopped stream would capture
-    // silence/stale audio; disarm (resume re-arms a fresh grace on the Playing edge).
-    if !playing {
-        return AutoIdentifyGate::Disarm;
-    }
-    // (3) Still the current entry, still a raw Stream, still THIS qid. A track change
+    // (2) Still the current entry, still a raw Stream, still THIS qid. A track change
     // during the grace/cadence retires the slot (a stale capture must never decorate a
-    // different entry).
+    // different entry). Checked BEFORE the play-state branch so a paused-but-still-current
+    // stream is distinguished from a paused deck whose stream already changed.
     let still_current_stream = st
         .reported_current()
         .and_then(|i| st.queue.get(i))
@@ -6050,10 +6182,12 @@ fn auto_identify_gate(st: &State, id: TimerId, playing: bool) -> AutoIdentifyGat
     if !still_current_stream {
         return AutoIdentifyGate::Disarm;
     }
-    // (4) ICY-WINS: if a non-blank ICY/now-playing title is stored for this qid that we
+    // (3) ICY-WINS: if a non-blank ICY/now-playing title is stored for this qid that we
     // did NOT write ourselves (!= last_recognized), real ICY is naming the stream - stop
     // the cadence. A title EQUAL to last_recognized is our own prior hit (own-hit
-    // provenance), so it must PROCEED, not disarm.
+    // provenance), so it must PROCEED, not disarm. Evaluated before the play-state branch
+    // so ICY wins even on a paused deck (a paused stream a real ICY title now names must
+    // still retire the cadence, never linger re-armed).
     if let Some((mqid, meta)) = &st.stream_meta {
         if *mqid == slot.qid {
             if let Some(title) = meta.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
@@ -6064,7 +6198,62 @@ fn auto_identify_gate(st: &State, id: TimerId, playing: bool) -> AutoIdentifyGat
             }
         }
     }
-    AutoIdentifyGate::Proceed
+    // (4) The deck must be genuinely PLAYING to capture: a paused stream would grab
+    // silence/stale audio. PAUSED (still our stream, no foreign ICY) re-arms keeping
+    // provenance so the resume edge does not re-identify; STOPPED disarms (a stop is
+    // terminal - resume/next re-arms a fresh grace).
+    match play {
+        PlayState::Playing => AutoIdentifyGate::Proceed,
+        PlayState::Paused => AutoIdentifyGate::RearmPaused,
+        PlayState::Stopped => AutoIdentifyGate::Disarm,
+    }
+}
+
+/// The auto-identify SURFACING decision (task why1cp6), factored out of
+/// [`HypodjHandler::identify_inner`] so the qid-gate + ICY-landed-mid-capture detection is
+/// unit-testable without songrec. See [`identify_surface_decision`].
+enum IdentifySurface {
+    /// The current entry is no longer the captured qid: report the hit but do NOT decorate.
+    Advanced,
+    /// A real ICY title landed DURING the capture: ICY wins - do NOT overwrite it, disarm.
+    IcyLanded,
+    /// Decorate as usual; carries the preserved ICY station Name (if one was latched).
+    Decorate(Option<String>),
+}
+
+/// Decide how a completed recognition should SURFACE, purely over `st` + the qid it was
+/// captured for + the title latched at capture START. A changed current qid ->
+/// [`IdentifySurface::Advanced`]; a non-blank title that CHANGED since capture start is a
+/// fresh ICY title -> [`IdentifySurface::IcyLanded`] (ICY-wins is enforced at FIRE, but the
+/// up-to-40s capture is a window a real ICY title can arrive in, so re-check it here too);
+/// otherwise [`IdentifySurface::Decorate`] with the preserved station Name.
+fn identify_surface_decision(
+    st: &State,
+    qid: QueueId,
+    title_at_capture: Option<&str>,
+) -> IdentifySurface {
+    let still_current = st
+        .reported_current()
+        .and_then(|i| st.queue.get(i))
+        .is_some_and(|it| QueueId(it.id) == qid);
+    if !still_current {
+        return IdentifySurface::Advanced;
+    }
+    let cur_title = st
+        .stream_meta
+        .as_ref()
+        .and_then(|(q, m)| (*q == qid).then(|| m.title.as_deref()).flatten())
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if cur_title.is_some() && cur_title != title_at_capture {
+        return IdentifySurface::IcyLanded;
+    }
+    let existing_name = st
+        .stream_meta
+        .as_ref()
+        .and_then(|(q, m)| (*q == qid).then(|| m.name.clone()))
+        .flatten();
+    IdentifySurface::Decorate(existing_name)
 }
 
 /// The auto-identify re-identify delay: `interval * 2^min(misses, MAX)`. A hit passes
@@ -7585,10 +7774,7 @@ impl HypodjHandler {
     /// or wedge the art worker.
     async fn fetch_remote_cover(&self, url: &str) -> Option<Vec<u8>> {
         const MAX_COVER_BYTES: u64 = 2 * 1024 * 1024;
-        let loopback_http = url.starts_with("http://127.0.0.1")
-            || url.starts_with("http://localhost")
-            || url.starts_with("http://[::1]");
-        if !url.starts_with("https://") && !loopback_http {
+        if !url.starts_with("https://") && !is_loopback_http_url(url) {
             return None;
         }
         let mut resp = self.cover_http.get(url).send().await.ok()?;
@@ -9052,6 +9238,48 @@ mod tests {
         assert!(
             h.state.lock().unwrap().pending_continuation_warm.is_none(),
             "still no warm once the StopRestore terminal has settled"
+        );
+    }
+
+    // STOP-RESTORE DISARM (LOW, task cxvztz4): the install funnel disarms a warm for a
+    // stopping fade, but a reschedule-triggering gesture (seek / repeat toggle) issued
+    // DURING the in-flight fade-out sees the deck still raw-Playing (the stop only lands at
+    // the StopRestore terminal) and RE-ARMS a warm behind it. The StopRestore terminal now
+    // disarms that parked warm so no inert timer lingers on the stopped deck.
+    #[tokio::test(start_paused = true)]
+    async fn stop_restore_terminal_disarms_a_warm_rearmed_mid_fade() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.play_for_test(0).await;
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "a warm arms on the genuinely playing final track"
+        );
+        // A `fade out` installs: the funnel disarms the warm (the deck is fading to a stop).
+        h.start_fade(fade_args(FadeKind::Out, 20)).await.unwrap();
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "the install funnel disarms the warm for a stopping fade"
+        );
+        // Simulate a seek / repeat-toggle mid-fade: mpv is STILL raw-Playing (the stop only
+        // lands at the terminal), so reschedule arms a warm behind the stopping deck - the
+        // bug's setup, an INERT timer parked up to dur-45s without the terminal disarm.
+        assert_eq!(h.player.state(), PlayState::Playing, "mpv is still raw-Playing mid-fade");
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "a mid-fade reschedule re-arms a warm on the still raw-Playing deck"
+        );
+        // Drive the fade-out to its StopRestore terminal: the deck stops and the fix disarms
+        // the parked warm so no inert timer survives on the dead deck.
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped, "the fade-out stopped the deck");
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "the StopRestore terminal disarms the warm re-armed mid-fade (no inert parked timer)"
         );
     }
 
@@ -11118,6 +11346,61 @@ mod tests {
         );
     }
 
+    // ICY-MID-CAPTURE (LOW, task why1cp6): the SURFACING decision that closes the ICY-wins
+    // gap. ICY-wins is enforced at FIRE, but the up-to-40s capture is a window a real ICY
+    // title can arrive in; the surfacing step re-checks it so a title that CHANGED since
+    // capture start is preserved (IcyLanded), not clobbered by the recognized title. Pure
+    // over the State, so no songrec is needed.
+    #[tokio::test]
+    async fn identify_surface_preserves_icy_that_landed_mid_capture() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let raw = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        let qid = QueueId(raw);
+
+        // Capture started with NO title latched (title_at_capture = None) and nothing landed
+        // during the capture -> Decorate (the ordinary first-hit surfacing path).
+        {
+            let st = h.state.lock().unwrap();
+            assert!(
+                matches!(identify_surface_decision(&st, qid, None), IdentifySurface::Decorate(_)),
+                "no title change during the capture -> decorate normally"
+            );
+        }
+        // A REAL ICY title lands mid-capture (title_at_capture was None, now non-blank) ->
+        // IcyLanded: the recognized title must NOT overwrite it.
+        h.set_stream_meta(qid, Some("NTS".into()), Some("Real Show - Live".into()));
+        {
+            let st = h.state.lock().unwrap();
+            assert!(
+                matches!(identify_surface_decision(&st, qid, None), IdentifySurface::IcyLanded),
+                "an ICY title that appeared during the capture wins - do not clobber it"
+            );
+        }
+        // A title UNCHANGED since capture start (our own prior hit, or a pre-existing title a
+        // MANUAL identify legitimately supersedes) -> Decorate, preserving the station Name.
+        {
+            let st = h.state.lock().unwrap();
+            match identify_surface_decision(&st, qid, Some("Real Show - Live")) {
+                IdentifySurface::Decorate(name) => {
+                    assert_eq!(name.as_deref(), Some("NTS"), "the ICY station Name is preserved")
+                }
+                _ => panic!("an unchanged title must decorate (own hit / pre-existing), not win as fresh ICY"),
+            }
+        }
+        // The stream advanced away from the captured qid -> Advanced (never decorate a
+        // now-different entry with a stale capture).
+        h.enqueue_song_for_test(playlist_test_song("lib")).await;
+        h.play_for_test(1).await;
+        {
+            let st = h.state.lock().unwrap();
+            assert!(
+                matches!(identify_surface_decision(&st, qid, None), IdentifySurface::Advanced),
+                "a changed current qid -> advanced (report but do not decorate)"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn recognized_cover_ignored_for_wrong_qid() {
         // A cover keyed to a DIFFERENT qid must never leak onto the current stream's
@@ -11182,12 +11465,13 @@ mod tests {
         tokio::task::yield_now().await;
         let id = fire_rx.recv().await.expect("the grace timer fired at 8s");
         let st = h.state.lock().unwrap();
-        assert_eq!(auto_identify_gate(&st, id, true), AutoIdentifyGate::Proceed);
+        assert_eq!(auto_identify_gate(&st, id, PlayState::Playing), AutoIdentifyGate::Proceed);
     }
 
-    // The pure fire-gate decision table (no songrec): tombstone on a stale id, disarm on
-    // a paused deck, proceed with our id, disarm on a REAL ICY title, PROCEED when the
-    // title equals last_recognized (own hit), disarm on a changed current qid.
+    // The pure fire-gate decision table (no songrec): tombstone on a stale id, disarm on a
+    // STOPPED deck, RE-ARM (keep provenance) on a PAUSED-but-still-current deck, proceed
+    // with our id, disarm on a REAL ICY title, PROCEED when the title equals last_recognized
+    // (own hit), disarm on a changed current qid.
     #[tokio::test(start_paused = true)]
     async fn auto_identify_gate_decision_table() {
         let Some((h, _rx)) = auto_identify_rig() else { return };
@@ -11206,27 +11490,37 @@ mod tests {
         {
             let st = h.state.lock().unwrap();
             assert_eq!(
-                auto_identify_gate(&st, crate::event::TimerId(u64::MAX), true),
+                auto_identify_gate(&st, crate::event::TimerId(u64::MAX), PlayState::Playing),
                 AutoIdentifyGate::Tombstone,
                 "a stale id tombstones"
             );
             assert_eq!(
-                auto_identify_gate(&st, live_id, false),
+                auto_identify_gate(&st, live_id, PlayState::Stopped),
                 AutoIdentifyGate::Disarm,
-                "a not-playing deck disarms"
+                "a stopped deck disarms"
             );
             assert_eq!(
-                auto_identify_gate(&st, live_id, true),
+                auto_identify_gate(&st, live_id, PlayState::Paused),
+                AutoIdentifyGate::RearmPaused,
+                "a paused-but-still-current deck re-arms (keeps provenance), never disarms"
+            );
+            assert_eq!(
+                auto_identify_gate(&st, live_id, PlayState::Playing),
                 AutoIdentifyGate::Proceed,
                 "our id + playing + no ICY proceeds"
             );
         }
-        // A REAL ICY title (not one we wrote) -> disarm (ICY wins).
+        // A REAL ICY title (not one we wrote) -> disarm (ICY wins), even while paused.
         h.set_stream_meta(QueueId(qid), Some("NTS".into()), Some("Real ICY - Track".into()));
         assert_eq!(
-            auto_identify_gate(&h.state.lock().unwrap(), live_id, true),
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, PlayState::Playing),
             AutoIdentifyGate::Disarm,
             "a real ICY title disarms the cadence"
+        );
+        assert_eq!(
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, PlayState::Paused),
+            AutoIdentifyGate::Disarm,
+            "ICY wins over the paused re-arm too"
         );
         // A title EQUAL to last_recognized is our own hit -> proceed (must not disarm).
         h.state
@@ -11237,7 +11531,7 @@ mod tests {
             .unwrap()
             .last_recognized = Some("Real ICY - Track".into());
         assert_eq!(
-            auto_identify_gate(&h.state.lock().unwrap(), live_id, true),
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, PlayState::Playing),
             AutoIdentifyGate::Proceed,
             "our own prior hit must not be mistaken for ICY"
         );
@@ -11246,7 +11540,7 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("lib")).await;
         h.play_for_test(1).await;
         assert_eq!(
-            auto_identify_gate(&h.state.lock().unwrap(), live_id, true),
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, PlayState::Playing),
             AutoIdentifyGate::Disarm,
             "a changed current qid disarms"
         );
@@ -11284,6 +11578,45 @@ mod tests {
         let a = st.pending_auto_identify.as_ref().unwrap();
         assert_eq!(a.misses, 0, "a hit resets misses");
         assert_eq!(a.last_recognized.as_deref(), Some("Artist - Track"), "own-hit provenance recorded");
+    }
+
+    // PAUSE PROVENANCE (MEDIUM, task why1cp6): a cadence fire while PAUSED (still our current
+    // stream, no foreign ICY) RE-ARMS the slot KEEPING last_recognized + misses instead of
+    // disarming. Dropping the slot would make the resume-edge reschedule arm a fresh grace
+    // that re-identifies a track we already recognized (a redundant Shazam call). Drives the
+    // full on_auto_identify_fire path with the deck reporting Paused.
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_paused_fire_keeps_provenance() {
+        let Some((h, _rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        // Seed own-hit provenance + a nonzero backoff, as a prior hit/miss would leave.
+        let first_id = {
+            let mut st = h.state.lock().unwrap();
+            let slot = st.pending_auto_identify.as_mut().unwrap();
+            slot.last_recognized = Some("Artist - Track".into());
+            slot.misses = 2;
+            slot.timer_id
+        };
+        // Report Paused (pending_pause makes reported_play_state Paused without a real fade).
+        h.state.lock().unwrap().pending_pause = true;
+        assert_eq!(h.reported_play_state(), PlayState::Paused, "the deck reports Paused");
+        // Fire the cadence while paused: the gate yields RearmPaused, the fire hook re-arms.
+        let h = std::sync::Arc::new(h);
+        h.on_auto_identify_fire(first_id).await;
+        let st = h.state.lock().unwrap();
+        let slot = st
+            .pending_auto_identify
+            .as_ref()
+            .expect("the slot SURVIVES a paused fire (not disarmed)");
+        assert_eq!(
+            slot.last_recognized.as_deref(),
+            Some("Artist - Track"),
+            "last_recognized provenance is preserved across the paused fire"
+        );
+        assert_eq!(slot.misses, 2, "misses preserved (a paused fire is neither a hit nor a miss)");
+        assert_ne!(slot.timer_id, first_id, "a FRESH cadence timer is armed (the fired one is spent)");
     }
 
     // DISARM co-located in clear_stream_meta_except: same qid keeps the slot; a qid change
@@ -11669,6 +12002,63 @@ mod tests {
             MpdResponse::Ack { code, .. } => assert_eq!(code, ACK_ERROR_NO_EXIST),
             other => panic!("expected no-exist ACK, got {other:?}"),
         }
+    }
+
+    // BOUNDED COVER CLIENT (task njvsh8w): the cover client is built by the hard-fail
+    // builder, never an UNBOUNDED fallback. Prove the bound behaviorally - a request to a
+    // loopback black-hole (bound-but-never-accepted, so the kernel completes the handshake
+    // into the backlog and no HTTP response ever comes) must hit the client's own 2.5s total
+    // timeout, not hang past the 8s safety net (which an unbounded client would).
+    #[tokio::test]
+    async fn cover_http_client_is_bounded_never_unbounded_fallback() {
+        // Skip in the certless, network-less package sandbox (same guard as the other live
+        // helpers): this test opens a real loopback socket.
+        let Some((_h, _events)) = handler_with_null_player() else { return };
+        let client = build_cover_http_client();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/x.png");
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(8), client.get(&url).send()).await;
+        match outcome {
+            Ok(res) => assert!(res.is_err(), "the bounded client times out the hung request"),
+            Err(_) => panic!("the request hung past 8s: the cover client is UNBOUNDED"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "the bound fired well under the 8s safety net (elapsed {:?})",
+            started.elapsed()
+        );
+        drop(listener);
+    }
+
+    // EXACT LOOPBACK HTTP EXEMPTION (task njvsh8w): plain http is exempted ONLY for a genuine
+    // loopback host, matched EXACTLY - a non-loopback host that merely STARTS WITH a loopback
+    // name (which the old starts_with prefix test wrongly allowed) is rejected.
+    #[test]
+    fn loopback_http_exemption_is_exact_host_not_prefix() {
+        // Genuine loopback hosts are exempted for plain http (local test servers / dev).
+        assert!(is_loopback_http_url("http://127.0.0.1:8080/cover.png"));
+        assert!(is_loopback_http_url("http://127.0.0.1/cover.png"));
+        assert!(is_loopback_http_url("http://localhost:9000/c.png"));
+        assert!(is_loopback_http_url("http://LocalHost/c.png"), "host match is case-insensitive");
+        assert!(is_loopback_http_url("http://[::1]:7000/c.png"));
+        assert!(
+            is_loopback_http_url("http://127.0.0.5/c.png"),
+            "the whole 127.0.0.0/8 block is loopback"
+        );
+        // A non-loopback host that merely STARTS WITH a loopback name is NOT exempted.
+        assert!(!is_loopback_http_url("http://127.0.0.1.evil.example/c.png"));
+        assert!(!is_loopback_http_url("http://localhost.attacker.test/c.png"));
+        assert!(
+            !is_loopback_http_url("http://127.0.0.1@evil.example/c.png"),
+            "a loopback in the userinfo does not smuggle the host past the check"
+        );
+        // https needs no exemption; only http is loopback-exempted.
+        assert!(!is_loopback_http_url("https://127.0.0.1/c.png"));
+        assert!(!is_loopback_http_url("https://localhost/c.png"));
+        // A hostless / unparseable url is never exempted.
+        assert!(!is_loopback_http_url("not a url"));
     }
 
     // ── saved internet radio stations (task cchte88) ───────────────────────
