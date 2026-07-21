@@ -60,6 +60,10 @@ use crate::player::{
     db_to_mpv_volume, effective_play_state, mpv_volume_to_db, PlayState, PlayerError, PlayerHandle,
     StreamMeta,
 };
+use crate::station_identity::{
+    is_nts_stream_url, match_nts_mixtape, StationIdentity, NTS_CATALOGUE_CACHE_KEY,
+    NTS_MIXTAPES_URL,
+};
 use crate::resume::{
     build_shutdown_fade, store_atomic, ResumeItem, ResumePlayState, ResumeState,
     RESUME_SCHEMA_VERSION,
@@ -270,6 +274,23 @@ struct State {
     /// with an 8s ICY grace; if no usable ICY title arrives, the fire auto-runs songrec
     /// identify and rearms on a rate-limited cadence. EPHEMERAL: never persisted.
     pending_auto_identify: Option<AutoIdentify>,
+    /// The resolved STATION IDENTITY for the current raw stream (task lq54isr), keyed by
+    /// the LATCHED [`QueueId`] it belongs to, or `None` at rest / for a library song / a
+    /// stream no provider recognized. A THIRD independent writer beside [`Self::stream_meta`]
+    /// (ICY) and [`Self::recognized_cover`] (Shazam): the per-track-start
+    /// [`crate::station_identity`] resolver (currently the NTS mixtapes provider) fills it
+    /// from an OUTSIDE catalogue keyed by the exact stream URL, so a stream that carries no
+    /// ICY and no fingerprint (an NTS mixtape) still surfaces a name + cover. The three
+    /// slots are merged at READ time (currentsong / MPRIS / stream-cover), never written to
+    /// a shared field, so there is no write race. EPHEMERAL: never persisted to resume.toml.
+    station_identity: Option<(QueueId, StationIdentity)>,
+    /// GENERATION counter for the station-identity resolver, bumped on every genuine
+    /// stream track-start that spawns a resolver. The spawned resolver captures the
+    /// generation and [`HypodjHandler::set_station_identity`] writes ONLY when it still
+    /// matches - so a slow resolver for a PRIOR stream can never clobber a newer stream's
+    /// already-resolved identity (qids are monotonic, but the single slot is last-writer,
+    /// and this is what makes the late write a no-op). EPHEMERAL: never persisted.
+    station_identity_gen: u64,
 }
 
 /// The pending continuation-warm slot (see [`State::pending_continuation_warm`]). A
@@ -442,6 +463,10 @@ impl Default for State {
             pending_continuation_warm: None,
             // No pending auto-identify until a stream becomes current.
             pending_auto_identify: None,
+            // No resolved station identity until a provider matches the current stream.
+            station_identity: None,
+            // The resolver generation starts at 0; every stream track-start bumps it.
+            station_identity_gen: 0,
         }
     }
 }
@@ -1235,6 +1260,15 @@ pub struct HypodjHandler {
     /// gated by the current stream entry - not a Subsonic concern, so it lives
     /// here rather than being borrowed through the base-url-bound SubsonicClient.
     cover_http: reqwest::Client,
+    /// Dedicated HTTP client for the STATION-IDENTITY catalogue fetch (task lq54isr):
+    /// the NTS `/api/v2/mixtapes` JSON. Its own client (no auth, a slightly longer 4s
+    /// total timeout than the cover client, since it is a one-shot off-spine resolve,
+    /// not an art-pane blocker) so the catalogue fetch never contends with cover bytes.
+    station_identity_http: reqwest::Client,
+    /// The fetched NTS mixtapes catalogue JSON, cached long-TTL (static content) under
+    /// [`NTS_CATALOGUE_CACHE_KEY`] so repeated stream track-starts re-match against the
+    /// cached document instead of re-fetching. A miss is a natural refetch.
+    nts_catalogue_cache: TtlLru<String, String>,
 
     // ── P2 plan registry ───────────────────────────────────────────────────
     /// The armed-plan registry, SHARED with the [`crate::executor::Executor`]
@@ -1587,6 +1621,17 @@ impl HypodjHandler {
                 .redirect(reqwest::redirect::Policy::limited(4))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
+            // The station-identity catalogue client: no auth, a 4s total ceiling (a
+            // one-shot off-spine resolve, bounded but not as tight as the cover client).
+            station_identity_http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(4))
+                .redirect(reqwest::redirect::Policy::limited(4))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+            // The NTS mixtapes catalogue is static; cache it for an hour so repeated
+            // stream track-starts re-match without re-fetching.
+            nts_catalogue_cache: TtlLru::new(4, Duration::from_secs(3600)),
             plan_pending: Arc::new(Mutex::new(Vec::new())),
             next_plan_id: AtomicU64::new(0),
             plan_timers: OnceLock::new(),
@@ -3246,6 +3291,84 @@ impl HypodjHandler {
         self.notify_change();
     }
 
+    /// Store a resolved [`StationIdentity`] for the raw stream identified by `queue_id`
+    /// (task lq54isr), gated on the resolver GENERATION so a stale result cannot clobber a
+    /// newer stream's identity. A newer stream track-start bumps `station_identity_gen`;
+    /// this write is a NO-OP when the captured `gen` no longer matches (the resolver was
+    /// for a superseded track). On a real write it wakes idling clients so currentsong /
+    /// dj-gui re-read the fresh Name + `X-CoverArt`. The std lock is held ONLY for the
+    /// field write and dropped BEFORE `notify_change` (never across an await); mutated
+    /// through `&self` interior mutability, never `&mut self`.
+    pub(crate) fn set_station_identity(&self, gen: u64, queue_id: QueueId, identity: StationIdentity) {
+        {
+            let mut st = self.state.lock().unwrap();
+            // A newer track-start already superseded this resolver: drop the late result
+            // rather than overwrite the current stream's slot with a prior stream's identity.
+            if st.station_identity_gen != gen {
+                return;
+            }
+            st.station_identity = Some((queue_id, identity));
+        }
+        self.notify_change();
+    }
+
+    /// STATION-IDENTITY resolver trigger (task lq54isr): on a genuine stream track-start,
+    /// spawn the per-track resolver off the spine. Reads the stream URL + BUMPS the
+    /// generation under ONE short std lock (dropped before the spawn), and returns WITHOUT
+    /// spawning for a library song / an entry that vanished (only a raw stream has an
+    /// external identity to resolve). Mirrors the auto-identify spawn discipline: the
+    /// heavy work (an NTS catalogue fetch + match) runs on a cloned `Arc` via
+    /// `tokio::spawn`, never inline on the spine, and no std lock is held across the await.
+    pub(crate) fn spawn_station_identity(self: &std::sync::Arc<Self>, qid: QueueId) {
+        let (url, gen) = {
+            let mut st = self.state.lock().unwrap();
+            let url = match st.queue.iter().find(|it| it.id == qid.0).map(|it| &it.entry) {
+                Some(QueueEntry::Stream { url, .. }) => url.clone(),
+                _ => return,
+            };
+            st.station_identity_gen = st.station_identity_gen.wrapping_add(1);
+            (url, st.station_identity_gen)
+        };
+        let this = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            this.resolve_station_identity(gen, qid, url).await;
+        });
+    }
+
+    /// The off-spine STATION-IDENTITY resolution body (task lq54isr). Currently ONE
+    /// provider: the NTS mixtapes catalogue. Host-prefilters to an NTS URL (so an
+    /// arbitrary stream never triggers a network call), fetches the catalogue cache-first
+    /// (static content, long TTL) with NO std lock held across the await, matches the URL
+    /// by string equality, and stores the identity via [`Self::set_station_identity`]
+    /// (generation-gated). Any error / miss leaves the slot untouched (no identity is an
+    /// honest outcome). No leaked task: the fetch is bounded by the client's 4s timeout
+    /// and lives entirely inside this future.
+    async fn resolve_station_identity(&self, gen: u64, qid: QueueId, url: String) {
+        // Only NTS URLs are worth a catalogue fetch (P4 adds more providers here).
+        if !is_nts_stream_url(&url) {
+            return;
+        }
+        // Cache-first: the catalogue is static, so a hit skips the network entirely.
+        let catalogue = match self.nts_catalogue_cache.get(&NTS_CATALOGUE_CACHE_KEY.to_string()) {
+            Some(json) => json,
+            None => {
+                let resp = match self.station_identity_http.get(NTS_MIXTAPES_URL).send().await {
+                    Ok(r) if r.status().is_success() => r,
+                    _ => return,
+                };
+                let json = match resp.text().await {
+                    Ok(t) if !t.trim().is_empty() => t,
+                    _ => return,
+                };
+                self.nts_catalogue_cache.put(NTS_CATALOGUE_CACHE_KEY.to_string(), json.clone());
+                json
+            }
+        };
+        if let Some(identity) = match_nts_mixtape(&catalogue, &url) {
+            self.set_station_identity(gen, qid, identity);
+        }
+    }
+
     /// Drop any stored live stream metadata that does NOT belong to `keep`, called on
     /// every play edge / stop so a station's Name/Title can never linger onto the next
     /// track. Passing `Some(qid)` keeps the slot when it matches (a mid-stream ICY
@@ -3273,6 +3396,14 @@ impl HypodjHandler {
         if let Some(a) = &st.pending_auto_identify {
             if keep != Some(a.qid) {
                 st.pending_auto_identify = None;
+            }
+        }
+        // Drop the resolved station identity on the same edge (task lq54isr) so a name /
+        // cover from a prior stream can never linger onto the next entry - a sibling of
+        // the stream_meta / recognized_cover drops above.
+        if let Some((qid, _)) = &st.station_identity {
+            if keep != Some(*qid) {
+                st.station_identity = None;
             }
         }
     }
@@ -5690,24 +5821,32 @@ impl HypodjHandler {
         // from ICY (stream_meta) or falls back to the URL Title, exactly like any
         // raw stream - so `add station/<name>` then `play` plays it by name.
         let resolved_station_url;
+        // The saved station's canonical NAME (P1, task lq54isr): carried as the
+        // QueueEntry::Stream title so `add station/<name>` shows the name instead of the
+        // raw URL - the same name-carry `try_continuation` does with the configured
+        // station label. `None` for a bare-URL add (Title falls back to the URL below).
+        let mut station_title: Option<String> = None;
         let uri = if let Some(name) = uri.strip_prefix("station/") {
             let stations = self
                 .client
                 .get_internet_radio_stations()
                 .await
                 .map_err(|e| e.to_string())?;
-            resolved_station_url = station_url_for_name(&stations, name)
+            let station = station_for_name(&stations, name)
                 .ok_or_else(|| format!("no such station: {name}"))?;
+            station_title = Some(station.name.clone());
+            resolved_station_url = station.stream_url.clone();
             resolved_station_url.as_str()
         } else {
             uri
         };
         let entry = if is_stream_uri(uri) {
-            // Title is the URL (a stream's icy-name is only known once mpv
-            // connects; the URL is a sensible, always-available label).
+            // Title is the saved station name when this came in as `station/<name>`
+            // (P1), else the URL (a bare stream's icy-name is only known once mpv
+            // connects; the URL is a sensible, always-available fallback label).
             QueueEntry::Stream {
                 url: uri.to_string(),
-                title: uri.to_string(),
+                title: station_title.unwrap_or_else(|| uri.to_string()),
             }
         } else {
             let song_id = uri
@@ -6130,18 +6269,48 @@ impl MpdHandler for HypodjHandler {
                         // exact entry - so a library song never inherits a station label
                         // and a stale slot from a prior stream never leaks onto a new one.
                         if matches!(item.entry, QueueEntry::Stream { .. }) {
+                            let cur_qid = QueueId(item.id);
                             if let Some((qid, meta)) = &st.stream_meta {
-                                if *qid == QueueId(item.id) {
+                                if *qid == cur_qid {
                                     apply_stream_meta(&mut pairs, meta);
                                 }
                             }
-                            // Surface a recognized Shazam cover toward the dj-gui art
-                            // pane as an `X-CoverArt` extension, ONLY when the stored
-                            // slot's identity matches this exact entry (task f7vnd3i).
-                            if let Some((qid, url)) = &st.recognized_cover {
-                                if *qid == QueueId(item.id) {
-                                    pairs.push(("X-CoverArt".to_string(), url.clone()));
+                            // A resolved station identity's name OUTRANKS the ICY `Name`
+                            // (task lq54isr): an NTS mixtape sends an empty/generic
+                            // icy-name, so the catalogue title is the true station label.
+                            // Overwrite the ICY-pushed `Name` (or add it) when the
+                            // qid-gated identity carries a non-empty name.
+                            if let Some((qid, ident)) = &st.station_identity {
+                                if *qid == cur_qid {
+                                    if let Some(name) =
+                                        ident.name.as_deref().filter(|n| !n.trim().is_empty())
+                                    {
+                                        if let Some(slot) =
+                                            pairs.iter_mut().find(|(k, _)| k == "Name")
+                                        {
+                                            slot.1 = name.to_string();
+                                        } else {
+                                            pairs.push(("Name".to_string(), name.to_string()));
+                                        }
+                                    }
                                 }
+                            }
+                            // Surface a cover toward the dj-gui art pane as an
+                            // `X-CoverArt` extension, ONLY when a qid-gated slot matches
+                            // this exact entry: the resolved station image (task lq54isr)
+                            // OUTRANKS a recognized Shazam cover (task f7vnd3i), two slots
+                            // read newest-provider-first so a last-writer race is impossible.
+                            let cover = st
+                                .station_identity
+                                .as_ref()
+                                .and_then(|(q, i)| (*q == cur_qid).then(|| i.image_url.clone()).flatten())
+                                .or_else(|| {
+                                    st.recognized_cover
+                                        .as_ref()
+                                        .and_then(|(q, u)| (*q == cur_qid).then(|| u.clone()))
+                                });
+                            if let Some(url) = cover {
+                                pairs.push(("X-CoverArt".to_string(), url));
                             }
                         }
                         MpdResponse::Pairs(pairs)
@@ -6868,17 +7037,42 @@ impl HypodjHandler {
         let it = st.queue.get(idx)?;
         let qid = QueueId(it.id);
         let is_stream = matches!(it.entry, QueueEntry::Stream { .. });
-        let stream_meta = if is_stream {
+        let mut stream_meta = if is_stream {
             st.stream_meta
                 .as_ref()
                 .and_then(|(q, m)| (*q == qid).then(|| m.clone()))
         } else {
             None
         };
-        let cover_url = if is_stream {
-            st.recognized_cover
+        let ident = if is_stream {
+            st.station_identity
                 .as_ref()
-                .and_then(|(q, u)| (*q == qid).then(|| u.clone()))
+                .and_then(|(q, i)| (*q == qid).then(|| i.clone()))
+        } else {
+            None
+        };
+        // Fold the resolved station identity into the SAME overlay the MPRIS seam already
+        // renders (task lq54isr): its name becomes the now-playing title when no ICY /
+        // recognized title outranks it (an NTS mixtape has neither), so GNOME's
+        // `xesam:title` reads the show name instead of the bare URL. The image folds into
+        // `cover_url` below, ahead of a recognized cover.
+        if let Some(ident) = &ident {
+            if let Some(name) = ident.name.as_deref().filter(|n| !n.trim().is_empty()) {
+                let m = stream_meta.get_or_insert_with(StreamMeta::default);
+                if m.title.as_deref().map_or(true, |t| t.trim().is_empty()) {
+                    m.title = Some(name.to_string());
+                }
+            }
+        }
+        let cover_url = if is_stream {
+            ident
+                .as_ref()
+                .and_then(|i| i.image_url.clone())
+                .or_else(|| {
+                    st.recognized_cover
+                        .as_ref()
+                        .and_then(|(q, u)| (*q == qid).then(|| u.clone()))
+                })
         } else {
             None
         };
@@ -7351,9 +7545,16 @@ impl HypodjHandler {
                     _ => None,
                 })
                 .and_then(|qid| {
-                    st.recognized_cover
+                    // The resolved station image (task lq54isr) OUTRANKS a recognized
+                    // Shazam cover (task f7vnd3i); both qid-gated, station-identity first.
+                    st.station_identity
                         .as_ref()
-                        .and_then(|(q, url)| (*q == qid).then(|| url.clone()))
+                        .and_then(|(q, i)| (*q == qid).then(|| i.image_url.clone()).flatten())
+                        .or_else(|| {
+                            st.recognized_cover
+                                .as_ref()
+                                .and_then(|(q, url)| (*q == qid).then(|| url.clone()))
+                        })
                 });
             match matched {
                 Some(u) => u,
@@ -7858,10 +8059,15 @@ fn station_browse_pairs(s: &Station) -> Vec<(String, String)> {
 /// getInternetRadioStations fetch. Backs `add station/<name>` (and thus `play` of a
 /// station by name) via [`enqueue_uri`](HypodjHandler::enqueue_uri).
 fn station_url_for_name(stations: &[Station], name: &str) -> Option<String> {
-    stations
-        .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(name))
-        .map(|s| s.stream_url.clone())
+    station_for_name(stations, name).map(|s| s.stream_url.clone())
+}
+
+/// Resolve a saved station BY NAME (case-insensitive, ASCII) to its full [`Station`],
+/// or `None` when none carries that name. Backs the P1 station-name carry (task
+/// lq54isr): `add station/<name>` reads BOTH the canonical name (the Stream title) and
+/// the stream URL from one lookup. Pure (no network, no lock) so it is unit-testable.
+fn station_for_name<'a>(stations: &'a [Station], name: &str) -> Option<&'a Station> {
+    stations.iter().find(|s| s.name.eq_ignore_ascii_case(name))
 }
 
 /// The default label for saving `url` as an internet radio station, given the
@@ -10654,6 +10860,190 @@ mod tests {
         assert!(!cur.iter().any(|(k, _)| k == "Name"), "a library song never inherits a station Name");
     }
 
+    // ── station identity (task lq54isr) ────────────────────────────────────
+
+    use crate::station_identity::{StationIdentity, StationIdentitySource};
+
+    fn nts_identity() -> StationIdentity {
+        StationIdentity {
+            name: Some("4 To The Floor".to_string()),
+            image_url: Some("https://media.ntslive.co.uk/resize/400x400/ftf.jpeg".to_string()),
+            source: StationIdentitySource::NtsMixtape,
+        }
+    }
+
+    // A resolved station identity names the stream in currentsong (Name) and surfaces its
+    // image as X-CoverArt, even though the stream sent NO ICY (stream_meta is None) - the
+    // NTS-mixtape case, where the API name is the only name there is.
+    #[tokio::test]
+    async fn currentsong_station_identity_names_no_icy_stream() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Name" && v == "4 To The Floor"),
+            "the resolved station identity names the stream: {cur:?}"
+        );
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-CoverArt"
+                && v == "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            "the resolved station image surfaces as X-CoverArt: {cur:?}"
+        );
+        assert!(cur.iter().any(|(k, v)| k == "file" && v == NTS), "file: stays the raw URL");
+    }
+
+    // Read-time NAME priority: an NTS-classified station identity (whose mere presence
+    // means the URL was recognized) OUTRANKS an empty/generic ICY icy-name.
+    #[tokio::test]
+    async fn currentsong_station_identity_name_outranks_empty_icy() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        // The stream advertised a blank icy-name (what NTS mixtapes actually send).
+        h.set_stream_meta(QueueId(qid), Some("   ".to_string()), None);
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Name" && v == "4 To The Floor"),
+            "the API name outranks the empty icy-name: {cur:?}"
+        );
+        assert!(
+            !cur.iter().any(|(k, v)| k == "Name" && v.trim().is_empty()),
+            "the blank icy-name must not survive: {cur:?}"
+        );
+    }
+
+    // The OTHER side of the priority: a NON-NTS stream (no station identity) with a REAL
+    // icy-name keeps that ICY name - the identity slot never interferes when absent.
+    #[tokio::test]
+    async fn currentsong_real_icy_name_wins_without_station_identity() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let other = "https://ice.somafm.com/groovesalad";
+        let qid = h.enqueue_stream_for_test(other).await;
+        h.play_for_test(0).await;
+        h.set_stream_meta(QueueId(qid), Some("SomaFM Groove Salad".to_string()), None);
+        // No station_identity is set (a non-NTS stream never resolves one).
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "Name" && v == "SomaFM Groove Salad"),
+            "a real icy-name wins with no station identity: {cur:?}"
+        );
+    }
+
+    // The station image OUTRANKS a recognized Shazam cover when both slots are keyed to
+    // the current stream (two qid-gated slots, station-identity first).
+    #[tokio::test]
+    async fn station_identity_image_outranks_recognized_cover() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.set_recognized_cover(QueueId(qid), "https://shazam.example/cover.jpg".to_string());
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        let render = |r: MpdResponse| match r {
+            MpdResponse::Pairs(p) => p,
+            other => panic!("expected Pairs, got {other:?}"),
+        };
+        let cur = render(h.handle(MpdCommand::CurrentSong).await);
+        assert!(
+            cur.iter().any(|(k, v)| k == "X-CoverArt"
+                && v == "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            "the station image outranks the Shazam cover: {cur:?}"
+        );
+        assert!(
+            !cur.iter().any(|(k, v)| k == "X-CoverArt" && v.contains("shazam")),
+            "the Shazam cover must not also appear: {cur:?}"
+        );
+    }
+
+    // clear_stream_meta_except drops the station identity on a track change (a different
+    // qid), exactly like its stream_meta / recognized_cover siblings, so a name/cover can
+    // never linger onto the next entry; a mid-stream re-land on the SAME qid keeps it.
+    #[tokio::test]
+    async fn station_identity_cleared_on_track_change() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        // Same qid kept (a mid-stream event) leaves the slot intact.
+        h.clear_stream_meta_except(Some(QueueId(qid)));
+        assert!(h.state.lock().unwrap().station_identity.is_some(), "same-qid keep preserves it");
+
+        // A different qid (a real track change) drops it.
+        h.clear_stream_meta_except(Some(QueueId(qid.wrapping_add(1))));
+        assert!(
+            h.state.lock().unwrap().station_identity.is_none(),
+            "a track change drops the station identity"
+        );
+    }
+
+    // The generation gate on set_station_identity: a resolver whose captured generation is
+    // stale (a newer track-start bumped it) is a NO-OP, so a slow prior-stream resolver can
+    // never clobber a newer stream's already-resolved identity.
+    #[tokio::test]
+    async fn set_station_identity_rejects_stale_generation() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        let cur_gen = h.state.lock().unwrap().station_identity_gen;
+
+        // A stale generation write is dropped.
+        h.set_station_identity(cur_gen.wrapping_sub(1), QueueId(qid), nts_identity());
+        assert!(
+            h.state.lock().unwrap().station_identity.is_none(),
+            "a stale-generation write must be a no-op"
+        );
+
+        // The matching generation writes.
+        h.set_station_identity(cur_gen, QueueId(qid), nts_identity());
+        assert!(
+            h.state.lock().unwrap().station_identity.is_some(),
+            "a matching-generation write lands"
+        );
+    }
+
+    // MPRIS: current_item folds the station identity into the overlay so GNOME's
+    // xesam:title reads the resolved show name and mpris:artUrl reads its image, even with
+    // no ICY on the stream (task lq54isr / P3).
+    #[tokio::test]
+    async fn current_item_surfaces_station_identity_for_mpris() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.state.lock().unwrap().station_identity = Some((QueueId(qid), nts_identity()));
+
+        let item = h.current_item().expect("a current item");
+        let meta = item.stream_meta.expect("station identity folded into the overlay");
+        assert_eq!(
+            meta.title.as_deref(),
+            Some("4 To The Floor"),
+            "the show name becomes the now-playing title for MPRIS"
+        );
+        assert_eq!(
+            item.cover_url.as_deref(),
+            Some("https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            "the station image becomes the MPRIS cover"
+        );
+    }
+
     // ── on-demand recognition (identify, task f7vnd3i) ─────────────────────
 
     #[tokio::test]
@@ -11381,6 +11771,13 @@ mod tests {
         assert_eq!(station_url_for_name(&stations, "nts 1").as_deref(), Some("https://n/1"));
         assert_eq!(station_url_for_name(&stations, "NTS 2").as_deref(), Some("https://n/2"));
         assert_eq!(station_url_for_name(&stations, "nope"), None);
+
+        // station_for_name (P1 carry) returns BOTH the canonical name (for the Stream
+        // title) and the URL from one case-insensitive lookup.
+        let found = station_for_name(&stations, "nts 1").expect("case-insensitive hit");
+        assert_eq!(found.name, "NTS 1", "the canonical (saved) name is carried, not the query casing");
+        assert_eq!(found.stream_url, "https://n/1");
+        assert!(station_for_name(&stations, "nope").is_none());
     }
 
     #[test]

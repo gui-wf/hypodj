@@ -423,6 +423,11 @@ async fn spine<C: Clock>(
                         // id starts a track (closing any still-latched outgoing one
                         // first), a resume of the SAME id emits no TrackStart. A
                         // Playing with no queue_id is not attributable and dropped.
+                        // A GENUINE track-start edge = a qid that is not the one already
+                        // latched (a resume of the same qid is NOT a start). Computed BEFORE
+                        // `on_playing` mutates the latch, so the station-identity resolver
+                        // (task lq54isr) arms once per real start, never on a resume.
+                        let new_edge = qid.is_some() && pubr.latch != qid;
                         if let Some(qid) = qid {
                             pubr.on_playing(qid, song);
                         }
@@ -436,6 +441,15 @@ async fn spine<C: Clock>(
                         // above already disarmed a stale slot from the outgoing entry; this
                         // only arms. Sync (no await), no poller - the timer wheel drives it.
                         handler.reschedule_auto_identify(qid);
+                        // STATION IDENTITY (task lq54isr): on a genuine track-start, spawn
+                        // the per-track resolver off the spine (self-filters to a raw stream;
+                        // a library song returns without spawning). clear_stream_meta_except
+                        // above already dropped a stale slot; this only (re)resolves.
+                        if new_edge {
+                            if let Some(qid) = qid {
+                                handler.spawn_station_identity(qid);
+                            }
+                        }
                     }
                     PlayerEvent::TimePos { pos, queue_id } => {
                         // Attribute on IDENTITY: a frame whose queue_id does not

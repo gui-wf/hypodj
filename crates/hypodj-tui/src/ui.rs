@@ -302,6 +302,25 @@ fn render_now(f: &mut Frame, area: Rect, state: &TuiState) {
     render_next_up(f, cols[1], state);
 }
 
+/// The now-playing HEADLINE and optional STATION sub-line for the current pane (task
+/// lq54isr). A raw stream carries the station/show in `Name` and the now-playing (if
+/// any) in `Title`; an unnamed stream's `Title` is just its URL. So the headline is the
+/// station name when `Title` is only the URL (no real now-playing), else the `Title`;
+/// and the station name rides a subtle second line whenever it is NOT already the
+/// headline. A library song (no `Name`) keeps its `Title` headline and no station line.
+/// Pure/testable.
+pub fn stream_headline(np: &NowPlaying) -> (String, Option<String>) {
+    let title_is_url = np.title.is_some() && np.title == np.file;
+    let headline = if title_is_url {
+        np.name.clone().or_else(|| np.title.clone())
+    } else {
+        np.title.clone()
+    }
+    .unwrap_or_else(|| "(unknown)".to_string());
+    let station = np.name.as_deref().filter(|n| *n != headline).map(str::to_string);
+    (headline, station)
+}
+
 /// Left of Now Playing: the dithered album art with title/artist/album beneath it.
 fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
     let np = &state.now;
@@ -354,11 +373,18 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         return;
     }
 
+    // For a raw stream the daemon puts the station/show in `Name` and the now-playing
+    // (if any) in `Title`; an unnamed stream's `Title` is just its URL. Derive the
+    // headline (station name when `Title` is only the URL) and an optional station
+    // sub-line (task lq54isr) so the pane shows a proper name, not the raw URL.
+    let (headline, station_line) = stream_headline(np);
     // Reserve up to 4 base rows at the bottom for title/artist/album + the playback
-    // status line (state | volume fader | position), plus one more per optional HUD
-    // line (armed, then field); the rest is art. Reserving no row when a HUD line is
+    // status line (state | volume fader | position), plus one per optional station line
+    // and HUD line (armed, then field); the rest is art. Reserving no row when a line is
     // absent is what keeps the layout from jumping when it vanishes at rest.
-    let extra = armed_line.is_some() as u16 + field_line.is_some() as u16;
+    let extra = station_line.is_some() as u16
+        + armed_line.is_some() as u16
+        + field_line.is_some() as u16;
     let text_h = (4u16 + extra).min(inner.height);
     let art_h = inner.height.saturating_sub(text_h);
     if art_h > 0 {
@@ -389,8 +415,7 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         width: inner.width,
         height: text_h,
     };
-    let title = np.title.clone().unwrap_or_else(|| "(unknown)".to_string());
-    let title_span = Span::styled(title, Style::default().add_modifier(Modifier::BOLD));
+    let title_span = Span::styled(headline, Style::default().add_modifier(Modifier::BOLD));
     // A heart marks a Subsonic favorite. U+2665 is East-Asian-Width ambiguous, so it
     // is followed by U+FE0E (text-presentation selector) to force a single cell on
     // emoji-presentation terminals (else the title shifts and the border corrupts).
@@ -404,6 +429,14 @@ fn render_current(f: &mut Frame, area: Rect, state: &TuiState) {
         Line::from(title_span)
     };
     let mut lines = vec![title_line];
+    // The station name as a subtle second line when it is not already the headline
+    // (a stream with a real now-playing title shows "<station>" beneath it).
+    if let Some(station) = station_line {
+        lines.push(Line::from(Span::styled(
+            station,
+            Style::default().add_modifier(Modifier::DIM),
+        )));
+    }
     if let Some(artist) = np.artist.as_deref() {
         lines.push(Line::from(artist.to_string()));
     }
@@ -580,12 +613,57 @@ fn volume_slider(vol: u8, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        armed_hud, dj_prompt_line, field_hud, hit_style, level_wave_row, match_spans, track_seed,
-        volume_slider, wave_glyphs, wave_row, window_title, BLOCK_GLYPHS,
+        armed_hud, dj_prompt_line, field_hud, hit_style, level_wave_row, match_spans, stream_headline,
+        track_seed, volume_slider, wave_glyphs, wave_row, window_title, BLOCK_GLYPHS,
     };
     use crate::state::{Mode, TuiState};
     use hypodj_client::model::{AmbientHint, ArmedFeatures, FieldPull, FieldState, HintKind, NowPlaying};
     use ratatui::style::Style;
+
+    #[test]
+    fn stream_headline_prefers_station_name_over_raw_url() {
+        // A raw NTS stream with no now-playing: Title is just its URL, Name is the show.
+        // The headline must be the station name (not the URL), with no duplicate station
+        // sub-line (the name IS the headline).
+        let url = "https://stream-mixtape-geo.ntslive.net/mixtape5";
+        let np = NowPlaying {
+            title: Some(url.into()),
+            file: Some(url.into()),
+            name: Some("4 To The Floor".into()),
+            ..NowPlaying::default()
+        };
+        let (headline, station) = stream_headline(&np);
+        assert_eq!(headline, "4 To The Floor", "the station name replaces the raw URL");
+        assert_eq!(station, None, "no duplicate station line when it is already the headline");
+    }
+
+    #[test]
+    fn stream_headline_keeps_now_playing_and_shows_station_beneath() {
+        // A stream WITH a real now-playing (Title differs from the URL): the headline is
+        // the now-playing line, and the station name rides a subtle second line.
+        let np = NowPlaying {
+            title: Some("Floating Points - Track".into()),
+            file: Some("https://example.com/live".into()),
+            name: Some("NTS 1".into()),
+            ..NowPlaying::default()
+        };
+        let (headline, station) = stream_headline(&np);
+        assert_eq!(headline, "Floating Points - Track");
+        assert_eq!(station.as_deref(), Some("NTS 1"));
+    }
+
+    #[test]
+    fn stream_headline_library_song_keeps_title_no_station() {
+        // A library song carries a Title but no Name: headline is the Title, no station line.
+        let np = NowPlaying {
+            title: Some("Blue in Green".into()),
+            file: Some("song/42".into()),
+            ..NowPlaying::default()
+        };
+        let (headline, station) = stream_headline(&np);
+        assert_eq!(headline, "Blue in Green");
+        assert_eq!(station, None);
+    }
 
     #[test]
     fn armed_hud_reads_human_and_absent_when_unarmed() {

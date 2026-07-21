@@ -13,6 +13,13 @@ pub struct NowPlaying {
     pub song: Option<usize>,   // 0-based index of current
     pub duration: Option<f64>, // library songs only
     pub title: Option<String>,
+    /// The station / show NAME for a raw stream, from the `currentsong` `Name` pair
+    /// (real MPD radio convention: `Name:` = station, `Title:` = now-playing). Present
+    /// for a stream the daemon named - via live ICY icy-name, or a resolved station
+    /// identity such as an NTS mixtape title (task lq54isr) - and `None` for a library
+    /// song or an unnamed stream. Lets the dj-gui show the station name instead of the
+    /// bare URL.
+    pub name: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
     /// The current song's uri from `currentsong` `file` (`song/<id>` for a library
@@ -217,6 +224,7 @@ pub fn now_playing(status: &[(String, String)], current: &[(String, String)]) ->
         song: find(status, "song").and_then(|v| v.parse().ok()),
         duration: find(status, "duration").and_then(|v| v.parse().ok()),
         title: find(current, "Title").map(str::to_string),
+        name: find(current, "Name").map(str::to_string),
         artist: find(current, "Artist").map(str::to_string),
         album: find(current, "Album").map(str::to_string),
         file: find(current, "file").map(str::to_string),
@@ -331,6 +339,32 @@ mod tests {
         assert!(!np.armed.any());
         // No X-Starred pair -> not a favorite.
         assert!(!np.starred);
+    }
+
+    #[test]
+    fn nowplaying_parses_stream_name_pair() {
+        // A raw stream renders with `Name` (station/show) alongside `Title` (real MPD
+        // radio convention). The client must parse `Name` into `np.name` so the dj-gui
+        // can show the station name instead of the bare URL (task lq54isr).
+        let status = p(&[("state", "play"), ("playlistlength", "1"), ("song", "0")]);
+        let current = p(&[
+            ("file", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            ("Title", "https://stream-mixtape-geo.ntslive.net/mixtape5"),
+            ("Name", "4 To The Floor"),
+            ("X-CoverArt", "https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            ("Pos", "0"),
+            ("Id", "1"),
+        ]);
+        let np = now_playing(&status, &current);
+        assert_eq!(np.name.as_deref(), Some("4 To The Floor"), "the station Name is parsed");
+        assert_eq!(
+            np.cover.as_deref(),
+            Some("https://media.ntslive.co.uk/resize/400x400/ftf.jpeg"),
+            "the stream cover still parses alongside Name"
+        );
+        // A library song (no Name pair) leaves np.name None.
+        let lib = now_playing(&status, &p(&[("file", "song/1"), ("Title", "T")]));
+        assert!(lib.name.is_none(), "a library song carries no station Name");
     }
 
     #[test]
