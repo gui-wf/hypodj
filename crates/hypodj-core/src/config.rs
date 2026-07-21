@@ -27,6 +27,68 @@ pub struct Config {
     /// stopped at the end of the queue exactly as it does today.
     #[serde(default)]
     pub continuation: ContinuationConfig,
+    /// Auto-identify (songrec) config for no-ICY streams. Optional; with no
+    /// `[recognize]` section the defaults apply (auto ON, interval 300s).
+    #[serde(default)]
+    pub recognize: RecognizeConfig,
+}
+
+/// `[recognize]` config for AUTO now-playing recognition of no-ICY streams (task
+/// bspk8v5). When a raw stream becomes current and no usable ICY metadata arrives
+/// within a short grace window, the daemon auto-fires the same songrec identify path
+/// the manual `identify` verb uses, so a Shazam-matchable stream names itself in the
+/// now-playing surfaces without a manual verb. ICY still WINS when present; this is
+/// the no-ICY fallback. Rate-limited (min interval + no-match backoff + single-flight)
+/// so it never hammers the Shazam endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecognizeConfig {
+    /// Master on/off for auto-identify. Default TRUE (the feature exists to fix the
+    /// bare-URL now-playing complaint; the backoff + interval floor + single-flight
+    /// make the default safe). Set `false` to disable auto-identify entirely (the
+    /// manual `identify` verb is unaffected).
+    #[serde(default = "d_recognize_auto")]
+    pub auto: bool,
+    /// The re-identify cadence, seconds: on a long-running stream the airing track
+    /// changes with no boundary signal, so a hit schedules the next attempt this far
+    /// out. Floor-clamped to `RECOGNIZE_MIN_INTERVAL_SECS` at load so no config typo
+    /// can produce a tight loop. A no-match applies an exponential backoff over this
+    /// (capped at interval * 8).
+    #[serde(default = "d_recognize_interval_secs")]
+    pub interval_secs: u64,
+}
+
+pub const DEFAULT_RECOGNIZE_AUTO: bool = true;
+pub const DEFAULT_RECOGNIZE_INTERVAL_SECS: u64 = 300;
+
+/// The hard floor on the auto-identify interval, seconds. Comfortably above the 40s
+/// per-attempt ceiling (`recognize::RECOGNIZE_TIMEOUT`) so even a config typo of
+/// `interval_secs = 1` cannot make the cadence collide with an in-flight attempt.
+pub const RECOGNIZE_MIN_INTERVAL_SECS: u64 = 60;
+
+fn d_recognize_auto() -> bool {
+    DEFAULT_RECOGNIZE_AUTO
+}
+fn d_recognize_interval_secs() -> u64 {
+    DEFAULT_RECOGNIZE_INTERVAL_SECS
+}
+
+impl Default for RecognizeConfig {
+    fn default() -> Self {
+        Self {
+            auto: DEFAULT_RECOGNIZE_AUTO,
+            interval_secs: DEFAULT_RECOGNIZE_INTERVAL_SECS,
+        }
+    }
+}
+
+impl RecognizeConfig {
+    /// Floor-clamp the interval at LOAD time so an out-of-range TOML value can never
+    /// produce a Shazam-hammering cadence downstream (mirrors [`FadeConfig::normalize`]).
+    pub fn normalize(&mut self) {
+        if self.interval_secs < RECOGNIZE_MIN_INTERVAL_SECS {
+            self.interval_secs = RECOGNIZE_MIN_INTERVAL_SECS;
+        }
+    }
 }
 
 /// `[continuation]` config for the end-of-queue continuation-radio feature: when
@@ -464,6 +526,7 @@ impl Config {
             .map_err(|e| ConfigError::Io(path.display().to_string(), e))?;
         let mut cfg: Config = toml::from_str(&raw)?;
         cfg.fade.normalize();
+        cfg.recognize.normalize();
         Ok(cfg)
     }
 
@@ -473,6 +536,7 @@ impl Config {
     pub fn from_str(raw: &str) -> Result<Self, ConfigError> {
         let mut cfg: Config = toml::from_str(raw)?;
         cfg.fade.normalize();
+        cfg.recognize.normalize();
         Ok(cfg)
     }
 }
@@ -714,6 +778,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.continuation.station.as_deref(), Some("NTS 1"));
+    }
+
+    #[test]
+    fn recognize_section_defaults_on_and_clamps_interval() {
+        // No [recognize] section -> defaults: auto ON, interval 300s.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.recognize.auto, "auto-identify defaults ON");
+        assert_eq!(cfg.recognize.interval_secs, DEFAULT_RECOGNIZE_INTERVAL_SECS);
+
+        // auto can be turned off, and a sub-floor interval clamps to the 60s floor at
+        // load so no config typo can hammer Shazam.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [recognize]
+            auto = false
+            interval_secs = 1
+        "#,
+        )
+        .unwrap();
+        assert!(!cfg.recognize.auto, "auto = false disables the feature");
+        assert_eq!(
+            cfg.recognize.interval_secs, RECOGNIZE_MIN_INTERVAL_SECS,
+            "interval_secs floor-clamped to 60"
+        );
     }
 
     #[test]

@@ -260,6 +260,16 @@ struct State {
     /// restart re-arms from the rehydrated toggle). Warming is a best-effort accelerator
     /// in FRONT of the slice-1 cold-start, which stays the load-bearing floor.
     pending_continuation_warm: Option<ContinuationWarm>,
+    /// The PENDING AUTO-IDENTIFY slot (task bspk8v5): the guard-scoped ICY-grace /
+    /// re-identify-cadence timer for the current no-ICY [`QueueEntry::Stream`], or
+    /// `None` at rest / behind a library song. Modeled 1:1 on
+    /// [`Self::pending_continuation_warm`]: it HOLDS its [`TimerGuard`] so DROPPING the
+    /// slot (any disarm edge - a track change or stop, all of which route through
+    /// [`HypodjHandler::clear_stream_meta_except`]) RAII-cancels the armed timer and a
+    /// late fire tombstones on the id. Armed on the stream-becomes-current Playing edge
+    /// with an 8s ICY grace; if no usable ICY title arrives, the fire auto-runs songrec
+    /// identify and rearms on a rate-limited cadence. EPHEMERAL: never persisted.
+    pending_auto_identify: Option<AutoIdentify>,
 }
 
 /// The pending continuation-warm slot (see [`State::pending_continuation_warm`]). A
@@ -286,6 +296,32 @@ struct ContinuationWarm {
     /// [`QueueEntry::Stream`] title exactly like the cold-start. Meaningful only when
     /// `warmed`.
     title: String,
+}
+
+/// The pending auto-identify slot (see [`State::pending_auto_identify`], task
+/// bspk8v5). Guard-scoped like [`ContinuationWarm`]: the held [`TimerGuard`] cancels
+/// the armed timer on drop (RAII disarm), so every disarm edge is one field write.
+struct AutoIdentify {
+    /// The stream entry this slot belongs to. The disarm co-located in
+    /// [`HypodjHandler::clear_stream_meta_except`] keeps the slot only while this qid is
+    /// still current; the fire gate and cadence rearm are keyed on it.
+    qid: QueueId,
+    /// The armed timer's id, so the fire hook can confirm the fire is THIS slot's (not a
+    /// superseded / plan / warm timer) before acting - the tombstone idiom.
+    timer_id: TimerId,
+    /// The RAII cancel-on-drop guard for the armed timer. Dropping the slot cancels the
+    /// timer; a late fire of a cancelled id tombstones (the timer live-set idiom).
+    #[allow(dead_code)]
+    guard: TimerGuard,
+    /// Consecutive no-match/error count, driving the exponential backoff (delay =
+    /// interval * 2^misses, saturating at [`AUTO_IDENTIFY_MAX_MISSES`] so an
+    /// unmatchable mix decays to one attempt per interval*8, never hammering Shazam).
+    misses: u32,
+    /// The now-playing title THIS slot last wrote via `set_stream_meta` (own-hit
+    /// provenance). The fire gate compares live `stream_meta.title` against it: an equal
+    /// title is our own hit (PROCEED - keep the cadence), a DIFFERENT non-blank title is
+    /// real ICY that arrived (DISARM - ICY wins, stop capturing).
+    last_recognized: Option<String>,
 }
 
 /// Which pertinence branch a [`Handler::seed_source`] resolution landed on - the
@@ -404,6 +440,8 @@ impl Default for State {
             continuation_active: None,
             // No pending continuation warm until a finite Song play arms one.
             pending_continuation_warm: None,
+            // No pending auto-identify until a stream becomes current.
+            pending_auto_identify: None,
         }
     }
 }
@@ -1277,6 +1315,16 @@ pub struct HypodjHandler {
     /// (see [`Self::resolve_continuation_url`]). Mutex (not OnceLock) mirrors
     /// [`Self::state_path`]: an unset feature is a valid state.
     continuation_station: Mutex<Option<String>>,
+    /// Auto-identify master toggle (task bspk8v5), plumbed from `[recognize].auto` at
+    /// daemon startup via [`Self::set_recognize_config`]. Default `false` in a raw
+    /// handler (feature inert until the daemon plumbs the real config, which defaults
+    /// ON); read locklessly at every arm/rearm so a mid-session toggle-off disarms at
+    /// the next reschedule and never arms again.
+    recognize_auto: AtomicBool,
+    /// The auto-identify re-identify cadence in seconds (`[recognize].interval_secs`,
+    /// floor-clamped to `RECOGNIZE_MIN_INTERVAL_SECS`). Read locklessly at rearm time so
+    /// a live config reload could retune it without touching an armed slot.
+    recognize_interval_secs: AtomicU64,
 }
 
 /// One echoed-but-unconfirmed translation. The plans are raw but ALREADY CLAMPED
@@ -1329,6 +1377,20 @@ const CONTINUATION_WARM_LEAD_SECS: f64 = 45.0;
 /// cancel-then-rearms one fresh timer instead of prefetching now. Absorbs the
 /// Tick-quantized staleness of the live-elapsed atomic without a spurious rearm.
 const CONTINUATION_WARM_REARM_SLACK_SECS: f64 = 2.0;
+
+/// The ICY GRACE window (task bspk8v5): after a raw [`QueueEntry::Stream`] becomes the
+/// current entry, wait this long for ICY metadata (`icy-name`/`icy-title`) to arrive
+/// before auto-firing songrec identify. mpv observes the ICY tags within a second or
+/// two of connect, so 8s is generous; a non-ICY stream never emits them, hence the
+/// timer rather than a pure event wait. When ICY DOES arrive, the fire-time gate sees a
+/// non-blank title and retires the slot (ICY wins).
+const AUTO_IDENTIFY_GRACE: Duration = Duration::from_secs(8);
+
+/// Saturation ceiling for the auto-identify no-match backoff exponent. The re-identify
+/// delay is `interval * 2^min(misses, this)`, so at the cap the delay is `interval * 8`
+/// (40 min at the default 300s interval): an all-night unmatchable mix costs one short
+/// capture per ~40 min, never a tight loop, and a later matchable track still gets named.
+const AUTO_IDENTIFY_MAX_MISSES: u32 = 3;
 
 /// The perceptual dB at which the wake/resume ramp-in first becomes HEARABLE, 20 dB
 /// above the -60 dB synth floor. The resume path reads the wall-clock LEAD - the
@@ -1539,6 +1601,13 @@ impl HypodjHandler {
             pulls: Mutex::new(PullField::new()),
             recognizing: AtomicBool::new(false),
             continuation_station: Mutex::new(None),
+            // Auto-identify starts INERT in a raw handler; the daemon plumbs the real
+            // (default-ON) config via set_recognize_config, so tests without a config
+            // never arm a capture. The interval seeds at the default (>= the floor).
+            recognize_auto: AtomicBool::new(false),
+            recognize_interval_secs: AtomicU64::new(
+                crate::config::DEFAULT_RECOGNIZE_INTERVAL_SECS,
+            ),
         }
     }
 
@@ -3196,6 +3265,16 @@ impl HypodjHandler {
                 st.recognized_cover = None;
             }
         }
+        // DISARM the auto-identify slot on the same edge (task bspk8v5): every track
+        // change (Playing with a different qid), stop, and queue-exhausted routes here,
+        // so dropping the slot unless its qid is kept is the ONE line that covers all
+        // disarm edges. The dropped TimerGuard RAII-cancels the armed grace/cadence
+        // timer; a late fire of the cancelled id tombstones on the live-set.
+        if let Some(a) = &st.pending_auto_identify {
+            if keep != Some(a.qid) {
+                st.pending_auto_identify = None;
+            }
+        }
     }
 
     /// ON-DEMAND now-playing RECOGNITION for the current raw stream (task f7vnd3i).
@@ -3220,11 +3299,50 @@ impl HypodjHandler {
     /// surfacing so a late result only decorates the entry it came from (mirroring
     /// the currentsong qid gate); a no-match leaves any prior stream_meta untouched.
     async fn identify(&self) -> MpdResponse {
+        // The MANUAL verb: run the shared body (no auto timer), map the outcome to the
+        // exact ACK/pairs surface the verb always emitted.
+        match self.identify_inner(None).await {
+            IdentifyOutcome::Hit { track, now_playing } => {
+                identify_hit_response(&track, now_playing.as_deref())
+            }
+            IdentifyOutcome::NoMatch => MpdResponse::pairs().pair("identify", "no match").build(),
+            IdentifyOutcome::Error(e) => ack(ACK_ERROR_UNKNOWN, "identify", &e),
+            IdentifyOutcome::AlreadyKnown => MpdResponse::pairs()
+                .pair("identify", "current track is already known")
+                .build(),
+            IdentifyOutcome::Nothing => {
+                MpdResponse::pairs().pair("identify", "nothing playing").build()
+            }
+            IdentifyOutcome::Busy => MpdResponse::pairs()
+                .pair("identify", "already identifying")
+                .build(),
+        }
+    }
+
+    /// The SHARED recognition body for BOTH the manual `identify` verb (`auto = None`)
+    /// and the auto-identify cadence (`auto = Some(fired_timer_id)`, task bspk8v5). All
+    /// the f7vnd3i safety is inherited: single-flight via the `recognizing` AtomicBool,
+    /// the std lock RELEASED before the recognize await, a qid re-check before surfacing,
+    /// ICY station-name preservation, `set_stream_meta`/`set_recognized_cover` ->
+    /// `notify_change`, and the recognize.rs 40s timeout + kill_on_drop + temp-wav RAII.
+    ///
+    /// SINGLE-FLIGHT: if a recognition is already in flight, the manual path returns
+    /// `Busy` (the verb ACKs "already identifying") and the auto path additionally rearms
+    /// the cadence one interval out (misses unchanged) - never a spin, never a queue.
+    /// CADENCE: on completion (hit or non-hit) it rearms the auto slot, generation-checked
+    /// against the captured qid (slot gone/changed during the capture -> no rearm). A hit
+    /// resets misses and records own-hit provenance; a no-match/error backs off. Because
+    /// this rearm runs for the MANUAL path too, a manual completion converges the auto
+    /// clock (a hit resets it), so auto can never fire right after a manual hit.
+    async fn identify_inner(&self, auto: Option<TimerId>) -> IdentifyOutcome {
         // Debounce: one recognition at a time (protects the Shazam endpoint).
         if self.recognizing.swap(true, Ordering::AcqRel) {
-            return MpdResponse::pairs()
-                .pair("identify", "already identifying")
-                .build();
+            // Busy: the in-flight attempt populates the same surfaces. For the auto path,
+            // rearm one interval out (misses unchanged) so a stalled fire never spins.
+            if let Some(id) = auto {
+                self.rearm_auto_identify_after_skip(id);
+            }
+            return IdentifyOutcome::Busy;
         }
         // RAII: reset the in-flight flag on EVERY exit path (hit / miss / error / early
         // return), so a failed or short-circuited identify can never wedge the guard.
@@ -3249,24 +3367,25 @@ impl HypodjHandler {
         };
         let (qid, url) = match target {
             Target::Stream(qid, url) => (qid, url),
-            Target::LibrarySong => {
-                return MpdResponse::pairs()
-                    .pair("identify", "current track is already known")
-                    .build();
-            }
-            Target::Nothing => {
-                return MpdResponse::pairs().pair("identify", "nothing playing").build();
-            }
+            Target::LibrarySong => return IdentifyOutcome::AlreadyKnown,
+            Target::Nothing => return IdentifyOutcome::Nothing,
         };
 
         // Heavy work off the reactor; no std lock is held across this await.
         let track = match crate::recognize::recognize_stream_url(url).await {
             Ok(Some(track)) => track,
             Ok(None) => {
-                // Clean no-match: leave any prior ICY stream_meta untouched.
-                return MpdResponse::pairs().pair("identify", "no match").build();
+                // Clean no-match: leave any prior ICY stream_meta untouched; back the
+                // auto cadence off exponentially so an unmatchable mix is not hammered.
+                self.rearm_auto_identify_after_attempt(qid, false, None);
+                return IdentifyOutcome::NoMatch;
             }
-            Err(e) => return ack(ACK_ERROR_UNKNOWN, "identify", &e.to_string()),
+            Err(e) => {
+                // A subprocess/timeout error counts as a miss for backoff (a dead or
+                // stalling stream decays identically to an unmatchable one).
+                self.rearm_auto_identify_after_attempt(qid, false, None);
+                return IdentifyOutcome::Error(e.to_string());
+            }
         };
 
         let now_playing = crate::recognize::now_playing_title(&track);
@@ -3280,9 +3399,10 @@ impl HypodjHandler {
                 .and_then(|i| st.queue.get(i))
                 .is_some_and(|it| QueueId(it.id) == qid);
             if !still_current {
-                // The stream advanced away from what we captured: report the hit but
-                // do NOT decorate the now-different entry.
-                return identify_hit_response(&track, now_playing.as_deref());
+                // The stream advanced away from what we captured: report the hit but do
+                // NOT decorate the now-different entry, and do NOT rearm (the slot for
+                // this qid was already disarmed by the track change).
+                return IdentifyOutcome::Hit { track, now_playing };
             }
             st.stream_meta
                 .as_ref()
@@ -3298,8 +3418,174 @@ impl HypodjHandler {
         // station Name if one was already latched; the recognized now-playing rides
         // Title. set_stream_meta wakes idling clients (notify_change).
         self.set_stream_meta(qid, existing_name, now_playing.clone());
+        // Rearm the cadence at the interval and record own-hit provenance (so the next
+        // fire does not mistake the title WE wrote for a fresh ICY title and disarm).
+        self.rearm_auto_identify_after_attempt(qid, true, now_playing.clone());
 
-        identify_hit_response(&track, now_playing.as_deref())
+        IdentifyOutcome::Hit { track, now_playing }
+    }
+
+    /// AUTO-IDENTIFY trigger (task bspk8v5): (re)arm the ICY-GRACE timer when a raw
+    /// stream becomes the current entry. Called on the director Playing spine edge right
+    /// after `clear_stream_meta_except(qid)`. Sync (one short std lock; `timers.arm` is a
+    /// sync unbounded send, no await), streams-only, and IDEMPOTENT per qid so a
+    /// pause/resume mid-grace or mid-cadence does not restart the clock. Feature toggle
+    /// off or no timer source -> fully inert (drops any slot). DISARM lives in
+    /// [`Self::clear_stream_meta_except`], so this method never has to disarm on a
+    /// track change - only arm.
+    pub(crate) fn reschedule_auto_identify(&self, qid: Option<QueueId>) {
+        // Feature toggle / timer source: OFF or unset -> drop any slot and stay inert.
+        let timers = match (self.recognize_auto.load(Ordering::Relaxed), self.plan_timers.get()) {
+            (true, Some(t)) => t.clone(),
+            _ => {
+                self.state.lock().unwrap().pending_auto_identify = None;
+                return;
+            }
+        };
+        // A Playing edge with no attributable qid cannot arm; the co-located disarm in
+        // clear_stream_meta_except already ran on this same edge.
+        let Some(qid) = qid else { return };
+        let mut st = self.state.lock().unwrap();
+        // IDEMPOTENT per qid: a resume (same-qid Playing edge) must not restart the
+        // grace/cadence clock, so a slot already armed for this qid is a no-op.
+        if matches!(&st.pending_auto_identify, Some(a) if a.qid == qid) {
+            return;
+        }
+        // STREAMS ONLY, ever: a library song is already named. Not a Stream (or gone) ->
+        // drop any stale slot and return.
+        let is_stream = st
+            .queue
+            .iter()
+            .find(|it| it.id == qid.0)
+            .map(|it| matches!(it.entry, QueueEntry::Stream { .. }))
+            .unwrap_or(false);
+        if !is_stream {
+            st.pending_auto_identify = None;
+            return;
+        }
+        // Arm a fresh ICY-GRACE timer (absolute deadline on the shared wheel). Replacing
+        // the slot drops the old guard (RAII cancel); a late fire tombstones on the id.
+        let (timer_id, guard) = timers.arm(Instant::now() + AUTO_IDENTIFY_GRACE);
+        st.pending_auto_identify = Some(AutoIdentify {
+            qid,
+            timer_id,
+            guard,
+            misses: 0,
+            last_recognized: None,
+        });
+    }
+
+    /// AUTO-IDENTIFY fire hook (task bspk8v5), called by the director fired arm next to
+    /// `on_continuation_warm_fire`. Gates the fire under one short lock (via the pure
+    /// [`auto_identify_gate`]) then, on PROCEED, `tokio::spawn`s the shared
+    /// [`Self::identify_inner`] body on a cloned Arc - NEVER inline on the spine (a
+    /// capture is up to 40s). A stale id tombstones; a paused/stopped deck, a changed
+    /// qid, or a real ICY title DISARMS the slot; the recognizing single-flight is taken
+    /// inside `identify_inner`.
+    pub async fn on_auto_identify_fire(self: &std::sync::Arc<Self>, id: TimerId) {
+        // Toggle off mid-flight: disarm THIS slot and never fire (belt: the next
+        // reschedule would also disarm, but a fire may land before it).
+        if !self.recognize_auto.load(Ordering::Relaxed) {
+            let mut st = self.state.lock().unwrap();
+            if matches!(&st.pending_auto_identify, Some(a) if a.timer_id == id) {
+                st.pending_auto_identify = None;
+            }
+            return;
+        }
+        // Read the reported play state BEFORE the State lock (never nested).
+        let playing = self.reported_play_state() == PlayState::Playing;
+        let decision = {
+            let st = self.state.lock().unwrap();
+            auto_identify_gate(&st, id, playing)
+        };
+        match decision {
+            AutoIdentifyGate::Tombstone => {}
+            AutoIdentifyGate::Disarm => {
+                let mut st = self.state.lock().unwrap();
+                if matches!(&st.pending_auto_identify, Some(a) if a.timer_id == id) {
+                    st.pending_auto_identify = None;
+                }
+            }
+            AutoIdentifyGate::Proceed => {
+                // Off-spine: a capture is up to 40s, so NEVER inline on the director
+                // spine. identify_inner owns the single-flight swap + the cadence rearm.
+                let this = self.clone();
+                tokio::spawn(async move {
+                    this.identify_inner(Some(id)).await;
+                });
+            }
+        }
+    }
+
+    /// Rearm the auto-identify cadence at the tail of a completed attempt (hit or
+    /// non-hit), generation-checked against the captured `qid`. A slot gone or repointed
+    /// to a different qid during the capture -> BAIL (no rearm), so a track change during
+    /// the up-to-40s capture never resurrects a stale timer. A hit rearms at one interval
+    /// and records own-hit provenance in `last_recognized`; a non-hit backs off
+    /// exponentially (`interval * 2^misses`, capped at `interval * 8`).
+    fn rearm_auto_identify_after_attempt(&self, qid: QueueId, hit: bool, recognized: Option<String>) {
+        let timers = match (self.recognize_auto.load(Ordering::Relaxed), self.plan_timers.get()) {
+            (true, Some(t)) => t.clone(),
+            _ => {
+                // Toggled off during the capture: disarm the slot rather than rearm.
+                let mut st = self.state.lock().unwrap();
+                if matches!(&st.pending_auto_identify, Some(a) if a.qid == qid) {
+                    st.pending_auto_identify = None;
+                }
+                return;
+            }
+        };
+        let interval = self.recognize_interval_secs.load(Ordering::Relaxed);
+        let mut st = self.state.lock().unwrap();
+        // Generation check: the slot must still exist FOR THIS qid (else the track
+        // changed mid-capture and clear_stream_meta_except already dropped it).
+        let Some(slot) = st.pending_auto_identify.as_mut() else { return };
+        if slot.qid != qid {
+            return;
+        }
+        // Delay uses the CURRENT miss count, THEN the count advances (so the first miss
+        // rearms at one interval and each further miss doubles, saturating at *8).
+        let (delay_exp, next_misses) = if hit {
+            (0u32, 0u32)
+        } else {
+            let cur = slot.misses;
+            (cur, (cur + 1).min(AUTO_IDENTIFY_MAX_MISSES))
+        };
+        let (timer_id, guard) = timers.arm(Instant::now() + auto_identify_delay(interval, delay_exp));
+        slot.timer_id = timer_id;
+        slot.guard = guard;
+        slot.misses = next_misses;
+        if let Some(r) = recognized {
+            slot.last_recognized = Some(r);
+        }
+    }
+
+    /// Rearm the auto-identify cadence when a fire found the recognizing guard BUSY (a
+    /// manual identify in flight): rearm one interval out, misses UNCHANGED, keyed on the
+    /// fired timer id (the slot has not been rearmed yet). If a concurrent identify has
+    /// already rearmed the slot (its id no longer matches), this no-ops - the clock has
+    /// converged. Toggle off -> disarm.
+    fn rearm_auto_identify_after_skip(&self, id: TimerId) {
+        let timers = match (self.recognize_auto.load(Ordering::Relaxed), self.plan_timers.get()) {
+            (true, Some(t)) => t.clone(),
+            _ => {
+                let mut st = self.state.lock().unwrap();
+                if matches!(&st.pending_auto_identify, Some(a) if a.timer_id == id) {
+                    st.pending_auto_identify = None;
+                }
+                return;
+            }
+        };
+        let interval = self.recognize_interval_secs.load(Ordering::Relaxed);
+        let mut st = self.state.lock().unwrap();
+        let Some(slot) = st.pending_auto_identify.as_mut() else { return };
+        if slot.timer_id != id {
+            return;
+        }
+        let (timer_id, guard) = timers.arm(Instant::now() + auto_identify_delay(interval, 0));
+        slot.timer_id = timer_id;
+        slot.guard = guard;
+        // misses UNCHANGED: a skip is not a miss.
     }
 
     fn notify_change(&self) {
@@ -4031,6 +4317,19 @@ impl HypodjHandler {
         // the OLD station. Called once at daemon startup before any play, so a warmed
         // prefetch is never live here; a sync slot-drop is sufficient (no drop_warm await).
         self.state.lock().unwrap().pending_continuation_warm = None;
+    }
+
+    /// Register the `[recognize]` auto-identify config (task bspk8v5), plumbed once at
+    /// daemon startup like [`Self::set_continuation_station`]. `auto` is the master
+    /// toggle; `interval_secs` is the re-identify cadence, floor-clamped again here
+    /// (defense in depth over the config-load clamp) so no path can hammer Shazam. A
+    /// toggle-off takes effect at the next reschedule / fire and never arms again.
+    pub fn set_recognize_config(&self, auto: bool, interval_secs: u64) {
+        self.recognize_auto.store(auto, Ordering::Relaxed);
+        self.recognize_interval_secs.store(
+            interval_secs.max(crate::config::RECOGNIZE_MIN_INTERVAL_SECS),
+            Ordering::Relaxed,
+        );
     }
 
     /// The end-of-queue continuation status as X- extension pairs for `status`,
@@ -5547,6 +5846,96 @@ fn prune_expired_nl(map: &mut HashMap<String, PendingNl>) {
     map.retain(|_, p| now.duration_since(p.created) < NL_TOKEN_TTL);
 }
 
+/// The outcome of one shared [`HypodjHandler::identify_inner`] recognition, so BOTH the
+/// manual verb (mapping it to an ACK/pairs surface) and the auto cadence (which ignores
+/// the value - its rearm happens inside the body) funnel through one function.
+enum IdentifyOutcome {
+    /// A Shazam hit: the recognized track + its now-playing "Artist - Track" line.
+    Hit {
+        track: crate::recognize::RecognizedTrack,
+        now_playing: Option<String>,
+    },
+    /// A clean no-match (songrec exit 0, empty stdout).
+    NoMatch,
+    /// A subprocess/timeout error (message for the verb ACK).
+    Error(String),
+    /// The current entry is a library song - already named, nothing to recognize.
+    AlreadyKnown,
+    /// Nothing is playing / the deck is stopped.
+    Nothing,
+    /// A recognition was already in flight (single-flight); this attempt was skipped.
+    Busy,
+}
+
+/// The pure AUTO-IDENTIFY fire decision over a `&State` snapshot (task bspk8v5), shared
+/// by the fire hook so the decision table is unit-testable without songrec. Read under
+/// the caller's `State` lock; `playing` (the deck is genuinely Playing) is passed in
+/// because the caller reads [`HypodjHandler::reported_play_state`] OUTSIDE the `State`
+/// lock (never nested), mirroring the continuation-warm predicate.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoIdentifyGate {
+    /// The fired id is not the slot's (a superseded / plan / warm timer): NO-OP, leave
+    /// the slot untouched (the live-set tombstone idiom).
+    Tombstone,
+    /// Drop the slot: the deck is not playing, the current is no longer this stream, or a
+    /// real ICY title now names it (ICY wins). Resume/next re-arms cleanly.
+    Disarm,
+    /// Capture: no usable ICY title (or only the title WE wrote), still the current
+    /// playing stream - run songrec.
+    Proceed,
+}
+
+/// Decide what an auto-identify fire for `id` should do, purely over `st` + the
+/// out-of-lock `playing` flag. See [`AutoIdentifyGate`] for the outcomes.
+fn auto_identify_gate(st: &State, id: TimerId, playing: bool) -> AutoIdentifyGate {
+    // (1) Is this fire ours? A stale id tombstones (a superseded slot has a fresh id).
+    let Some(slot) = &st.pending_auto_identify else {
+        return AutoIdentifyGate::Tombstone;
+    };
+    if slot.timer_id != id {
+        return AutoIdentifyGate::Tombstone;
+    }
+    // (2) The deck must be genuinely PLAYING - a paused/stopped stream would capture
+    // silence/stale audio; disarm (resume re-arms a fresh grace on the Playing edge).
+    if !playing {
+        return AutoIdentifyGate::Disarm;
+    }
+    // (3) Still the current entry, still a raw Stream, still THIS qid. A track change
+    // during the grace/cadence retires the slot (a stale capture must never decorate a
+    // different entry).
+    let still_current_stream = st
+        .reported_current()
+        .and_then(|i| st.queue.get(i))
+        .map(|it| it.id == slot.qid.0 && matches!(it.entry, QueueEntry::Stream { .. }))
+        .unwrap_or(false);
+    if !still_current_stream {
+        return AutoIdentifyGate::Disarm;
+    }
+    // (4) ICY-WINS: if a non-blank ICY/now-playing title is stored for this qid that we
+    // did NOT write ourselves (!= last_recognized), real ICY is naming the stream - stop
+    // the cadence. A title EQUAL to last_recognized is our own prior hit (own-hit
+    // provenance), so it must PROCEED, not disarm.
+    if let Some((mqid, meta)) = &st.stream_meta {
+        if *mqid == slot.qid {
+            if let Some(title) = meta.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                let ours = slot.last_recognized.as_deref() == Some(title);
+                if !ours {
+                    return AutoIdentifyGate::Disarm;
+                }
+            }
+        }
+    }
+    AutoIdentifyGate::Proceed
+}
+
+/// The auto-identify re-identify delay: `interval * 2^min(misses, MAX)`. A hit passes
+/// `misses = 0` (one interval); each consecutive no-match doubles it up to the
+/// `interval * 8` cap. Saturating multiply so a huge configured interval never overflows.
+fn auto_identify_delay(interval_secs: u64, misses: u32) -> Duration {
+    let factor = 1u64 << misses.min(AUTO_IDENTIFY_MAX_MISSES);
+    Duration::from_secs(interval_secs.saturating_mul(factor))
+}
+
 /// Resets the handler's in-flight `identify` debounce flag on drop (task f7vnd3i),
 /// so a recognition that short-circuits, errors, panics, or times out ALWAYS
 /// releases the guard - a hung Shazam call can never wedge the trigger forever.
@@ -6455,17 +6844,49 @@ impl MpdHandler for HypodjHandler {
 pub struct CurrentItem {
     pub mpd_id: u64,
     pub entry: QueueEntry,
+    /// The live ICY / recognized now-playing metadata for a raw stream, qid-gated to
+    /// THIS entry (task bspk8v5) - so the MPRIS `xesam:title`/`xesam:artist` surface the
+    /// recognized or ICY now-playing instead of the bare URL (the GNOME complaint), and a
+    /// library song can never inherit a station label. `None` for a library song or a
+    /// stream with no metadata yet.
+    pub stream_meta: Option<StreamMeta>,
+    /// The recognized Shazam cover-art URL for a raw stream, qid-gated to THIS entry
+    /// (task bspk8v5 / f7vnd3i) - passed through as the MPRIS `mpris:artUrl` so the GNOME
+    /// notification can show cover art. `None` when no recognition has matched.
+    pub cover_url: Option<String>,
 }
 
 impl HypodjHandler {
-    /// Snapshot the current queue item (id + entry), or `None` when stopped /
-    /// queue empty. Used by the MPRIS server to render now-playing Metadata.
+    /// Snapshot the current queue item (id + entry + qid-gated stream overlay), or `None`
+    /// when stopped / queue empty. Used by the MPRIS server to render now-playing
+    /// Metadata. The `stream_meta`/`cover_url` overlay is read under the SAME single lock
+    /// with the identical qid gate the `currentsong` dispatch uses, so the entry and its
+    /// metadata can never tear and a library song can never inherit a station label.
     pub fn current_item(&self) -> Option<CurrentItem> {
         let st = self.state.lock().unwrap();
         let idx = st.current?;
-        st.queue.get(idx).map(|it| CurrentItem {
+        let it = st.queue.get(idx)?;
+        let qid = QueueId(it.id);
+        let is_stream = matches!(it.entry, QueueEntry::Stream { .. });
+        let stream_meta = if is_stream {
+            st.stream_meta
+                .as_ref()
+                .and_then(|(q, m)| (*q == qid).then(|| m.clone()))
+        } else {
+            None
+        };
+        let cover_url = if is_stream {
+            st.recognized_cover
+                .as_ref()
+                .and_then(|(q, u)| (*q == qid).then(|| u.clone()))
+        } else {
+            None
+        };
+        Some(CurrentItem {
             mpd_id: it.id,
             entry: it.entry.clone(),
+            stream_meta,
+            cover_url,
         })
     }
 
@@ -10325,6 +10746,314 @@ mod tests {
             !cur.iter().any(|(k, _)| k == "X-CoverArt"),
             "a wrong-qid cover must not surface: {cur:?}"
         );
+    }
+
+    // ===== AUTO-IDENTIFY (task bspk8v5) =====
+
+    /// A handler with a REAL fake-clocked timer source wired in and auto-identify ENABLED
+    /// (default-off in a raw handler), plus the fire receiver a test drains. `None` in the
+    /// certless sandbox (same guard as the other live-client helpers).
+    fn auto_identify_rig() -> Option<(
+        HypodjHandler,
+        tokio::sync::mpsc::UnboundedReceiver<crate::event::TimerId>,
+    )> {
+        let (h, events) = handler_with_null_player()?;
+        // Keep the NullPlayer actor's event sends from wedging on a dropped receiver.
+        std::mem::forget(events);
+        let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<crate::event::TimerId>();
+        let timers = crate::timer::spawn_timer_source(crate::clock::TokioClock, fire_tx);
+        h.set_plan_timers(timers);
+        h.set_recognize_config(true, 300);
+        Some((h, fire_rx))
+    }
+
+    // ARM the 8s ICY grace on a stream becoming current, fire it on the fake clock, and
+    // assert the PURE fire gate decides PROCEED (no ICY, still the current playing
+    // stream). Drives the no-ICY path naturally (NullPlayer never emits StreamMetadata).
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_arms_grace_and_fire_gate_proceeds() {
+        let Some((h, mut fire_rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        {
+            let st = h.state.lock().unwrap();
+            let a = st.pending_auto_identify.as_ref().expect("a grace slot is armed");
+            assert_eq!(a.qid, QueueId(qid));
+            assert_eq!(a.misses, 0);
+            assert!(a.last_recognized.is_none());
+        }
+        // Before the 8s grace: no fire.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(fire_rx.try_recv().is_err(), "no fire before the 8s grace");
+        // Cross the grace: exactly one fire, and the gate decides PROCEED.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        let id = fire_rx.recv().await.expect("the grace timer fired at 8s");
+        let st = h.state.lock().unwrap();
+        assert_eq!(auto_identify_gate(&st, id, true), AutoIdentifyGate::Proceed);
+    }
+
+    // The pure fire-gate decision table (no songrec): tombstone on a stale id, disarm on
+    // a paused deck, proceed with our id, disarm on a REAL ICY title, PROCEED when the
+    // title equals last_recognized (own hit), disarm on a changed current qid.
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_gate_decision_table() {
+        let Some((h, _rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        let live_id = h
+            .state
+            .lock()
+            .unwrap()
+            .pending_auto_identify
+            .as_ref()
+            .unwrap()
+            .timer_id;
+
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(
+                auto_identify_gate(&st, crate::event::TimerId(u64::MAX), true),
+                AutoIdentifyGate::Tombstone,
+                "a stale id tombstones"
+            );
+            assert_eq!(
+                auto_identify_gate(&st, live_id, false),
+                AutoIdentifyGate::Disarm,
+                "a not-playing deck disarms"
+            );
+            assert_eq!(
+                auto_identify_gate(&st, live_id, true),
+                AutoIdentifyGate::Proceed,
+                "our id + playing + no ICY proceeds"
+            );
+        }
+        // A REAL ICY title (not one we wrote) -> disarm (ICY wins).
+        h.set_stream_meta(QueueId(qid), Some("NTS".into()), Some("Real ICY - Track".into()));
+        assert_eq!(
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, true),
+            AutoIdentifyGate::Disarm,
+            "a real ICY title disarms the cadence"
+        );
+        // A title EQUAL to last_recognized is our own hit -> proceed (must not disarm).
+        h.state
+            .lock()
+            .unwrap()
+            .pending_auto_identify
+            .as_mut()
+            .unwrap()
+            .last_recognized = Some("Real ICY - Track".into());
+        assert_eq!(
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, true),
+            AutoIdentifyGate::Proceed,
+            "our own prior hit must not be mistaken for ICY"
+        );
+        // Current advances to a different entry -> disarm (a stale capture must not
+        // decorate the wrong entry).
+        h.enqueue_song_for_test(playlist_test_song("lib")).await;
+        h.play_for_test(1).await;
+        assert_eq!(
+            auto_identify_gate(&h.state.lock().unwrap(), live_id, true),
+            AutoIdentifyGate::Disarm,
+            "a changed current qid disarms"
+        );
+    }
+
+    // The backoff SCHEDULE (pure): one interval on a hit/first miss, doubling per miss,
+    // saturating at interval * 8.
+    #[test]
+    fn auto_identify_delay_schedule() {
+        assert_eq!(auto_identify_delay(300, 0), Duration::from_secs(300));
+        assert_eq!(auto_identify_delay(300, 1), Duration::from_secs(600));
+        assert_eq!(auto_identify_delay(300, 2), Duration::from_secs(1200));
+        assert_eq!(auto_identify_delay(300, 3), Duration::from_secs(2400));
+        assert_eq!(auto_identify_delay(300, 4), Duration::from_secs(2400), "saturated at *8");
+        assert_eq!(auto_identify_delay(300, 99), Duration::from_secs(2400));
+    }
+
+    // Rearm MISS increments misses (saturating at 3); a HIT resets to 0 and records
+    // own-hit provenance.
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_backoff_increments_and_hit_resets() {
+        let Some((h, _rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        for expect_after in [1u32, 2, 3, 3] {
+            h.rearm_auto_identify_after_attempt(QueueId(qid), false, None);
+            assert_eq!(
+                h.state.lock().unwrap().pending_auto_identify.as_ref().unwrap().misses,
+                expect_after
+            );
+        }
+        h.rearm_auto_identify_after_attempt(QueueId(qid), true, Some("Artist - Track".into()));
+        let st = h.state.lock().unwrap();
+        let a = st.pending_auto_identify.as_ref().unwrap();
+        assert_eq!(a.misses, 0, "a hit resets misses");
+        assert_eq!(a.last_recognized.as_deref(), Some("Artist - Track"), "own-hit provenance recorded");
+    }
+
+    // DISARM co-located in clear_stream_meta_except: same qid keeps the slot; a qid change
+    // (track change) and a stop (keep = None) both drop it -> no phantom fire.
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_disarmed_by_clear_stream_meta_except() {
+        let Some((h, mut fire_rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        assert!(h.state.lock().unwrap().pending_auto_identify.is_some());
+        // Same qid: kept.
+        h.clear_stream_meta_except(Some(QueueId(qid)));
+        assert!(
+            h.state.lock().unwrap().pending_auto_identify.is_some(),
+            "same qid keeps the slot (a mid-stream re-land)"
+        );
+        // A different qid (track change): dropped.
+        h.clear_stream_meta_except(Some(QueueId(qid.wrapping_add(999))));
+        assert!(
+            h.state.lock().unwrap().pending_auto_identify.is_none(),
+            "a qid change disarms"
+        );
+        // Advancing time produces NO phantom fire (the guard cancelled the timer).
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert!(fire_rx.try_recv().is_err(), "a disarmed timer never fires");
+        // Re-arm, then a stop (keep = None) drops it.
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        assert!(h.state.lock().unwrap().pending_auto_identify.is_some());
+        h.clear_stream_meta_except(None);
+        assert!(
+            h.state.lock().unwrap().pending_auto_identify.is_none(),
+            "a stop disarms"
+        );
+    }
+
+    // Reschedule is IDEMPOTENT per qid: a resume (same-qid Playing edge) does not restart
+    // the grace clock (the timer id is unchanged).
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_reschedule_idempotent_per_qid() {
+        let Some((h, _rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        let id0 = h.state.lock().unwrap().pending_auto_identify.as_ref().unwrap().timer_id;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        let id1 = h.state.lock().unwrap().pending_auto_identify.as_ref().unwrap().timer_id;
+        assert_eq!(id0, id1, "same-qid reschedule is a no-op (clock not restarted)");
+    }
+
+    // GENERATION CHECK: a rearm for a qid that is NOT the current slot's (a stale
+    // completion after a track change) leaves the slot untouched; and a rearm with no
+    // slot present is a no-op (no panic).
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_rearm_generation_check_bails() {
+        let Some((h, _rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        let id0 = h.state.lock().unwrap().pending_auto_identify.as_ref().unwrap().timer_id;
+        h.rearm_auto_identify_after_attempt(QueueId(qid.wrapping_add(999)), true, Some("x".into()));
+        {
+            let st = h.state.lock().unwrap();
+            let a = st.pending_auto_identify.as_ref().unwrap();
+            assert_eq!(a.timer_id, id0, "a wrong-qid rearm leaves the slot untouched");
+            assert!(a.last_recognized.is_none());
+        }
+        // Slot gone -> rearm is a no-op (no panic).
+        h.clear_stream_meta_except(None);
+        h.rearm_auto_identify_after_attempt(QueueId(qid), true, Some("y".into()));
+        assert!(h.state.lock().unwrap().pending_auto_identify.is_none());
+    }
+
+    // INERT when disabled, and STREAMS ONLY: auto = false never arms; a library song is
+    // never auto-identified.
+    #[tokio::test(start_paused = true)]
+    async fn auto_identify_inert_when_disabled_and_skips_library() {
+        let Some((h, _rx)) = auto_identify_rig() else { return };
+        h.set_recognize_config(false, 300);
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        assert!(
+            h.state.lock().unwrap().pending_auto_identify.is_none(),
+            "auto = false never arms"
+        );
+        // Re-enable, but a LIBRARY song still never arms (streams only).
+        h.set_recognize_config(true, 300);
+        let libqid = h.enqueue_song_for_test(playlist_test_song("lib")).await;
+        h.play_for_test(1).await;
+        h.reschedule_auto_identify(Some(QueueId(libqid)));
+        assert!(
+            h.state.lock().unwrap().pending_auto_identify.is_none(),
+            "a library song is never auto-identified (streams only)"
+        );
+    }
+
+    /// LIVE end-to-end proof (task bspk8v5), manual-only like the other live tests: with
+    /// auto-identify enabled and a real Shazam-matchable stream playing, the 8s grace
+    /// fires, the fire hook spawns a REAL songrec capture, and the recognized name reaches
+    /// BOTH currentsong `Title` AND `current_item().stream_meta` (the MPRIS source) within
+    /// one grace + capture window. Needs internet + `ffmpeg`/`songrec` on PATH; run with:
+    ///   PATH=<songrec-bin>:<ffmpeg-bin>:$PATH cargo test -p hypodj-core -- --ignored auto_identify_live
+    /// Recognition is probabilistic (a talk segment no-matches): a clean no-match soft-
+    /// skips rather than failing, so re-run until NTS plays a track.
+    #[tokio::test]
+    #[ignore = "live: needs internet + songrec/ffmpeg on PATH; recognition is probabilistic"]
+    async fn auto_identify_live_names_stream_within_grace_and_capture() {
+        let Some((h, mut fire_rx)) = auto_identify_rig() else { return };
+        let qid = h.enqueue_stream_for_test(NTS).await;
+        h.play_for_test(0).await;
+        let h = std::sync::Arc::new(h);
+        h.reschedule_auto_identify(Some(QueueId(qid)));
+        // Real 8s grace (wall clock here, not paused).
+        let id = tokio::time::timeout(Duration::from_secs(15), fire_rx.recv())
+            .await
+            .expect("the grace timer fired")
+            .expect("a fire id");
+        // The fire hook gates then spawns the real capture off-spine.
+        h.on_auto_identify_fire(id).await;
+        // Poll for the recognized name (the capture runs up to ~40s).
+        let mut named = None;
+        for _ in 0..55 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            {
+                let st = h.state.lock().unwrap();
+                if let Some((q, m)) = &st.stream_meta {
+                    if *q == QueueId(qid) {
+                        if let Some(t) = m.title.clone() {
+                            named = Some(t);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match named {
+            Some(t) => {
+                eprintln!("AUTO-IDENTIFY named the stream: {t}");
+                // currentsong Title carries it.
+                let cur = match h.handle(MpdCommand::CurrentSong).await {
+                    MpdResponse::Pairs(p) => p,
+                    other => panic!("expected Pairs, got {other:?}"),
+                };
+                assert!(
+                    cur.iter().any(|(k, v)| k == "Title" && v == &t),
+                    "currentsong Title carries the recognized name: {cur:?}"
+                );
+                // The MPRIS source (current_item stream_meta) carries it too.
+                let ci = h.current_item().expect("a current item");
+                assert_eq!(
+                    ci.stream_meta.and_then(|m| m.title),
+                    Some(t),
+                    "current_item().stream_meta carries the recognized name for MPRIS"
+                );
+                eprintln!("PROOF OK: auto-identify surfaced the name to currentsong + MPRIS");
+            }
+            None => eprintln!("no match this run (talk segment) - soft skip; re-run"),
+        }
     }
 
     // ── stream cover-art serving (albumart Stream branch, task kmrhj8m) ─────

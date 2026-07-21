@@ -35,7 +35,7 @@ use mpris_server::{
 
 use crate::handler::{CurrentItem, HypodjHandler};
 use crate::model::{QueueEntry, Song};
-use crate::player::{PlayState, PlayerHandle};
+use crate::player::{PlayState, PlayerHandle, StreamMeta};
 use crate::subsonic::SubsonicClient;
 
 /// The MPRIS implementation object served on the bus. Cheap to hold: three Arc/
@@ -157,22 +157,45 @@ fn track_id(mpd_id: u64) -> TrackId {
 
 /// Map a current queue item to MPRIS Metadata. Pure over (item, client) so it is
 /// unit-testable. A library [`Song`] gets full tags + a getCoverArt `mpris:artUrl`
-/// (built with auth like the stream URL) when a cover id is known; a raw stream
-/// gets only `xesam:title = the URL` and NO art (a live stream has no cover).
+/// (built with auth like the stream URL) when a cover id is known; a raw stream gets its
+/// live ICY / recognized now-playing overlay when present (task bspk8v5): the recognized
+/// or ICY title as `xesam:title` (else the URL fallback), the station as `xesam:artist`,
+/// and the recognized Shazam cover as `mpris:artUrl` - so GNOME shows the named track
+/// instead of the bare URL. With no overlay a raw stream still gets `xesam:title = URL`
+/// and no art (a live stream has no inherent cover).
 pub fn item_metadata(item: &CurrentItem, client: &SubsonicClient) -> Metadata {
     let mut m = Metadata::new();
     m.set_trackid(Some(track_id(item.mpd_id)));
     match &item.entry {
         QueueEntry::Song(song) => song_metadata(&mut m, song, client),
         QueueEntry::Stream { url, title } => {
-            // For a raw stream the title is the URL (per the queue model); still
-            // set it explicitly and set the xesam:url. No artUrl.
-            let shown = if title.is_empty() { url } else { title };
-            m.set_title(Some(shown.clone()));
-            m.set_url(Some(url.clone()));
+            stream_metadata(&mut m, url, title, item.stream_meta.as_ref(), item.cover_url.as_deref());
         }
     }
     m
+}
+
+/// Fill Metadata from a raw stream + its qid-gated overlay (task bspk8v5). `xesam:title`
+/// is the recognized/ICY now-playing when present, else the queued title, else the URL;
+/// the station (icy-name / recognized station) rides `xesam:artist`; a recognized cover
+/// URL passes straight through as `mpris:artUrl`. `xesam:url` is always the raw URL.
+fn stream_metadata(
+    m: &mut Metadata,
+    url: &str,
+    title: &str,
+    meta: Option<&StreamMeta>,
+    cover_url: Option<&str>,
+) {
+    let now_playing = meta.and_then(|mm| mm.title.as_deref()).filter(|t| !t.trim().is_empty());
+    let shown = now_playing.unwrap_or(if title.is_empty() { url } else { title });
+    m.set_title(Some(shown.to_string()));
+    if let Some(station) = meta.and_then(|mm| mm.name.as_deref()).filter(|n| !n.trim().is_empty()) {
+        m.set_artist(Some([station.to_string()]));
+    }
+    m.set_url(Some(url.to_string()));
+    if let Some(cover) = cover_url {
+        m.set_art_url(Some(cover.to_string()));
+    }
 }
 
 /// Fill Metadata from a library Song: title/artist/album/length + artUrl.
@@ -556,6 +579,8 @@ mod tests {
         let item = CurrentItem {
             mpd_id: 7,
             entry: QueueEntry::Song(a_song()),
+            stream_meta: None,
+            cover_url: None,
         };
         let m = item_metadata(&item, &client);
         assert_eq!(m.title(), Some("Independent Us"));
@@ -580,6 +605,8 @@ mod tests {
         let item = CurrentItem {
             mpd_id: 1,
             entry: QueueEntry::Song(song),
+            stream_meta: None,
+            cover_url: None,
         };
         let m = item_metadata(&item, &client);
         let art = m.art_url().expect("artUrl present via song-id fallback");
@@ -596,10 +623,51 @@ mod tests {
                 url: url.to_string(),
                 title: url.to_string(),
             },
+            stream_meta: None,
+            cover_url: None,
         };
         let m = item_metadata(&item, &client);
         assert_eq!(m.title(), Some(url));
-        assert!(m.art_url().is_none(), "a raw stream must carry no artUrl");
+        assert!(m.art_url().is_none(), "a raw stream with no overlay must carry no artUrl");
         assert!(m.length().is_none(), "a raw stream has unknown length");
+    }
+
+    #[test]
+    fn raw_stream_overlay_titles_recognized_names_station_and_carries_art() {
+        // With a qid-gated stream overlay (recognized or ICY now-playing + station +
+        // cover), the MPRIS metadata surfaces the NAMED track instead of the bare URL
+        // (the GNOME complaint, task bspk8v5): recognized title -> xesam:title, station
+        // -> xesam:artist, recognized cover -> mpris:artUrl, raw url stays xesam:url.
+        let Some(client) = test_client() else { return };
+        let url = "https://stream-mixtape-geo.ntslive.net/mixtape5";
+        let item = CurrentItem {
+            mpd_id: 3,
+            entry: QueueEntry::Stream {
+                url: url.to_string(),
+                title: url.to_string(),
+            },
+            stream_meta: Some(StreamMeta {
+                name: Some("NTS 1".to_string()),
+                title: Some("Floating Points - Track".to_string()),
+            }),
+            cover_url: Some("https://is1.example/hq.jpg".to_string()),
+        };
+        let m = item_metadata(&item, &client);
+        assert_eq!(
+            m.title(),
+            Some("Floating Points - Track"),
+            "xesam:title is the recognized/ICY now-playing, not the URL"
+        );
+        assert_eq!(
+            m.artist(),
+            Some(vec!["NTS 1".to_string()]),
+            "xesam:artist is the station name"
+        );
+        assert_eq!(
+            m.art_url().as_deref(),
+            Some("https://is1.example/hq.jpg"),
+            "mpris:artUrl passes the recognized Shazam cover through"
+        );
+        assert_eq!(m.url().as_deref(), Some(url), "xesam:url stays the raw stream URL");
     }
 }

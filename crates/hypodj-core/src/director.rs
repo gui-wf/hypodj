@@ -430,6 +430,12 @@ async fn spine<C: Clock>(
                         // entry (a mid-stream title change re-lands on the same qid): a
                         // new track must not inherit the outgoing stream's Name/Title.
                         handler.clear_stream_meta_except(qid);
+                        // AUTO-IDENTIFY (task bspk8v5): on the stream-becomes-current edge,
+                        // arm the ICY grace timer (streams only, idempotent per qid so a
+                        // resume does not restart the clock). clear_stream_meta_except just
+                        // above already disarmed a stale slot from the outgoing entry; this
+                        // only arms. Sync (no await), no poller - the timer wheel drives it.
+                        handler.reschedule_auto_identify(qid);
                     }
                     PlayerEvent::TimePos { pos, queue_id } => {
                         // Attribute on IDENTITY: a frame whose queue_id does not
@@ -531,6 +537,11 @@ async fn spine<C: Clock>(
                             handler.on_continuation_warm_fire(id),
                         )
                         .await;
+                        // AUTO-IDENTIFY fire hook (task bspk8v5): a fired id may be the
+                        // pending auto-identify's. It only GATES here (a stale id no-ops)
+                        // then tokio::spawns the up-to-40s capture off the spine, so it
+                        // returns immediately and never pins the spine (no timeout needed).
+                        handler.on_auto_identify_fire(id).await;
                         pubr.edge(DjEventKind::WallClock(id));
                     }
                     // Timer source ended: FUSE the branch (drop the receiver) so it

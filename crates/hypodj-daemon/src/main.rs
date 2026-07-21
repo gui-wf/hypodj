@@ -109,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
     // station name or an http(s) URL), or None to leave the feature off. The runtime
     // `continuation on|off` toggle (default OFF, persisted) still gates whether it fires.
     handler.set_continuation_station(cfg.continuation.station.clone());
+    // Auto-identify (task bspk8v5): plumb the `[recognize]` config (auto toggle +
+    // floor-clamped re-identify interval). Default ON, so a no-ICY Shazam-matchable
+    // stream names itself; ICY still wins when present, and the backoff + single-flight
+    // keep the Shazam endpoint safe. The plan-timer wheel it arms on is wired below.
+    handler.set_recognize_config(cfg.recognize.auto, cfg.recognize.interval_secs);
 
     // The background scrobbler (feature 1) shares the SAME client. The director
     // spine feeds it every player event alongside the inline queue-advance.
