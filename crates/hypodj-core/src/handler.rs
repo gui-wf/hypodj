@@ -519,21 +519,34 @@ fn drain_is_next(st: &State) -> bool {
 /// `duration_secs` when a warm is armable, else `None`. Read under the caller's `State`
 /// lock; `station_ok` (a non-empty station configured) is passed in because
 /// `continuation_station` is a SEPARATE Mutex the caller reads first (never nested).
+/// `playing` (the deck is genuinely PLAYING) is passed in for the SAME reason: the
+/// caller reads [`HypodjHandler::reported_play_state`] - which consults the player
+/// actor's `watch` - OUTSIDE this `State` lock (never nested). It is the PLAY-STATE
+/// GATE: because [`HypodjHandler::stop_playback`] keeps `current`, a stopped deck
+/// still has a finite current Song draining next, so `current` alone can NOT tell a
+/// warm apart from one behind a deck the user stopped - only the play state can. This
+/// gate is what makes [`HypodjHandler::reschedule_continuation_warm`] idempotent-
+/// correct from EVERY funnel: on a stopped / paused / fading-out deck it disarms and
+/// does NOT re-arm; only a genuinely playing draining deck (re)arms. It mirrors the
+/// fire hook's Paused-drop, but at the predicate so it also covers the Stopped edge.
 ///
 /// Deliberately NOT [`HypodjHandler::current_can_warm`] (the SKIP near-EOF guard): the
 /// [`NEAR_EOF_GUARD_SECS`] decline exists to avoid a swallowed-EOF stall, which cannot
 /// occur for a continuation warm because the actor's `WarmKind::Continuation` ATTRIBUTES
 /// the auto-advance instead of swallowing it - so this predicate omits that guard on
 /// purpose.
-fn continuation_warm_ready(st: &State, station_ok: bool) -> Option<f64> {
-    // Armed toggle ON, a station configured, NO in-flight skip (a skip owns the warm
-    // slot and supersedes), NO live continuation stream (never warm behind the station
-    // itself), and the queue GENUINELY draining next - the SAME true-drain boundary
-    // slice-1 continuation fires on (drain_is_next), so a warm can never arm for a
-    // boundary slice-1 would not treat as a drain. Current must be a FINITE Song with a
-    // known duration (a stream has no natural EOF to warm ahead of; unknown duration
-    // cannot bound the LEAD).
-    if !(st.continuation
+fn continuation_warm_ready(st: &State, station_ok: bool, playing: bool) -> Option<f64> {
+    // The deck GENUINELY PLAYING (never arm behind a stopped/paused/fading-out deck -
+    // stop_playback keeps `current`, so this play-state gate, not `current`, is what
+    // refuses a warm on a stopped deck), the armed toggle ON, a station configured, NO
+    // in-flight skip (a skip owns the warm slot and supersedes), NO live continuation
+    // stream (never warm behind the station itself), and the queue GENUINELY draining
+    // next - the SAME true-drain boundary slice-1 continuation fires on (drain_is_next),
+    // so a warm can never arm for a boundary slice-1 would not treat as a drain. Current
+    // must be a FINITE Song with a known duration (a stream has no natural EOF to warm
+    // ahead of; unknown duration cannot bound the LEAD).
+    if !(playing
+        && st.continuation
         && station_ok
         && st.pending_skip.is_none()
         && st.continuation_active.is_none()
@@ -3479,6 +3492,13 @@ impl HypodjHandler {
         let dur = req.dur;
         let intent = req.intent;
         let commit_logical = req.commit_logical;
+        // Does this fade drive the deck to a STOP (the `Out` -> Terminal::StopRestore
+        // fade)? Captured here, before `intent` is moved into the build/spawn closures,
+        // so the post-install continuation-warm step below can DISARM (never re-arm)
+        // behind a deck that is fading to a stop. Every other fade leaves the deck
+        // playing (glide / knob / wind-down / resume-in) or pausing (PauseOut, which the
+        // predicate's play-state gate already refuses via `pending_pause`).
+        let installs_stop = matches!(intent, FadeIntent::Out);
         // ANY fade that installs here SUPERSEDES whatever is running. If it superseded
         // a live skip dip, that dip's Terminal::SkipLoad/switch_warmed will NEVER run,
         // so `pending_skip` and the prefetched warm target are now STALE - the warm
@@ -3610,21 +3630,32 @@ impl HypodjHandler {
             // already landed, its prefetched station alike. Done FIRST so no stale entry
             // sits parked to auto-advance behind the still-playing current track.
             let _ = self.player.drop_warm().await;
-            // Then RE-EVALUATE the continuation warm (slice 2) rather than merely dropping
-            // it. A bare slot-take here (the earlier funnel) killed a still-PENDING warm
-            // (`warmed` == false, nothing parked on the actor) with NO re-arm, so a single
-            // mid-track volume gesture - setvol glide / knob, which have no follow-on
-            // reschedule of their own and BOTH route through here - turned the next EOF into
-            // a cold ICY-connect gap instead of the gapless warmed handoff. reschedule
-            // disarms first (its TimerGuard RAII-cancels the armed timer; drops a warm the
-            // drop_warm above already cleared - idempotent - keeping the handler honest with
-            // the actor for the `warmed` == true case) then race-safely RE-ARMS a fresh
-            // timer when the predicate still holds. So a volume gesture PRESERVES gaplessness
-            // on a pending warm while a warmed slot is still correctly superseded and re-armed.
-            // Self-gating: a non-drain / paused / stream boundary (or a follow-on disarm, as
-            // in pause_with_fade) arms nothing. Holds no std lock across the await and never
-            // touches the FadeSlot, so it is re-entrancy-safe from this post-supersede path.
-            self.reschedule_continuation_warm().await;
+            if installs_stop {
+                // A fade-OUT drives the deck to a StopRestore stop: the warm must DIE and
+                // never re-arm behind a deck that is fading to a stop. reschedule's play-
+                // state gate would refuse at FIRE once the deck has stopped, but here at
+                // INSTALL the deck is still raw-Playing, so a bare reschedule would arm a
+                // timer that sits parked on the stopping deck until it self-drops at fire.
+                // Disarm outright instead - no bare timer left behind the stopping deck.
+                self.disarm_continuation_warm().await;
+            } else {
+                // Then RE-EVALUATE the continuation warm (slice 2) rather than merely dropping
+                // it. A bare slot-take here (the earlier funnel) killed a still-PENDING warm
+                // (`warmed` == false, nothing parked on the actor) with NO re-arm, so a single
+                // mid-track volume gesture - setvol glide / knob, which have no follow-on
+                // reschedule of their own and BOTH route through here - turned the next EOF into
+                // a cold ICY-connect gap instead of the gapless warmed handoff. reschedule
+                // disarms first (its TimerGuard RAII-cancels the armed timer; drops a warm the
+                // drop_warm above already cleared - idempotent - keeping the handler honest with
+                // the actor for the `warmed` == true case) then race-safely RE-ARMS a fresh
+                // timer when the predicate still holds. So a volume gesture PRESERVES gaplessness
+                // on a pending warm while a warmed slot is still correctly superseded and re-armed.
+                // Self-gating: a non-drain / paused / stopped / stream boundary (or a follow-on
+                // disarm, as in pause_with_fade) arms nothing via the play-state gate. Holds no
+                // std lock across the await and never touches the FadeSlot, so it is re-entrancy-
+                // safe from this post-supersede path.
+                self.reschedule_continuation_warm().await;
+            }
         }
         res
     }
@@ -4824,10 +4855,16 @@ impl HypodjHandler {
             .unwrap_or(false);
         let Some(timers) = self.plan_timers.get().cloned() else { return };
         let elapsed = self.last_elapsed_secs();
+        // The PLAY-STATE GATE: read the reported play state (which consults the player
+        // actor's watch + reads `State` internally) BEFORE locking `State` below, never
+        // nested. A warm arms ONLY behind a genuinely playing deck - a stopped (stop
+        // keeps `current`), paused, or fading-out deck disarms without re-arming, which
+        // is what makes this reschedule idempotent-correct from every funnel.
+        let playing = self.reported_play_state() == PlayState::Playing;
         // (2) Predicate + finite-Song duration under one short lock.
         let dur = {
             let st = self.state.lock().unwrap();
-            match continuation_warm_ready(&st, station_ok) {
+            match continuation_warm_ready(&st, station_ok, playing) {
                 Some(d) => d,
                 None => return,
             }
@@ -4866,14 +4903,18 @@ impl HypodjHandler {
                 return;
             }
         }
+        // Read the reported play state ONCE (outside every `State` lock below, never
+        // nested): reused for the fast Paused-drop and the predicate's play-state gate.
+        let play_state = self.reported_play_state();
         // Paused at fire -> the warm is stale-waste through an open-ended pause; drop it.
         // Resume re-arms via reschedule.
-        if self.reported_play_state() == PlayState::Paused {
+        if play_state == PlayState::Paused {
             self.disarm_continuation_warm().await;
             return;
         }
         let station = self.continuation_station.lock().unwrap().clone();
         let station_ok = station.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        let playing = play_state == PlayState::Playing;
         let elapsed = self.last_elapsed_secs();
         // (b) Re-check the predicate + still-ours under one short lock; capture a DECISION
         // (never hold the std guard across the disarm await - the Send invariant).
@@ -4887,7 +4928,7 @@ impl HypodjHandler {
             if !matches!(&st.pending_continuation_warm, Some(w) if w.timer_id == id) {
                 FireDecision::Bail
             } else {
-                match continuation_warm_ready(&st, station_ok) {
+                match continuation_warm_ready(&st, station_ok, playing) {
                     Some(d) => FireDecision::Prefetch(d),
                     None => FireDecision::Disarm,
                 }
@@ -8016,12 +8057,11 @@ mod tests {
     async fn continuation_warm_arms_at_lead_and_fires_on_fake_clock() {
         let Some((h, probe, mut fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely PLAY the final track: the arm predicate now gates on a genuinely
+        // playing deck, so the warm only arms behind a Playing (not stopped) deck.
+        h.play_for_test(0).await;
         h.note_elapsed_ms(10_000); // 10s in -> LEAD deadline at 200 - 10 - 45 = 145s
         h.reschedule_continuation_warm().await;
         {
@@ -8061,12 +8101,10 @@ mod tests {
         let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("s0")).await;
         h.enqueue_song_for_test(playlist_test_song("s1")).await;
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely play s0 so the deck is Playing (the arm predicate gates on it).
+        h.play_for_test(0).await;
         h.reschedule_continuation_warm().await;
         assert!(
             h.state.lock().unwrap().pending_continuation_warm.is_none(),
@@ -8243,12 +8281,11 @@ mod tests {
         h.enqueue_song_for_test(playlist_test_song("A")).await;
         h.enqueue_song_for_test(playlist_test_song("B")).await;
         h.enqueue_song_for_test(playlist_test_song("C")).await;
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(2); // C is last / draining; the warm sits behind it
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely play C (the last / draining Song) so the deck is Playing (the arm
+        // predicate gates on it); the warmed slot then models a landed prefetch.
+        h.play_for_test(2).await;
         install_warmed_slot(&h, 500, NTS);
         // Remove A (position 1): C stays the last draining Song, so the warm re-arms.
         h.plan_queue_edit(&crate::plan::Action::Remove {
@@ -8325,6 +8362,101 @@ mod tests {
         );
     }
 
+    // PLAY-STATE GATE (MEDIUM): a STOP keeps `current` (stop_playback never clears it), so a
+    // finite Song still drains next behind a Stopped deck. A stray volume gesture then routes
+    // through the fade-install funnel's reschedule - which, WITHOUT the play-state gate, armed
+    // a warm on the STOPPED deck (an open ICY connection + a warmed slot parked behind a deck
+    // the user explicitly stopped, plus a perpetual fire-then-rearm cycle). The gate refuses:
+    // no slot, no timer, ever.
+    #[tokio::test(start_paused = true)]
+    async fn stop_then_setvol_does_not_arm_a_warm() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        // Play the final track: a warm DOES arm on a normally-playing deck.
+        h.play_for_test(0).await;
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "a warm arms on the genuinely playing final track"
+        );
+        // MPD stop: keeps `current`, but the deck is now Stopped -> the warm disarms.
+        h.handle(MpdCommand::Stop).await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "stop disarms the warm (keeps `current` but the deck is Stopped)"
+        );
+        // A stray setvol on the STOPPED deck routes through the fade-install funnel's
+        // reschedule. The play-state gate refuses (reported state is Stopped): no warm arms.
+        h.handle(MpdCommand::SetVol(30)).await;
+        h.wait_for_fade().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "a volume gesture on a Stopped deck arms no warm (the play-state gate refuses)"
+        );
+    }
+
+    // PLAY-STATE GATE (LOW): a `fade out` drives the deck to a StopRestore stop. WITHOUT the
+    // gate, the fade-install funnel's reschedule ran while the deck was still raw-Playing and
+    // left a warm timer armed on the STOPPING deck. The funnel now DISARMS for a stopping fade
+    // (and the fire-time gate would refuse anyway once stopped): no bare timer is left parked.
+    #[tokio::test(start_paused = true)]
+    async fn fade_out_does_not_leave_a_warm_armed_on_the_stopping_deck() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.play_for_test(0).await;
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "a warm arms on the genuinely playing final track"
+        );
+        // `fade out`: the install funnel disarms the warm (the deck is fading to a stop).
+        h.start_fade(fade_args(FadeKind::Out, 20)).await.unwrap();
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "fade-out disarms the warm at the install funnel (no bare timer on the stopping deck)"
+        );
+        // Drive the fade-out to completion: the deck is now Stopped, and STILL no warm.
+        h.wait_for_fade().await;
+        assert_eq!(h.player.state(), PlayState::Stopped, "the fade-out stopped the deck");
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "still no warm once the StopRestore terminal has settled"
+        );
+    }
+
+    // PLAY-STATE GATE (resume path): after a STOP disarms the warm, playing the final track
+    // again RE-ARMS it - the play_index funnel's reschedule sees a genuinely playing deck once
+    // more, so the gapless prefetch is restored without any extra call-site patch.
+    #[tokio::test(start_paused = true)]
+    async fn play_after_stop_rearms_once_playing_again() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await;
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        h.play_for_test(0).await;
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "a warm arms while playing"
+        );
+        // Stop disarms (the deck is Stopped, the gate refuses any re-arm).
+        h.handle(MpdCommand::Stop).await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "stop disarms the warm"
+        );
+        // Play again: the deck is genuinely Playing once more -> the warm re-arms.
+        h.play_for_test(0).await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_some(),
+            "playing again re-arms the warm once the deck is genuinely playing"
+        );
+    }
+
     // REGRESSION (fade-install funnel): a mid-track SETVOL glide during a PENDING warm
     // (armed but not yet warmed - nothing parked on the actor) must RE-ARM the warm, not
     // silently kill it. The earlier funnel took the slot unconditionally with NO re-arm, so
@@ -8336,12 +8468,11 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let Some((h, probe, mut fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely play the final track so the deck is Playing: the arm predicate
+        // gates on it, and the volume gesture below must re-arm while PLAYING.
+        h.play_for_test(0).await;
         h.note_elapsed_ms(10_000); // 10s in -> LEAD deadline at 200 - 10 - 45 = 145s (pending)
         h.reschedule_continuation_warm().await;
         let first_id = {
@@ -8393,12 +8524,10 @@ mod tests {
     async fn knob_step_preserves_and_rearms_pending_continuation_warm() {
         let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely play so the deck is Playing (the arm predicate gates on it).
+        h.play_for_test(0).await;
         h.note_elapsed_ms(10_000);
         h.reschedule_continuation_warm().await;
         let first_id = h.state.lock().unwrap().pending_continuation_warm.as_ref().unwrap().timer_id;
@@ -8426,12 +8555,11 @@ mod tests {
         use std::sync::atomic::Ordering::Relaxed;
         let Some((h, probe, _fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await;
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely play so the deck is Playing (the arm predicate gates on it); the
+        // warmed slot below then models a warm that had already landed on the actor.
+        h.play_for_test(0).await;
         install_warmed_slot(&h, 500, NTS);
         let drops_before = probe.drop.load(Relaxed);
 
@@ -8458,12 +8586,10 @@ mod tests {
     async fn continuation_warm_fire_rearms_when_remaining_grew() {
         let Some((h, probe, mut fire_rx)) = warm_rig() else { return };
         h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
-        {
-            let mut st = h.state.lock().unwrap();
-            st.current = Some(0);
-            st.continuation = true;
-        }
+        h.state.lock().unwrap().continuation = true;
         h.set_continuation_station(Some(NTS.to_string()));
+        // Genuinely play so the deck is Playing (the arm predicate gates on it).
+        h.play_for_test(0).await;
         h.note_elapsed_ms(150_000); // 150s in -> deadline at 200 - 150 - 45 = 5s
         h.reschedule_continuation_warm().await;
         let first_id = {
