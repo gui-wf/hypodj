@@ -91,20 +91,76 @@ impl RecognizeConfig {
     }
 }
 
-/// `[continuation]` config for the end-of-queue continuation-radio feature: when
-/// the play queue drains, flow into a configured online radio station instead of
-/// stopping silent. This holds ONLY the station identity; the runtime on/off arming
-/// is a persisted toggle (`continuation on|off`), default OFF, so the feature is
-/// never surprising - a configured station does nothing until it is explicitly
-/// armed and a station is resolvable.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// The end-of-queue CONTINUATION behavior when the play queue drains and the
+/// runtime `continuation on|off` toggle is armed. Two disjoint mechanisms share
+/// the ONE arming toggle; this config field selects which one fires.
+///
+/// - `Radio` (the default, back-compat): flow into a configured online radio
+///   station (a raw stream) - the original slice-1/slice-2 behavior.
+/// - `Autofill`: append real LIBRARY tracks similar to the recency seed so the
+///   music keeps going from the user's own library (they scrobble, seek, carry
+///   full metadata, and re-autofill on each subsequent true-drain).
+///
+/// `#[serde(rename_all = "lowercase")]` so the TOML value is `mode = "radio"` /
+/// `mode = "autofill"`. Every existing config (station-only or no `[continuation]`
+/// section at all) deserializes to `Radio`, so the radio path is byte-identical to
+/// today; `mode = "autofill"` is the only way to switch.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContinuationMode {
+    /// Flow into the configured radio station (the back-compat default).
+    #[default]
+    Radio,
+    /// Append similar LIBRARY songs from the user's own library.
+    Autofill,
+}
+
+/// `[continuation]` config for the end-of-queue continuation feature: when the
+/// play queue drains, either flow into a configured online radio station (`mode =
+/// "radio"`, the default) OR append similar library tracks (`mode = "autofill"`)
+/// instead of stopping silent. This holds the station identity and the mode
+/// selector; the runtime on/off arming is a persisted toggle (`continuation
+/// on|off`), default OFF, so the feature is never surprising - it does nothing
+/// until it is explicitly armed.
+#[derive(Debug, Clone, Deserialize)]
 pub struct ContinuationConfig {
     /// The continuation station: either a saved Navidrome internet-radio station
     /// NAME (resolved to its stream URL via `getInternetRadioStations`) or an
     /// absolute `http(s)://` stream URL used directly. `None` (unset) means the
-    /// feature is off - the deck ends stopped at end-of-queue as it does today.
+    /// radio path is off - the deck ends stopped at end-of-queue as it does today.
+    /// Ignored when `mode = "autofill"` (autofill seeds from the library, not a
+    /// station).
     #[serde(default)]
     pub station: Option<String>,
+    /// Which continuation mechanism fires at the drain edge (radio | autofill).
+    /// Defaults to `Radio` so every pre-existing config keeps its exact behavior.
+    #[serde(default)]
+    pub mode: ContinuationMode,
+    /// How many similar library tracks an `autofill` refill appends per true-drain
+    /// (the target count after dedup shrinkage; the fetch over-fetches 2x). Unused
+    /// in `radio` mode. Default 20.
+    #[serde(default = "d_autofill_count")]
+    pub autofill_count: u32,
+}
+
+/// Manual (not derived) so a MISSING `[continuation]` section - which the top-level
+/// `#[serde(default)]` fills from `Default` - matches the per-field serde defaults: a
+/// derived `Default` would give `autofill_count = 0` (a zero-length refill), so spell
+/// it out to keep the no-section case byte-identical to an empty `[continuation]`.
+impl Default for ContinuationConfig {
+    fn default() -> Self {
+        Self {
+            station: None,
+            mode: ContinuationMode::Radio,
+            autofill_count: d_autofill_count(),
+        }
+    }
+}
+
+pub const DEFAULT_AUTOFILL_COUNT: u32 = 20;
+
+fn d_autofill_count() -> u32 {
+    DEFAULT_AUTOFILL_COUNT
 }
 
 /// `[restart]` config for the smooth-restart (sleep-fade-out on SIGTERM + resume
@@ -778,6 +834,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.continuation.station.as_deref(), Some("NTS 1"));
+        // Back-compat: mode defaults to Radio and autofill_count to 20 whenever the
+        // key is absent (a station-only config, or no section at all).
+        assert_eq!(cfg.continuation.mode, ContinuationMode::Radio, "mode defaults to radio");
+        assert_eq!(cfg.continuation.autofill_count, DEFAULT_AUTOFILL_COUNT);
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.continuation.mode, ContinuationMode::Radio, "no section => radio");
+        assert_eq!(cfg.continuation.autofill_count, DEFAULT_AUTOFILL_COUNT);
+
+        // mode = "autofill" parses (lowercase serde rename) and a custom count sticks.
+        let cfg = Config::from_str(
+            r#"
+            [server]
+            url = "https://m"
+            username = "a"
+            password = "b"
+            [continuation]
+            mode = "autofill"
+            autofill_count = 12
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.continuation.mode, ContinuationMode::Autofill);
+        assert_eq!(cfg.continuation.autofill_count, 12);
     }
 
     #[test]

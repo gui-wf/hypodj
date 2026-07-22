@@ -109,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
     // station name or an http(s) URL), or None to leave the feature off. The runtime
     // `continuation on|off` toggle (default OFF, persisted) still gates whether it fires.
     handler.set_continuation_station(cfg.continuation.station.clone());
+    // End-of-queue continuation MODE (radio | autofill) + the autofill refill count.
+    // Defaults to radio (back-compat: the station handoff above), so this is a no-op
+    // unless `[continuation].mode = "autofill"` is set. Shares the ONE `continuation
+    // on|off` arming toggle - mode only selects which mechanism fires at the drain.
+    handler.set_continuation_mode(cfg.continuation.mode, cfg.continuation.autofill_count);
     // Auto-identify (task bspk8v5): plumb the `[recognize]` config (auto toggle +
     // floor-clamped re-identify interval). Default ON, so a no-ICY Shazam-matchable
     // stream names itself; ICY still wins when present, and the backoff + single-flight

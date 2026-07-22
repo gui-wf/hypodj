@@ -19,9 +19,10 @@
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::hash::BuildHasher;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -33,7 +34,7 @@ use tokio::time::Instant;
 
 use crate::cache::TtlLru;
 use crate::clock::TokioClock;
-use crate::config::FadeConfig;
+use crate::config::{ContinuationMode, FadeConfig};
 use crate::executor::PendingPlan;
 use crate::fade::{
     min_deliberate_dur, run_fade, Curve, FadeError, FadeOutcome, FadeProgress, FadeSpec, FadeTarget,
@@ -291,6 +292,31 @@ struct State {
     /// already-resolved identity (qids are monotonic, but the single slot is last-writer,
     /// and this is what makes the late write a no-op). EPHEMERAL: never persisted.
     station_identity_gen: u64,
+    /// AUTOFILL recently-seen dedup ring (continuation mode = autofill): the
+    /// [`SongId`]s of tracks recently autofilled or recently finished, newest at the
+    /// back. Each true-drain refill drops any candidate whose id is in here, so a
+    /// refill never immediately re-appends the same batch (getSimilarSongs overlap is
+    /// high between adjacent seeds) and A -> B -> A ping-pong cannot form. FIFO-capped
+    /// at [`AUTOFILL_SEEN_CAP`] (`pop_front` on overflow): after ~cap distinct tracks a
+    /// song MAY recur, which is correct for a finite library where the goal is "the
+    /// music keeps going" - the invariant is no IMMEDIATE repeat / no tight loop, not
+    /// permanent exclusion. Fed from two sites: every id an autofill appends, and the
+    /// finishing Song id at the [`Self::advance_on_eof`] last_finished capture (so the
+    /// seed - which IS last_finished at the drain edge - and every recently played
+    /// track are excluded from the next refill). EPHEMERAL: never persisted to
+    /// resume.toml (same stance as `fresh_enqueue_anchor`).
+    autofill_seen: VecDeque<SongId>,
+    /// The clock instant of the most recent autofill FETCH attempt (stamped BEFORE the
+    /// fetch), or `None` until the first. The DEGENERATE-INPUT FUSE: a true-drain within
+    /// [`AUTOFILL_MIN_INTERVAL`] of this stamp is a pathological instant-EOF spiral (a
+    /// corrupt library where every appended song errors immediately, re-entering the
+    /// drain every ~n entries) - the refill then stops HONESTLY instead of hammering the
+    /// server. It is a STOP, not a wait: no timer is armed, no poller runs; a healthy
+    /// batch always outlives the interval so the fuse is invisible in normal use. Hard
+    /// ceiling: <= 1 fetch per [`AUTOFILL_MIN_INTERVAL`] in ANY execution. Uses the
+    /// shared tokio clock so it is deterministic under `#[tokio::test(start_paused)]` +
+    /// `tokio::time::advance`. EPHEMERAL: never persisted.
+    last_autofill_at: Option<Instant>,
 }
 
 /// The pending continuation-warm slot (see [`State::pending_continuation_warm`]). A
@@ -467,6 +493,9 @@ impl Default for State {
             station_identity: None,
             // The resolver generation starts at 0; every stream track-start bumps it.
             station_identity_gen: 0,
+            // No autofill has run yet: an empty dedup ring and no fetch stamp.
+            autofill_seen: VecDeque::new(),
+            last_autofill_at: None,
         }
     }
 }
@@ -555,6 +584,20 @@ impl State {
         // Sequential (and consume, which removes the current): drained iff the
         // current entry is the last one.
         cur + 1 >= len
+    }
+
+    /// Record `id` in the AUTOFILL recently-seen dedup ring, FIFO-capped at
+    /// [`AUTOFILL_SEEN_CAP`] (`pop_front` the oldest on overflow). Called for every id
+    /// an autofill appends and for the finishing Song id at the [`HypodjHandler::
+    /// advance_on_eof`] last_finished capture, so the next refill excludes both the
+    /// just-appended batch and every recently played track (the seed included).
+    fn push_autofill_seen(&mut self, id: SongId) {
+        // A no-op re-push of an id already at the back would waste a slot; but the
+        // dual feed (append + finish) can legitimately re-touch an id, so just cap.
+        self.autofill_seen.push_back(id);
+        while self.autofill_seen.len() > AUTOFILL_SEEN_CAP {
+            self.autofill_seen.pop_front();
+        }
     }
 }
 
@@ -1413,6 +1456,26 @@ pub struct HypodjHandler {
     /// (see [`Self::resolve_continuation_url`]). Mutex (not OnceLock) mirrors
     /// [`Self::state_path`]: an unset feature is a valid state.
     continuation_station: Mutex<Option<String>>,
+    /// The end-of-queue continuation MODE (radio | autofill), plumbed once at daemon
+    /// startup from `[continuation].mode` via [`Self::set_continuation_mode`]. A SEPARATE
+    /// Mutex (like [`Self::continuation_station`]), read under a SHORT scope at the drain
+    /// edge and at every warm reschedule/fire (folded into `station_ok` so no station
+    /// prefetch ever arms in autofill mode). Defaults `Radio` in a raw handler, so the
+    /// existing radio path is byte-identical until the daemon plumbs a real config.
+    continuation_mode: Mutex<ContinuationMode>,
+    /// The AUTOFILL refill count (`[continuation].autofill_count`, default 20): how many
+    /// similar library tracks each true-drain refill targets after dedup shrinkage.
+    /// Read locklessly at the drain edge; floor-clamped to 1 on set so a misconfig can
+    /// never yield a zero-length refill that pointlessly fetches then honest-stops.
+    autofill_count: AtomicU32,
+    /// TEST-ONLY autofill fetch hook. In a `#[cfg(test)]` build [`Self::autofill_fetch`]
+    /// pops a scripted per-drain result from here instead of calling `client.similar`
+    /// (which needs a live server the sandbox lacks); when the script is empty it falls
+    /// through to the real client (which errors against the never-called test client,
+    /// exercising the backend-error honest-stop leg). Also counts fetch entries so a
+    /// test can assert "exactly one fetch per drain" and records the last seed used.
+    #[cfg(test)]
+    autofill_test: Mutex<AutofillTestHook>,
     /// Auto-identify master toggle (task bspk8v5), plumbed from `[recognize].auto` at
     /// daemon startup via [`Self::set_recognize_config`]. Default `false` in a raw
     /// handler (feature inert until the daemon plumbs the real config, which defaults
@@ -1475,6 +1538,21 @@ const CONTINUATION_WARM_LEAD_SECS: f64 = 45.0;
 /// cancel-then-rearms one fresh timer instead of prefetching now. Absorbs the
 /// Tick-quantized staleness of the live-elapsed atomic without a spurious rearm.
 const CONTINUATION_WARM_REARM_SLACK_SECS: f64 = 2.0;
+
+/// AUTOFILL recently-seen dedup ring capacity ([`State::autofill_seen`]). Sized at
+/// 10x the default refill batch (20): enough distinct history to kill both immediate
+/// batch-to-batch overlap and short ping-pong loops, while still letting a track recur
+/// after ~200 distinct plays on a finite library (the goal is "the music keeps going",
+/// not permanent exclusion). Linear `contains` is fine at this size.
+const AUTOFILL_SEEN_CAP: usize = 200;
+
+/// AUTOFILL degenerate-input FUSE window ([`State::last_autofill_at`]). A true-drain
+/// that re-enters the refill within this interval of the previous fetch is a
+/// pathological instant-EOF spiral (a corrupt library where every appended song errors
+/// immediately); it stops HONESTLY (no timer, no poller) rather than hammering the
+/// server. A healthy batch is tens of minutes of playback, so the fuse never trips in
+/// normal use; the hard ceiling is <= 1 fetch per this interval in ANY execution.
+const AUTOFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The ICY GRACE window (task bspk8v5): after a raw [`QueueEntry::Stream`] becomes the
 /// current entry, wait this long for ICY metadata (`icy-name`/`icy-title`) to arrive
@@ -1640,6 +1718,21 @@ fn calmer_rerank(
     pool
 }
 
+/// TEST-ONLY scripted-fetch hook for autofill (see [`HypodjHandler::autofill_test`]).
+/// Not compiled into a production build.
+#[cfg(test)]
+#[derive(Default)]
+struct AutofillTestHook {
+    /// Scripted per-drain results, front popped on each [`HypodjHandler::autofill_fetch`].
+    /// `Ok(vec)` models a similar() success (possibly empty); `Err(())` models a transport
+    /// error. When empty the fetch falls through to the real (never-called) client.
+    batches: VecDeque<Result<Vec<Song>, ()>>,
+    /// How many times autofill_fetch was entered (proves "exactly one fetch per drain").
+    calls: u32,
+    /// The seed id the last fetch used (proves the fresh-seed re-autofill walk).
+    last_seed: Option<SongId>,
+}
+
 impl HypodjHandler {
     /// Construct with the default `[fade]` tunables (research-backed constants).
     pub fn new(client: Arc<SubsonicClient>, player: PlayerHandle) -> Self {
@@ -1705,6 +1798,12 @@ impl HypodjHandler {
             pulls: Mutex::new(PullField::new()),
             recognizing: AtomicBool::new(false),
             continuation_station: Mutex::new(None),
+            // Continuation mode defaults RADIO (back-compat); the daemon plumbs the real
+            // config via set_continuation_mode. Autofill count seeds at the default.
+            continuation_mode: Mutex::new(ContinuationMode::Radio),
+            autofill_count: AtomicU32::new(crate::config::DEFAULT_AUTOFILL_COUNT),
+            #[cfg(test)]
+            autofill_test: Mutex::new(AutofillTestHook::default()),
             // Auto-identify starts INERT in a raw handler; the daemon plumbs the real
             // (default-ON) config via set_recognize_config, so tests without a config
             // never arm a capture. The interval seeds at the default (>= the floor).
@@ -4579,6 +4678,17 @@ impl HypodjHandler {
         self.state.lock().unwrap().pending_continuation_warm = None;
     }
 
+    /// Register the end-of-queue continuation MODE (radio | autofill) and the autofill
+    /// refill count, plumbed once at daemon startup from `[continuation].mode` /
+    /// `[continuation].autofill_count`. Mode selects which mechanism the ONE `continuation
+    /// on|off` toggle fires; it does NOT arm anything on its own. The count is floor-
+    /// clamped to 1 (a zero-count refill would fetch then honest-stop for nothing). Radio
+    /// stays the default, so an un-plumbed handler behaves exactly as before.
+    pub fn set_continuation_mode(&self, mode: ContinuationMode, autofill_count: u32) {
+        *self.continuation_mode.lock().unwrap() = mode;
+        self.autofill_count.store(autofill_count.max(1), Ordering::Relaxed);
+    }
+
     /// Register the `[recognize]` auto-identify config (task bspk8v5), plumbed once at
     /// daemon startup like [`Self::set_continuation_station`]. `auto` is the master
     /// toggle; `interval_secs` is the re-identify cadence, floor-clamped again here
@@ -4984,6 +5094,26 @@ impl HypodjHandler {
         self.enqueue_song(song).await
     }
 
+    /// TEST-ONLY: script the NEXT autofill fetch result (FIFO). `Ok(vec)` models a
+    /// similar() success (empty vec = backend returned nothing); `Err(())` models a
+    /// transport error. Each call to [`Self::autofill_fetch`] pops the front entry.
+    #[cfg(test)]
+    pub(crate) fn push_autofill_batch(&self, batch: Result<Vec<Song>, ()>) {
+        self.autofill_test.lock().unwrap().batches.push_back(batch);
+    }
+
+    /// TEST-ONLY: how many times autofill_fetch was entered (proves one-fetch-per-drain).
+    #[cfg(test)]
+    pub(crate) fn autofill_fetch_calls(&self) -> u32 {
+        self.autofill_test.lock().unwrap().calls
+    }
+
+    /// TEST-ONLY: the seed id the last autofill fetch used (proves the fresh-seed walk).
+    #[cfg(test)]
+    pub(crate) fn autofill_last_seed(&self) -> Option<SongId> {
+        self.autofill_test.lock().unwrap().last_seed.clone()
+    }
+
     /// TEST-ONLY: queue a raw stream uri (no network), for director tests.
     #[cfg(test)]
     pub(crate) async fn enqueue_stream_for_test(&self, uri: &str) -> u64 {
@@ -5169,6 +5299,11 @@ impl HypodjHandler {
                 QueueEntry::Song(s) => Some(s.clone()),
                 QueueEntry::Stream { .. } => None,
             }) {
+                // Also feed the AUTOFILL dedup ring: the finishing track (which becomes
+                // the recency SEED at this drain edge) must be excluded from the next
+                // refill, killing seed-orbit and A -> B -> A ping-pong. Bounded + ephemeral;
+                // harmless in radio mode (only autofill ever reads the ring).
+                st.push_autofill_seen(song.id.clone());
                 st.last_finished = Some(song);
             }
             // Does the finishing entry's stable id match the active continuation
@@ -5182,6 +5317,10 @@ impl HypodjHandler {
                     == st.continuation_active;
             (finishing_is_continuation, st.is_true_drain())
         };
+        // The continuation MODE (radio | autofill), read once under a short scope (a
+        // SEPARATE Mutex): it selects which mechanism the drain-edge dispatch fires and
+        // gates the slice-2 landed-commit + warm predicate off in autofill mode.
+        let mode = *self.continuation_mode.lock().unwrap();
         let next = self.plan_next(true);
         match next {
             Some(idx) => {
@@ -5202,7 +5341,9 @@ impl HypodjHandler {
                 // AND a slot that is still warmed (survived every disarm). ANY leg failing
                 // falls through to the unchanged slice-1 cold-start / honest stop.
                 let mut landed_orphan = false;
-                if continuation_landed && true_drain && !finishing_is_continuation {
+                if continuation_landed && true_drain && !finishing_is_continuation
+                    && mode == ContinuationMode::Radio
+                {
                     let committed = {
                         let mut st = self.state.lock().unwrap();
                         match st.pending_continuation_warm.take() {
@@ -5256,7 +5397,12 @@ impl HypodjHandler {
                     tracing::warn!(
                         "continuation stream ended (dropped / finite / unreachable); stopping honestly - one-shot, no re-fire"
                     );
-                } else if true_drain && self.try_continuation().await {
+                } else if true_drain && mode == ContinuationMode::Autofill && self.try_autofill().await {
+                    // AUTOFILL appended similar library Songs and started playing the first;
+                    // they are ordinary tracks on the normal player path, so no landed
+                    // orphan / continuation latch is involved. Re-autofills each true-drain.
+                    return;
+                } else if true_drain && mode == ContinuationMode::Radio && self.try_continuation().await {
                     // A fresh cold-start (loadfile-replace) kicks any orphan station out,
                     // so no landed_orphan can survive this branch.
                     return;
@@ -5373,6 +5519,154 @@ impl HypodjHandler {
         false
     }
 
+    // ── end-of-queue CONTINUATION autofill (mode = autofill, task t83os4h) ────
+
+    /// End-of-queue AUTOFILL refill. Fired ONLY from the [`Self::advance_on_eof`]
+    /// None-branch at a genuine true-drain when the runtime toggle is ARMED and
+    /// `continuation.mode == Autofill`. It appends N real LIBRARY tracks similar to the
+    /// recency seed and continues playback, so the music keeps going from the user's own
+    /// library. Returns `true` when it appended-and-started a refill, `false` in EVERY
+    /// inert / failure case so the caller performs the SAME honest stop as today.
+    ///
+    /// CONTINUOUS, not one-shot: unlike [`Self::try_continuation`] (whose one-shot
+    /// `continuation_active` latch stops a DEAD radio stream from re-firing forever),
+    /// autofilled Songs are ordinary library tracks on the normal player path - their EOF
+    /// is SUCCESS, and re-firing on the next true-drain IS the feature. So this NEVER
+    /// touches `continuation_active`; each refill's fresh seed (the last autofilled Song
+    /// becomes `last_finished` at the next drain edge) walks the similarity graph instead
+    /// of orbiting the original seed. Two independent bounds keep it from hammering the
+    /// server: (1) structurally, exactly one fetch per true-drain, and a true-drain
+    /// requires the appended songs to actually reach EOF (tens of minutes of playback);
+    /// every failure leg returns false into the honest stop, and a stopped deck emits no
+    /// further Eofs. (2) A degenerate-input fuse ([`AUTOFILL_MIN_INTERVAL`]) stops an
+    /// instant-EOF spiral honestly - a hard <= 1-fetch-per-interval ceiling.
+    ///
+    /// Lock discipline mirrors [`Self::try_continuation`]: the std `Mutex<State>` is
+    /// released BEFORE the `similar` await; the seed resolve, the fetch, and the filter
+    /// all run lock-free; the append is one pure mutation under a single short lock scope.
+    async fn try_autofill(&self) -> bool {
+        // 1. One short lock: armed? fuse? snapshot the dedup ring; stamp the fetch time.
+        let (n, seen) = {
+            let mut st = self.state.lock().unwrap();
+            // Armed? The runtime toggle must be ON (default OFF - never a surprise). Same
+            // toggle as radio: ONE arm switch, `mode` selects the behavior.
+            if !st.continuation {
+                return false;
+            }
+            // Degenerate-input FUSE: a true-drain within AUTOFILL_MIN_INTERVAL of the
+            // previous fetch is a pathological instant-EOF spiral (corrupt library). Stop
+            // HONESTLY - a stop, not a wait: no timer armed, no poller. Stamp is set BELOW
+            // even on the failure legs, so a healthy batch (tens of minutes) never trips.
+            let now = Instant::now();
+            if let Some(prev) = st.last_autofill_at {
+                if now.saturating_duration_since(prev) < AUTOFILL_MIN_INTERVAL {
+                    tracing::warn!(
+                        "autofill re-drained within the min interval; stopping honestly (instant-EOF fuse)"
+                    );
+                    return false;
+                }
+            }
+            st.last_autofill_at = Some(now);
+            let seen: std::collections::HashSet<SongId> =
+                st.autofill_seen.iter().cloned().collect();
+            (self.autofill_count.load(Ordering::Relaxed).max(1), seen)
+        };
+        // The recency seed (its own short lock inside seed_source). No seed - nothing
+        // ever played / empty deck / streams-only session - is the genuine empty case.
+        let Some(seed) = self.similar_seed_id() else {
+            tracing::info!("autofill: no seed (nothing played / empty deck); ending stopped");
+            return false;
+        };
+        // 2. Fetch similar library tracks with NO std lock held. 2x over-fetch so dedup
+        //    shrinkage still leaves a full batch. ONE call per drain, NO genre/random
+        //    degrade chain - autofill promises SIMILAR, not anything. Empty or error is an
+        //    honest stop (one info log, no retry, no fallback ladder at the drain edge).
+        let fetched = match self.autofill_fetch(&seed, (n * 2) as i32).await {
+            Ok(v) if !v.is_empty() => v,
+            Ok(_) => {
+                tracing::info!(seed = %seed.0, "autofill: backend returned no similar songs; ending stopped");
+                return false;
+            }
+            Err(e) => {
+                tracing::info!(seed = %seed.0, error = %e, "autofill: similar fetch failed; ending stopped");
+                return false;
+            }
+        };
+        // 3. Filter lock-free: drop the seed itself, drop anything in the dedup ring,
+        //    dedup within the batch, and truncate to N. All-already-seen -> honest stop.
+        let mut picked: Vec<Song> = Vec::new();
+        let mut batch_seen: std::collections::HashSet<SongId> = std::collections::HashSet::new();
+        for song in fetched {
+            if song.id == seed || seen.contains(&song.id) || !batch_seen.insert(song.id.clone()) {
+                continue;
+            }
+            picked.push(song);
+            if picked.len() >= n as usize {
+                break;
+            }
+        }
+        if picked.is_empty() {
+            tracing::info!(seed = %seed.0, "autofill: all similar songs already recently seen; ending stopped");
+            return false;
+        }
+        // 4. Append the picked Songs as ordinary library entries in ONE short lock scope
+        //    (never across an await). Each id is recorded in the dedup ring so the NEXT
+        //    refill excludes this batch. Capture the appended ids (for a clean by-id
+        //    rollback on a load failure) and the first appended index (where to continue).
+        let (first_idx, appended_ids) = {
+            let mut st = self.state.lock().unwrap();
+            let first_idx = st.queue.len();
+            let mut appended_ids = Vec::with_capacity(picked.len());
+            for song in picked {
+                let id = st.next_id;
+                st.next_id += 1;
+                st.push_autofill_seen(song.id.clone());
+                st.queue.push(QueueItem { id, entry: QueueEntry::Song(song) });
+                appended_ids.push(id);
+            }
+            st.playlist_version += 1;
+            (first_idx, appended_ids)
+        };
+        self.notify_change();
+        // 5. Continue playback from the first appended entry. No volume resync (like the
+        //    natural advance and try_continuation step 5), so an in-flight winddown/sleep
+        //    ramp survives the handoff. NEVER set continuation_active: these are ordinary
+        //    library Songs on the normal player path - they scrobble, seek, become
+        //    last_finished, and ride the existing song-to-song warm-skip for gapless.
+        if self.play_index_inner(first_idx, false).await.is_ok() {
+            return true;
+        }
+        // The first appended song failed to load: remove the ENTIRE just-appended batch by
+        // stable id (a concurrent queue edit cannot make us drop the wrong rows) and return
+        // false -> the caller's single honest stop. Never a per-row load-retry walk.
+        tracing::warn!("autofill: first appended song failed to load; removing the batch, ending stopped");
+        {
+            let mut st = self.state.lock().unwrap();
+            st.queue.retain(|it| !appended_ids.contains(&it.id));
+            st.playlist_version += 1;
+        }
+        false
+    }
+
+    /// Fetch library Songs similar to `seed` for an autofill refill (2x over-fetched
+    /// `count`). Thin wrapper over `client.similar` (sonicSimilarity + getSimilarSongs2)
+    /// so the ONE network seam is mockable in tests: a `#[cfg(test)]` build pops a
+    /// scripted result from [`Self::autofill_test`] instead (the sandbox has no live
+    /// server), falling through to the real client when the script is exhausted. Called
+    /// with NO std lock held (the caller released it before this await).
+    async fn autofill_fetch(&self, seed: &SongId, count: i32) -> Result<Vec<Song>, SubsonicError> {
+        #[cfg(test)]
+        {
+            let mut t = self.autofill_test.lock().unwrap();
+            t.calls += 1;
+            t.last_seed = Some(seed.clone());
+            if let Some(scripted) = t.batches.pop_front() {
+                return scripted.map_err(|_| SubsonicError::Request("test autofill fetch error".into()));
+            }
+        }
+        self.client.similar(seed, Some(count)).await
+    }
+
     // ── continuation WARM: LEAD prefetch of the station (slice 2) ────────────
 
     /// Disarm any pending continuation warm: take the slot (its held [`TimerGuard`]
@@ -5404,14 +5698,19 @@ impl HypodjHandler {
     async fn reschedule_continuation_warm(&self) {
         // (1) Disarm any prior slot first (RAII-cancel + drop a live prefetch).
         self.disarm_continuation_warm().await;
-        // Config outside `State` (a separate Mutex): is a non-empty station configured?
-        let station_ok = self
-            .continuation_station
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|s| !s.trim().is_empty())
-            .unwrap_or(false);
+        // Config outside `State` (a separate Mutex): is a non-empty station configured
+        // AND is the mode RADIO? Folding `mode == Radio` in here means no station prefetch
+        // ever arms in autofill mode (defense in depth on top of the landed-commit being
+        // structurally inert there - continuation_active / pending_continuation_warm stay
+        // None, so finishing_is_continuation and landed_orphan never fire).
+        let station_ok = *self.continuation_mode.lock().unwrap() == ContinuationMode::Radio
+            && self
+                .continuation_station
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
         let Some(timers) = self.plan_timers.get().cloned() else { return };
         let elapsed = self.last_elapsed_secs();
         // The PLAY-STATE GATE: read the reported play state (which consults the player
@@ -5472,7 +5771,10 @@ impl HypodjHandler {
             return;
         }
         let station = self.continuation_station.lock().unwrap().clone();
-        let station_ok = station.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+        // Same `mode == Radio` fold as the reschedule: an autofill-mode session never
+        // has a warm slot armed, but gate here too so a mode flip cannot leave one live.
+        let station_ok = *self.continuation_mode.lock().unwrap() == ContinuationMode::Radio
+            && station.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false);
         let playing = play_state == PlayState::Playing;
         let elapsed = self.last_elapsed_secs();
         // (b) Re-check the predicate + still-ours under one short lock; capture a DECISION
@@ -8778,6 +9080,264 @@ mod tests {
         assert_eq!(st.continuation_active, None, "no continuation stream was ever cold-started");
     }
 
+    // ── end-of-queue CONTINUATION autofill (mode = autofill, task t83os4h) ────
+
+    // A minimal library song with a distinct id (mirrors playlist_test_song, kept local
+    // to the autofill tests so a scripted batch reads at a glance).
+    fn autofill_song(id: &str) -> Song {
+        playlist_test_song(id)
+    }
+
+    // Set the handler up for autofill: armed toggle + autofill mode. Count stays the
+    // default 20 so a small scripted batch (< 20) is appended whole.
+    fn arm_autofill(h: &HypodjHandler) {
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_mode(ContinuationMode::Autofill, crate::config::DEFAULT_AUTOFILL_COUNT);
+    }
+
+    // ARMED + mode autofill: a true drain appends the similar LIBRARY songs as first-class
+    // QueueEntry::Song rows, points current at the first, and continues playing (never a
+    // stopped deck). The finished song is the recency seed; the appended songs are real
+    // library tracks (they show up in queue_song_ids - the scrobble surface). No
+    // continuation_active latch is ever set (that is the radio one-shot, inapplicable here).
+    #[tokio::test]
+    async fn autofill_appends_similar_songs_on_true_drain() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![autofill_song("a1"), autofill_song("a2"), autofill_song("a3")]));
+
+        h.advance_on_eof(false).await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 4, "the three similar library songs are appended after the drained seed");
+        assert!(
+            matches!(&st.queue[1].entry, QueueEntry::Song(s) if s.id == SongId("a1".into())),
+            "the first appended entry is a real library Song, not a raw stream"
+        );
+        assert_eq!(st.current, Some(1), "current points at the first appended song (playing, not stopped)");
+        assert_eq!(
+            st.last_finished.as_ref().map(|s| &s.id),
+            Some(&SongId("seed".into())),
+            "the finished library song is the recency seed"
+        );
+        assert_eq!(st.continuation_active, None, "autofill NEVER sets the radio one-shot latch");
+        drop(st);
+        assert_eq!(
+            h.queue_song_ids(),
+            vec![SongId("seed".into()), SongId("a1".into()), SongId("a2".into()), SongId("a3".into())],
+            "the appended songs are real library tracks (present in the scrobble/seed id surface)"
+        );
+    }
+
+    // CONTINUOUS re-autofill: the appended songs themselves drain and re-fetch on each
+    // subsequent true-drain, and every refill uses a FRESH seed (the last autofilled song
+    // became last_finished / current). Single-song batches keep every drain a true drain.
+    // Fake clock so the 30s fuse never spuriously trips between refills.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_re_fires_each_drain_with_fresh_seed() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![autofill_song("a1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
+
+        // Drain 1: seed drains -> a1 appended + playing; the fetch seeded from the seed.
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_last_seed(), Some(SongId("seed".into())), "drain 1 seeds from the finished seed");
+        assert_eq!(h.state.lock().unwrap().current, Some(1), "a1 is now current+playing");
+
+        // Drain 2: a1 drains -> a2 appended; the fetch seeded from a1 (fresh seed walk),
+        // NOT the original seed. Advance past the fuse window first.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_last_seed(), Some(SongId("a1".into())), "drain 2 seeds from the LAST appended track");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 3, "a2 is appended (seed, a1, a2)");
+        assert_eq!(st.current, Some(2), "a2 is now current+playing - the music keeps going");
+    }
+
+    // DEDUP: a refill batch that OVERLAPS the recently-seen set has the overlap filtered
+    // out; a batch that is ENTIRELY already-seen (or only the seed) is an honest stop with
+    // exactly ONE fetch, never a tight re-fetch loop.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_dedups_recent_and_honest_stops_when_all_seen() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![autofill_song("X")])); // drain 1
+        h.push_autofill_batch(Ok(vec![autofill_song("X"), autofill_song("Y")])); // drain 2: X seen, Y new
+        h.push_autofill_batch(Ok(vec![autofill_song("X"), autofill_song("Y")])); // drain 3: all seen
+
+        h.advance_on_eof(false).await; // drain 1 -> X appended
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.advance_on_eof(false).await; // drain 2 -> X filtered (seen), Y appended
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 3, "only the new Y is appended; the overlapping X is filtered");
+            assert!(
+                matches!(&st.queue[2].entry, QueueEntry::Song(s) if s.id == SongId("Y".into())),
+                "the appended entry is Y, not a re-append of X"
+            );
+        }
+
+        let calls_before = h.autofill_fetch_calls();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.advance_on_eof(false).await; // drain 3 -> X seen, Y is the seed: all dropped -> honest stop
+        assert_eq!(h.state.lock().unwrap().current, None, "all-already-seen => honest stop, deck stopped");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 3, "nothing appended on the all-seen drain");
+        assert_eq!(
+            h.autofill_fetch_calls(),
+            calls_before + 1,
+            "exactly ONE fetch on the all-seen drain - no retry loop"
+        );
+    }
+
+    // HONEST STOP - no seed: a streams-only session (or an empty deck) has no library
+    // recency seed, so autofill appends nothing and the deck ends stopped, with NO fetch
+    // ever attempted (a stream must never seed).
+    #[tokio::test]
+    async fn autofill_no_seed_streams_only_honest_stops_no_fetch() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_stream_for_test(NTS).await; // a raw stream: no library id
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+
+        h.advance_on_eof(false).await;
+
+        assert_eq!(h.state.lock().unwrap().current, None, "no seed => honest stop");
+        assert_eq!(h.autofill_fetch_calls(), 0, "no fetch attempted without a seed (never seed from a stream)");
+    }
+
+    // HONEST STOP - backend empty: getSimilarSongs returns nothing -> one info log, one
+    // fetch, no retry, no fallback ladder. The deck stops; a stopped deck emits no Eofs,
+    // so it cannot spin.
+    #[tokio::test]
+    async fn autofill_empty_backend_honest_stops() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![])); // backend returns nothing
+
+        h.advance_on_eof(false).await;
+
+        assert_eq!(h.state.lock().unwrap().current, None, "empty backend => honest stop");
+        assert_eq!(h.state.lock().unwrap().queue.len(), 1, "nothing appended on an empty fetch");
+        assert_eq!(h.autofill_fetch_calls(), 1, "exactly one fetch, no retry");
+    }
+
+    // HONEST STOP - backend error: similar() erroring is treated exactly like empty (one
+    // fetch, honest stop), never a fallback network ladder at the drain edge.
+    #[tokio::test]
+    async fn autofill_fetch_error_honest_stops() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.push_autofill_batch(Err(())); // transport error
+
+        h.advance_on_eof(false).await;
+
+        assert_eq!(h.state.lock().unwrap().current, None, "fetch error => honest stop");
+        assert_eq!(h.autofill_fetch_calls(), 1, "one fetch, no retry on error");
+    }
+
+    // DEGENERATE-INPUT FUSE: a re-drain within the 30s window (a pathological instant-EOF
+    // spiral) honest-stops WITHOUT a fetch; advancing the fake clock past the fuse lets a
+    // fresh drain refire. Hard ceiling: <= 1 fetch per interval in any execution.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_fuse_stops_instant_spiral_and_refires_after_interval() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.push_autofill_batch(Ok(vec![autofill_song("a1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
+
+        // Drain 1 (t=0): a1 appended, current -> a1, the fetch time is stamped.
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_fetch_calls(), 1, "drain 1 fetched once");
+        assert_eq!(h.state.lock().unwrap().current, Some(1));
+
+        // Drain 2 (t=0, no advance): the fuse trips BEFORE any fetch -> honest stop, and
+        // the scripted a2 batch is NOT consumed (the fetch never ran).
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_fetch_calls(), 1, "the fuse stops BEFORE the fetch - still one fetch total");
+        assert_eq!(h.state.lock().unwrap().current, None, "fuse => honest stop");
+
+        // Advance past the fuse window and re-establish a live drain edge (current at the
+        // last entry). Now a drain refires and consumes a2.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.state.lock().unwrap().current = Some(1); // a1 is the last entry again
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_fetch_calls(), 2, "past the fuse window, a fresh drain fetches again");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 3, "a2 is appended after the fuse cleared");
+        assert_eq!(st.current, Some(2));
+    }
+
+    // SINGLE-mode is NOT a true drain: with a track still queued, single stops the deck
+    // but autofill must NOT hijack the pending track. No fetch, no append.
+    #[tokio::test]
+    async fn autofill_single_mode_not_hijacked() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("s0")).await;
+        h.enqueue_song_for_test(autofill_song("s1")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.state.lock().unwrap().single = true;
+        h.push_autofill_batch(Ok(vec![autofill_song("x")])); // must NOT be consumed
+
+        h.advance_on_eof(false).await;
+
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.current, None, "single stops after the current track (its own semantics)");
+        assert_eq!(st.queue.len(), 2, "the pending track is preserved - autofill did not hijack it");
+        assert!(
+            st.queue.iter().all(|it| matches!(it.entry, QueueEntry::Song(_))),
+            "only the two original songs remain"
+        );
+        drop(st);
+        assert_eq!(h.autofill_fetch_calls(), 0, "no fetch on a non-drain single stop");
+    }
+
+    // CONSUME mode: the queue empties each track, so every drain is a refill; the seed is
+    // carried by last_finished (which survives consume eviction) and walks fresh each time.
+    #[tokio::test(start_paused = true)]
+    async fn autofill_consume_mode_refill_chain_walks_fresh_seeds() {
+        let Some((h, _events)) = handler_with_null_player() else { return };
+        h.enqueue_song_for_test(autofill_song("seed")).await;
+        h.state.lock().unwrap().current = Some(0);
+        arm_autofill(&h);
+        h.state.lock().unwrap().consume = true;
+        h.push_autofill_batch(Ok(vec![autofill_song("a1")]));
+        h.push_autofill_batch(Ok(vec![autofill_song("a2")]));
+
+        // Drain 1: consume evicts the seed; the seed survives in last_finished and seeds
+        // the fetch; a1 is appended into the emptied queue.
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_last_seed(), Some(SongId("seed".into())), "drain 1 seeds from the consumed seed");
+        {
+            let st = h.state.lock().unwrap();
+            assert_eq!(st.queue.len(), 1, "consume emptied the queue, then a1 was appended");
+            assert!(matches!(&st.queue[0].entry, QueueEntry::Song(s) if s.id == SongId("a1".into())));
+        }
+
+        // Drain 2: a1 is consumed and becomes the fresh seed; a2 is appended.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        h.advance_on_eof(false).await;
+        assert_eq!(h.autofill_last_seed(), Some(SongId("a1".into())), "drain 2 walks to the a1 seed");
+        let st = h.state.lock().unwrap();
+        assert_eq!(st.queue.len(), 1, "consume emptied again, then a2 was appended");
+        assert!(matches!(&st.queue[0].entry, QueueEntry::Song(s) if s.id == SongId("a2".into())));
+    }
+
     // The continuation INDICATOR pairs ride `status` ONLY when armed (toggle ON AND a
     // station configured), so a client can render the standing "then: <station>" hint.
     // Disarmed or unconfigured => no pairs (a lean status), like the armed/hint HUD.
@@ -8904,6 +9464,27 @@ mod tests {
         let w = st.pending_continuation_warm.as_ref().expect("the slot survives the fire");
         assert!(w.warmed, "the slot flips warmed after the prefetch Ok");
         assert_eq!(w.url, NTS, "the resolved station url is recorded for the landed-commit");
+    }
+
+    // AUTOFILL mode NEVER arms a station warm: the `mode == Radio` fold in station_ok
+    // makes the arm predicate false even with a configured station and a playing drain,
+    // so no station prefetch ever happens in autofill mode (defense in depth on top of
+    // the landed-commit being structurally inert there).
+    #[tokio::test(start_paused = true)]
+    async fn autofill_mode_never_arms_a_station_warm() {
+        let Some((h, _probe, _fire_rx)) = warm_rig() else { return };
+        h.enqueue_song_for_test(playlist_test_song("seed")).await; // duration 200s
+        h.state.lock().unwrap().continuation = true;
+        h.set_continuation_station(Some(NTS.to_string()));
+        // Autofill mode (a station is still configured, but mode wins - it is unused).
+        h.set_continuation_mode(ContinuationMode::Autofill, crate::config::DEFAULT_AUTOFILL_COUNT);
+        h.play_for_test(0).await;
+        h.note_elapsed_ms(10_000);
+        h.reschedule_continuation_warm().await;
+        assert!(
+            h.state.lock().unwrap().pending_continuation_warm.is_none(),
+            "no station warm arms in autofill mode (mode == Radio folded into station_ok)"
+        );
     }
 
     // DECLINE without a true drain: a track still queued after the current, or a cycling
